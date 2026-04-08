@@ -1,0 +1,23 @@
+{
+  "property_id": "string",
+  "report_id": "string",
+  "issue_code": "string",
+  "system": "string",
+  "component": "string",
+  "issue_title": "string",
+  "report_severity": "string",
+  "platform_priority": "string",
+  "homeowner_summary": "string",
+  "why_it_matters": "string",
+  "next_action": "string",
+  "repair_type": "string",
+  "suggested_timeline": "string",
+  "monitoring_status": "string",
+  "summary_page": 0,
+  "detail_page": 0,
+  "source_text": "string",
+  "recommendation_text": "string",
+  "candidate_image_paths": [],
+  "verified_image_path": null,
+  "review_status": "pending_verification"
+}

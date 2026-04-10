@@ -1,53 +1,38 @@
-from adapters.bigben_internachi_adapter import BigBenInternachiAdapter
-from adapters.roof_report_adapter import RoofReportAdapter
-from adapters.sewer_scope_adapter import SewerScopeAdapter
-from adapters.section_based_adapter import SectionBasedAdapter
+def classify_report(pages):
+    """
+    Determines which adapter to use based on extracted PDF text.
+    """
 
+    # Safety check
+    if not isinstance(pages, list):
+        return "section_based"
 
-def classify_report(extracted):
-    pages = extracted.get("pages", [])
-    first_pages_text = "\n".join(page.get("text", "") for page in pages[:10]).lower()
+    # Combine first 10 pages for detection
+    text = "\n".join(p.get("text", "") for p in pages[:10]).lower()
 
-    # Big Ben / InterNACHI-style full inspection
-    if (
-        "inspection report by big ben inspections" in first_pages_text
-        or "internachi" in first_pages_text
-    ):
-        return BigBenInternachiAdapter()
-
-    # Roof-only report heuristic
-    roof_keywords = [
-        "roof inspection",
-        "roof report",
-        "roof covering",
-        "flashing",
-        "gutters",
-        "downspouts",
-        "roof penetrations",
-        "shingles",
+    # --- Spectora detection ---
+    spectora_signals = [
+        "summary",
+        "inspection report",
+        "page 1 of",
+        "deficient",
+        "maintenance",
+        "rj home inspections",
+        "spectora",
     ]
-    roof_hits = sum(1 for k in roof_keywords if k in first_pages_text)
 
-    if roof_hits >= 3:
-        return RoofReportAdapter()
+    spectora_score = sum(1 for k in spectora_signals if k in text)
 
-    # Sewer scope report heuristic
-    sewer_keywords = [
-        "sewer scope",
-        "sewer inspection",
-        "camera inspection",
-        "lateral",
-        "roots",
-        "belly",
-        "offset joint",
-        "blockage",
-        "cleanout",
-        "main line",
-    ]
-    sewer_hits = sum(1 for k in sewer_keywords if k in first_pages_text)
+    if spectora_score >= 3:
+        return "spectora"
 
-    if sewer_hits >= 3:
-        return SewerScopeAdapter()
+    # --- InterNACHI / BigBen ---
+    if "internachi" in text or "standards of practice" in text:
+        return "bigben_internachi"
 
-    # Fallback for unknown / looser report formats
-    return SectionBasedAdapter()
+    # --- AmeriSpec ---
+    if "amerispec" in text:
+        return "amerispec"
+
+    # --- Default fallback ---
+    return "section_based"

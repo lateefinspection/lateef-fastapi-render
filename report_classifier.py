@@ -1,28 +1,29 @@
 def classify_report(pages):
     """
-    Determines which adapter to use based on extracted PDF text.
+    Determine which adapter family to use from extracted PDF pages.
+    Returns one of:
+    - bigben_internachi
+    - spectora
+    - amerispec
+    - section_based
     """
 
-    # Safety check
     if not isinstance(pages, list):
         return "section_based"
 
-    # Combine first 10 pages for detection
     text = "\n".join(p.get("text", "") for p in pages[:10]).lower()
 
-    # --- Spectora detection ---
+    # --- Spectora / RJ style ---
     spectora_signals = [
+        "spectora",
+        "rj home inspections",
+        "rj residential report",
         "summary",
-        "inspection report",
-        "page 1 of",
         "deficient",
         "maintenance",
-        "rj home inspections",
-        "spectora",
+        "page 1 of",
     ]
-
     spectora_score = sum(1 for k in spectora_signals if k in text)
-
     if spectora_score >= 3:
         return "spectora"
 
@@ -31,8 +32,16 @@ def classify_report(pages):
         return "bigben_internachi"
 
     # --- AmeriSpec ---
-    if "amerispec" in text:
+    amerispec_signals = [
+        "amerispec",
+        "condition:",
+        "recommendation:",
+        "defect:",
+        "observation:",
+    ]
+    amerispec_score = sum(1 for k in amerispec_signals if k in text)
+    if amerispec_score >= 2:
         return "amerispec"
 
-    # --- Default fallback ---
+    # --- Fallback ---
     return "section_based"

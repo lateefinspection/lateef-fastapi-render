@@ -43,5 +43,9 @@ def classify_report(pages):
     if amerispec_score >= 2:
         return "amerispec"
 
+    if "property inspection report" in text:
+        return "generic_narrative"
+ 
     # --- Fallback ---
     return "section_based"
+

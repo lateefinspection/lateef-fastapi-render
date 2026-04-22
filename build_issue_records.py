@@ -1,143 +1,202 @@
 import json
 import uuid
-from report_classifier import classify_report
+from datetime import datetime, timezone
 
-from adapters.bigben_internachi_adapter import BigBenInternachiAdapter
-from adapters.section_based_adapter import SectionBasedAdapter
-from adapters.spectora_adapter import SpectoraAdapter
-from adapters.amerispec_adapter import AmeriSpecAdapter
+from ai_issue_extractor import extract_issues_with_ai
+from image_matcher import collect_images_by_page, match_images_for_issue
+from normalizers import (
+    normalize_issue_title,
+    normalize_summary,
+    normalize_system,
+    normalize_component,
+    normalize_severity,
+    map_priority,
+    default_next_action,
+    default_why_it_matters,
+)
+
+INPUT_PATH = "output/extracted.json"
+OUTPUT_PATH = "output/issue_records_v1.json"
 
 
 def load_extracted():
-    with open("output/extracted.json", "r", encoding="utf-8") as f:
+    with open(INPUT_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def get_adapter(name):
-    adapters = {
-        "bigben_internachi": BigBenInternachiAdapter,
-        "section_based": SectionBasedAdapter,
-        "spectora": SpectoraAdapter,
-        "amerispec": AmeriSpecAdapter,
-    }
-    return adapters.get(name, SectionBasedAdapter)()
+def build_page_aware_text(extracted):
+    """
+    Builds text with explicit page markers so AI can return page numbers.
+    """
+    parts = []
+    for page in extracted.get("pages", []):
+        page_number = page.get("page_number")
+        text = page.get("text", "") or ""
+        parts.append(f"=== PAGE {page_number} ===\n{text}")
+    return "\n\n".join(parts)
 
 
-def default_why_it_matters(issue_title: str) -> str:
-    t = (issue_title or "").lower()
+def dedupe_ai_issues(ai_issues):
+    deduped = []
+    seen = set()
 
-    if any(x in t for x in ["leak", "water", "stain", "moisture", "drainage"]):
-        return "May allow water intrusion, hidden damage, mold, or moisture-related deterioration."
+    for item in ai_issues:
+        raw_title = item.get("issue_title", "")
+        raw_system = item.get("system", "")
+        raw_page = item.get("page_number")
 
-    if any(x in t for x in ["unsafe", "hazard", "egress", "double tap", "scalding", "loose railing"]):
-        return "May create a safety hazard and should be addressed by a qualified professional."
+        issue_title = normalize_issue_title(raw_title)
+        normalized_system = normalize_system(raw_system or issue_title)
+        normalized_component = normalize_component(
+            item.get("component"),
+            issue_title=issue_title,
+            normalized_system=normalized_system,
+        )
 
-    if any(x in t for x in ["corrosion", "crack", "settling", "sagging", "movement"]):
-        return "May worsen over time and lead to larger repair needs if not addressed."
+        key = (
+            normalized_system.lower(),
+            normalized_component.lower(),
+            issue_title.lower(),
+            raw_page,
+        )
 
-    return "May lead to damage, safety issues, or system failure if not addressed."
+        if key in seen:
+            continue
 
+        seen.add(key)
+        deduped.append(item)
 
-def default_next_action(issue_title: str) -> str:
-    t = (issue_title or "").lower()
-
-    if any(x in t for x in ["electrical", "gfci", "panel", "double tap"]):
-        return "Contact a qualified electrician."
-    if any(x in t for x in ["plumb", "toilet", "sink", "drain", "water heater", "scalding"]):
-        return "Contact a qualified plumbing contractor."
-    if any(x in t for x in ["roof", "chimney", "gutter", "downspout", "flashing"]):
-        return "Contact a qualified roofing contractor."
-    if any(x in t for x in ["hvac", "heating", "cooling", "air filter", "condensation"]):
-        return "Contact a qualified HVAC professional."
-
-    return "Further evaluation recommended."
+    return deduped
 
 
-def build_issue_records():
-    extracted = load_extracted()
-    pages = extracted.get("pages", [])
-
-    adapter_name = classify_report(pages)
-    adapter = get_adapter(adapter_name)
-
-    print(f"Adapter used: {adapter_name}")
-
-    issues = adapter.extract_summary_issues(pages)
+def build_issue_records(ai_issues, extracted):
     records = []
 
-    for issue in issues:
-        issue_title = issue.get("issue_title", "")
-        next_action = issue.get("next_action") or default_next_action(issue_title)
+    ai_issues = dedupe_ai_issues(ai_issues)
+    images_by_page = collect_images_by_page(extracted)
 
-        record = {
-            "adapter_name": adapter_name,
+    for i, item in enumerate(ai_issues, start=1):
+        raw_title = item.get("issue_title", "Unknown Issue")
+        raw_summary = item.get("summary", "")
+        raw_system = item.get("system", "")
+        raw_component = item.get("component")
+        raw_severity = item.get("severity", "unknown")
+        raw_page = item.get("page_number")
+
+        issue_title = normalize_issue_title(raw_title)
+        homeowner_summary = normalize_summary(raw_summary) or issue_title
+
+        normalized_system = normalize_system(raw_system or issue_title)
+        normalized_component = normalize_component(
+            raw_component,
+            issue_title=issue_title,
+            normalized_system=normalized_system,
+        )
+        normalized_severity = normalize_severity(raw_severity, issue_title)
+        platform_priority = map_priority(normalized_severity)
+
+        next_action = default_next_action(normalized_system, issue_title)
+        why_it_matters = default_why_it_matters(
+            normalized_system,
+            issue_title,
+            normalized_severity,
+        )
+
+        candidate_image_paths, all_page_image_paths, verified_image_path = match_images_for_issue(
+            issue_title=issue_title,
+            summary_page=raw_page,
+            images_by_page=images_by_page,
+        )
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        records.append({
+            "adapter_name": "ai_extractor",
             "property_id": str(uuid.uuid4()),
             "internal_report_uuid": str(uuid.uuid4()),
+
             "record_id": None,
             "report_number": None,
             "submitted_at": None,
             "submitted_by": None,
+
             "property_address": None,
             "inspection_date": None,
+
             "client_name": None,
             "client_email": None,
             "client_phone": None,
+
             "additional_comments": None,
             "additional_services": [],
+
             "report_url": None,
             "report_filename": None,
             "report_link": None,
             "s3_key": None,
             "source_pdf_sha256": None,
 
-            "issue_code": issue.get("issue_code"),
-            "system": issue.get("system"),
-            "component": issue.get("component"),
+            "issue_code": f"AI.{i}",
+            "system": normalized_system,
+            "component": normalized_component,
             "issue_title": issue_title,
-            "report_severity": issue.get("report_severity", "unknown"),
-            "platform_priority": issue.get("platform_priority", "medium"),
 
-            "homeowner_summary": issue.get("homeowner_summary")
-            or f"{issue_title.lower()}. Recommended action: {next_action}",
+            "report_severity": normalized_severity,
+            "platform_priority": platform_priority,
 
-            "why_it_matters": issue.get("why_it_matters")
-            or default_why_it_matters(issue_title),
-
+            "homeowner_summary": homeowner_summary,
+            "why_it_matters": why_it_matters,
             "next_action": next_action,
 
-            "repair_type": "specialist_evaluation",
-            "suggested_timeline": "30_to_90_days",
-            "monitoring_status": "needs_repair",
+            "repair_type": "general_repair",
+            "suggested_timeline": "30_to_90_days" if normalized_severity != "high" else "as_soon_as_possible",
+            "monitoring_status": "needs_review",
 
-            "summary_page": issue.get("summary_page"),
-            "detail_page": issue.get("detail_page"),
-            "source_text": issue.get("source_text", ""),
-            "recommendation_text": issue.get("recommendation_text", next_action),
+            "summary_page": raw_page,
+            "detail_page": raw_page,
 
-            "candidate_image_paths": issue.get("candidate_image_paths", []),
-            "all_page_image_paths": issue.get("all_page_image_paths", []),
-            "verified_image_path": issue.get("verified_image_path"),
+            "source_text": homeowner_summary,
+            "recommendation_text": next_action,
+
+            "candidate_image_paths": candidate_image_paths,
+            "all_page_image_paths": all_page_image_paths,
+            "verified_image_path": verified_image_path,
 
             "review_status": "pending_verification",
             "review_state": "new",
+
             "last_viewed_at": None,
             "approved_at": None,
-        }
 
-        records.append(record)
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        })
 
-    return adapter_name, records
+    return records
 
 
 def main():
-    adapter_name, records = build_issue_records()
+    extracted = load_extracted()
 
-    print(f"Issue records built: {len(records)}")
+    full_text = build_page_aware_text(extracted)
 
-    with open("output/issue_records_v1.json", "w", encoding="utf-8") as f:
+    print("🤖 Running AI extraction...")
+
+    ai_issues = extract_issues_with_ai(full_text)
+
+    if not ai_issues:
+        print("⚠️ No issues returned from AI")
+        ai_issues = []
+
+    records = build_issue_records(ai_issues, extracted)
+
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(records, f, indent=2, ensure_ascii=False)
 
-    print("Saved to: output/issue_records_v1.json")
+    print("\n===== BUILD COMPLETE =====")
+    print("Adapter used: ai_extractor")
+    print(f"Issue records built: {len(records)}")
+    print(f"Saved to: {OUTPUT_PATH}\n")
 
 
 if __name__ == "__main__":

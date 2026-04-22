@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import requests
-import os
+import pdfplumber
 
 app = FastAPI()
 
@@ -20,23 +20,25 @@ def adapter_test_upload(data: ReportRequest):
     try:
         pdf_url = data.reportUrl
 
-        # Step 1: Download PDF
+        # Download PDF
         response = requests.get(pdf_url)
         if response.status_code != 200:
             return {"success": False, "error": "Failed to download PDF"}
 
-        # Step 2: Save PDF temporarily
         file_path = "temp_report.pdf"
         with open(file_path, "wb") as f:
             f.write(response.content)
 
-        # Step 3: Confirm saved
-        file_size = os.path.getsize(file_path)
+        # Extract text
+        text = ""
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
 
         return {
             "success": True,
-            "message": "PDF downloaded successfully",
-            "fileSize": file_size
+            "message": "PDF processed",
+            "textPreview": text[:500]  # first 500 chars
         }
 
     except Exception as e:

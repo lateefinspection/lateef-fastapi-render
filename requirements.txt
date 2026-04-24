@@ -27,3 +27,5 @@ pdfplumber
 pdf2image
 Pillow
 boto3
+pdfminer.six
+openai

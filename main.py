@@ -8,7 +8,9 @@ from pdf2image import convert_from_bytes
 
 app = FastAPI()
 
-# AWS CONFIG
+# =========================
+# ENV CONFIG
+# =========================
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION")
@@ -21,43 +23,55 @@ s3 = boto3.client(
     aws_secret_access_key=AWS_SECRET_KEY
 )
 
+# =========================
+# REQUEST MODEL
+# =========================
 class ReportRequest(BaseModel):
     reportUrl: str
     recordId: str
 
-
+# =========================
+# HEALTH CHECK
+# =========================
 @app.get("/")
 def health():
     return {"status": "ok"}
 
-
+# =========================
+# MAIN PIPELINE
+# =========================
 @app.post("/webhook/adapter-test-upload")
 def adapter_test_upload(data: ReportRequest):
     try:
         pdf_url = data.reportUrl
         record_id = data.recordId
 
-        # Download PDF
+        # -------------------------
+        # DOWNLOAD PDF
+        # -------------------------
         response = requests.get(pdf_url)
         if response.status_code != 200:
             return {"error": "Failed to download PDF"}
 
         pdf_bytes = response.content
 
-        # 🔥 Convert PDF → images (THIS IS THE UPGRADE)
+        # -------------------------
+        # CONVERT PDF → IMAGES
+        # -------------------------
         images = convert_from_bytes(pdf_bytes)
 
         uploaded_urls = []
 
-        for i, image in enumerate(images[:3]):  # limit to first 3 pages
+        # -------------------------
+        # UPLOAD IMAGES TO S3
+        # -------------------------
+        for i, image in enumerate(images):
             file_id = str(uuid.uuid4())
             filename = f"approved-images/{record_id}/{file_id}.png"
 
-            # Save locally
             local_path = f"/tmp/{file_id}.png"
             image.save(local_path, "PNG")
 
-            # Upload to S3
             s3.upload_file(
                 local_path,
                 S3_BUCKET,
@@ -68,20 +82,41 @@ def adapter_test_upload(data: ReportRequest):
             image_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{filename}"
             uploaded_urls.append(image_url)
 
-        # Build structured response
-        def build_section():
-            return {
-                "issue": "no issues found",
-                "imageUrl": uploaded_urls[0] if uploaded_urls else None
-            }
+        # -------------------------
+        # SAFE IMAGE MAPPING
+        # -------------------------
+        def get_image(index):
+            if uploaded_urls and len(uploaded_urls) > index:
+                return uploaded_urls[index]
+            elif uploaded_urls:
+                return uploaded_urls[0]
+            return None
 
+        # -------------------------
+        # RESPONSE STRUCTURE
+        # -------------------------
         return {
             "output": {
-                "roof": build_section(),
-                "plumbing": build_section(),
-                "electrical": build_section(),
-                "hvac": build_section(),
-                "foundation": build_section(),
+                "roof": {
+                    "issue": "no issues found",
+                    "imageUrl": get_image(0)
+                },
+                "plumbing": {
+                    "issue": "no issues found",
+                    "imageUrl": get_image(1)
+                },
+                "electrical": {
+                    "issue": "no issues found",
+                    "imageUrl": get_image(2)
+                },
+                "hvac": {
+                    "issue": "no issues found",
+                    "imageUrl": get_image(3)
+                },
+                "foundation": {
+                    "issue": "no issues found",
+                    "imageUrl": get_image(4)
+                },
                 "summary": "home is in good condition"
             }
         }

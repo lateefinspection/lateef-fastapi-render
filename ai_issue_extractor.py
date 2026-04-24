@@ -6,12 +6,18 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 def extract_issues_from_text(text: str):
-    prompt = f"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""
 You are a professional home inspector AI.
 
 Analyze the following home inspection report text and extract REAL issues.
 
-Return ONLY valid JSON in this format:
+Return ONLY valid JSON:
 
 {{
   "roof": {{ "issue": "...", "severity": "low|medium|high" }},
@@ -23,36 +29,35 @@ Return ONLY valid JSON in this format:
 }}
 
 Rules:
-- If NO issue → say "no issues found"
-- If issue exists → describe clearly
-- Be realistic like a real inspector
-- Do NOT hallucinate extreme problems
+- If no issue → "no issues found"
+- Be realistic
+- Do not hallucinate
 
 TEXT:
 {text[:12000]}
 """
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "user", "content": prompt}
+                }
             ],
             temperature=0.2,
         )
 
         content = response.choices[0].message.content
 
-        return content
+        # 🔥 FORCE JSON SAFE PARSE
+        try:
+            return json.loads(content)
+        except:
+            print("⚠️ JSON parse failed, returning raw")
+            return {"raw": content}
 
     except Exception as e:
         print("🔥 OpenAI ERROR:", str(e))
 
-        return json.dumps({
+        return {
             "roof": {"issue": "AI error", "severity": "low"},
             "plumbing": {"issue": "AI error", "severity": "low"},
             "electrical": {"issue": "AI error", "severity": "low"},
             "hvac": {"issue": "AI error", "severity": "low"},
             "foundation": {"issue": "AI error", "severity": "low"},
             "summary": "AI extraction failed"
-        })
+        }

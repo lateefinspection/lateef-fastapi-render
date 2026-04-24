@@ -1,117 +1,61 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import requests
-import json
-import traceback
+import uuid
 
-# Internal modules
 from extract_findings import extract_text_from_pdf
 from ai_issue_extractor import extract_issues_from_text
-from normalizers import normalize_issues
-from image_matcher import match_image
+from image_matcher import match_images
 
 app = FastAPI()
 
 
-# -------------------------------
-# REQUEST MODEL
-# -------------------------------
-class IntakeRequest(BaseModel):
-    reportUrl: str
-    recordId: str
-
-
-# -------------------------------
-# HEALTH CHECK (for Render)
-# -------------------------------
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "HomeFax AI Engine"}
+    return {"status": "ok"}
 
 
-# -------------------------------
-# MAIN PIPELINE
-# -------------------------------
 @app.post("/webhook/adapter-test-upload")
-def process_report(request: IntakeRequest):
+def process_report(data: dict):
     try:
-        report_url = request.reportUrl
-        record_id = request.recordId
+        report_url = data.get("reportUrl")
+        record_id = data.get("recordId", str(uuid.uuid4()))
 
-        print(f"\n📥 Processing report: {record_id}")
+        if not report_url:
+            raise HTTPException(status_code=400, detail="Missing reportUrl")
 
-        # -------------------------------
-        # STEP 1: DOWNLOAD PDF
-        # -------------------------------
-        response = requests.get(report_url)
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to download PDF")
+        print(f"📥 Processing report: {report_url}")
 
-        pdf_bytes = response.content
+        # Step 1: Download PDF
+        pdf_bytes = requests.get(report_url).content
 
-        # -------------------------------
-        # STEP 2: EXTRACT TEXT
-        # -------------------------------
-        extracted_text = extract_text_from_pdf(pdf_bytes)
+        # Step 2: Extract text
+        text = extract_text_from_pdf(pdf_bytes)
 
-        if not extracted_text or len(extracted_text.strip()) < 50:
-            print("⚠️ Low text extracted — continuing anyway")
+        print(f"📄 Extracted text length: {len(text)}")
 
-        # -------------------------------
-        # STEP 3: AI ISSUE EXTRACTION
-        # -------------------------------
-        ai_raw = extract_issues_from_text(extracted_text)
+        # Step 3: AI issue extraction
+        issues = extract_issues_from_text(text)
 
-        try:
-            ai_data = json.loads(ai_raw)
-        except Exception:
-            print("⚠️ AI returned invalid JSON — fallback triggered")
-            ai_data = {
-                "roof": {"issue": "no issues found", "severity": "low"},
-                "plumbing": {"issue": "no issues found", "severity": "low"},
-                "electrical": {"issue": "no issues found", "severity": "low"},
-                "hvac": {"issue": "no issues found", "severity": "low"},
-                "foundation": {"issue": "no issues found", "severity": "low"},
-                "summary": "AI parsing failed"
-            }
+        print(f"🤖 AI Issues: {issues}")
 
-        # -------------------------------
-        # STEP 4: NORMALIZE STRUCTURE
-        # -------------------------------
-        normalized = normalize_issues(ai_data)
+        # Step 4: Image matching
+        matched_images = match_images(pdf_bytes, issues, record_id)
 
-        # -------------------------------
-        # STEP 5: IMAGE MATCHING
-        # -------------------------------
+        print(f"🖼️ Matched images: {matched_images}")
+
+        # Step 5: Combine output
         output = {}
 
-        for section, data in normalized.items():
-
-            # summary handled separately
-            if section == "summary":
-                output["summary"] = data
-                continue
-
-            issue_text = data.get("issue", "no issues found")
-            severity = data.get("severity", "low")
-
-            output[section] = {
-                "issue": issue_text,
-                "severity": severity,
-                "imageUrl": match_image(section, record_id)
+        for system in ["roof", "plumbing", "electrical", "hvac", "foundation"]:
+            output[system] = {
+                "issue": issues.get(system, {}).get("issue", "no issues found"),
+                "imageUrl": matched_images.get(system)
             }
 
-        print("✅ Processing complete")
+        output["summary"] = issues.get("summary", "")
 
-        return {
-            "output": output
-        }
+        return {"output": output}
 
     except Exception as e:
         print("🔥 ERROR:", str(e))
-        traceback.print_exc()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))

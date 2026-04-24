@@ -1,17 +1,14 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import requests
-import pdfplumber
 import os
-import boto3
 import uuid
+import boto3
+from pdf2image import convert_from_bytes
 
 app = FastAPI()
 
-
-# =========================
-# CONFIG
-# =========================
+# AWS CONFIG
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION")
@@ -19,11 +16,10 @@ S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 
 s3 = boto3.client(
     "s3",
+    region_name=AWS_REGION,
     aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION
+    aws_secret_access_key=AWS_SECRET_KEY
 )
-
 
 class ReportRequest(BaseModel):
     reportUrl: str
@@ -35,92 +31,60 @@ def health():
     return {"status": "ok"}
 
 
-# =========================
-# S3 TEST
-# =========================
-@app.get("/test-s3")
-def test_s3():
-    try:
-        s3.list_buckets()
-        return {
-            "success": True,
-            "message": "S3 connection successful",
-            "bucket": S3_BUCKET
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-# =========================
-# MAIN PIPELINE
-# =========================
 @app.post("/webhook/adapter-test-upload")
 def adapter_test_upload(data: ReportRequest):
     try:
         pdf_url = data.reportUrl
         record_id = data.recordId
 
-        # -------------------------
-        # DOWNLOAD PDF
-        # -------------------------
+        # Download PDF
         response = requests.get(pdf_url)
         if response.status_code != 200:
-            return {"success": False, "error": "Failed to download PDF"}
+            return {"error": "Failed to download PDF"}
 
-        file_path = "temp_report.pdf"
-        with open(file_path, "wb") as f:
-            f.write(response.content)
+        pdf_bytes = response.content
 
-        # -------------------------
-        # EXTRACT TEXT
-        # -------------------------
-        text = ""
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
+        # 🔥 Convert PDF → images (THIS IS THE UPGRADE)
+        images = convert_from_bytes(pdf_bytes)
 
-        # -------------------------
-        # FAKE IMAGE GENERATION (TEMP)
-        # -------------------------
-        # We simulate an "image" upload for now
-        image_key = f"approved-images/{record_id}/{uuid.uuid4()}.txt"
+        uploaded_urls = []
 
-        temp_image_path = "temp_image.txt"
-        with open(temp_image_path, "w") as f:
-            f.write("placeholder image data")
+        for i, image in enumerate(images[:3]):  # limit to first 3 pages
+            file_id = str(uuid.uuid4())
+            filename = f"approved-images/{record_id}/{file_id}.png"
 
-        s3.upload_file(temp_image_path, S3_BUCKET, image_key)
+            # Save locally
+            local_path = f"/tmp/{file_id}.png"
+            image.save(local_path, "PNG")
 
-        image_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{image_key}"
+            # Upload to S3
+            s3.upload_file(
+                local_path,
+                S3_BUCKET,
+                filename,
+                ExtraArgs={"ContentType": "image/png"}
+            )
 
-        # -------------------------
-        # RESPONSE
-        # -------------------------
+            image_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+            uploaded_urls.append(image_url)
+
+        # Build structured response
+        def build_section():
+            return {
+                "issue": "no issues found",
+                "imageUrl": uploaded_urls[0] if uploaded_urls else None
+            }
+
         return {
             "output": {
-                "roof": {
-                    "issue": "no issues found",
-                    "imageUrl": image_url
-                },
-                "plumbing": {
-                    "issue": "no issues found",
-                    "imageUrl": image_url
-                },
-                "electrical": {
-                    "issue": "no issues found",
-                    "imageUrl": image_url
-                },
-                "hvac": {
-                    "issue": "no issues found",
-                    "imageUrl": image_url
-                },
-                "foundation": {
-                    "issue": "no issues found",
-                    "imageUrl": image_url
-                },
+                "roof": build_section(),
+                "plumbing": build_section(),
+                "electrical": build_section(),
+                "hvac": build_section(),
+                "foundation": build_section(),
                 "summary": "home is in good condition"
             }
         }
 
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"error": str(e)}

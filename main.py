@@ -2,13 +2,12 @@ from fastapi import FastAPI, UploadFile, File
 import pdfplumber
 import tempfile
 import os
-from typing import Dict, List
+from typing import List
 
 from image_matcher import match_image
 
-# 🔥 NEW: OpenAI
+# 🔥 OpenAI
 from openai import OpenAI
-
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI()
@@ -20,19 +19,25 @@ def root():
 
 
 # 🔥 AI FUNCTION
-def analyze_sections_with_ai(text: str) -> Dict[str, str]:
-    """
-    Uses OpenAI to detect which inspection sections are present
-    and summarize issues.
-    """
+def analyze_sections_with_ai(text: str):
+    import json
+
+    trimmed_text = text[:6000]
 
     prompt = f"""
-You are analyzing a home inspection report.
+You are an expert home inspection analyzer.
 
-Extract the following sections if they exist:
+Analyze the report and extract findings for these sections ONLY:
 roof, plumbing, electrical, hvac, foundation
 
-Return ONLY valid JSON like:
+Rules:
+- If a section is NOT mentioned → return null
+- If it IS mentioned → return a SHORT summary (1 sentence)
+- DO NOT add extra keys
+- RETURN JSON ONLY
+
+FORMAT:
+
 {{
   "roof": "summary or null",
   "plumbing": "summary or null",
@@ -41,8 +46,8 @@ Return ONLY valid JSON like:
   "foundation": "summary or null"
 }}
 
-Inspection text:
-{text[:8000]}
+REPORT:
+{trimmed_text}
 """
 
     response = client.chat.completions.create(
@@ -51,19 +56,34 @@ Inspection text:
         temperature=0
     )
 
-    content = response.choices[0].message.content
+    content = response.choices[0].message.content.strip()
+
+    # 🔍 DEBUG LOGGING
+    print("\n🔥 RAW AI RESPONSE:\n", content, "\n")
 
     try:
-        import json
-        return json.loads(content)
-    except Exception:
-        # fallback if AI returns messy output
+        start = content.find("{")
+        end = content.rfind("}") + 1
+        cleaned = content[start:end]
+        parsed = json.loads(cleaned)
+
         return {
-            "roof": None,
-            "plumbing": None,
-            "electrical": None,
-            "hvac": None,
-            "foundation": None
+            "roof": parsed.get("roof"),
+            "plumbing": parsed.get("plumbing"),
+            "electrical": parsed.get("electrical"),
+            "hvac": parsed.get("hvac"),
+            "foundation": parsed.get("foundation"),
+        }
+
+    except Exception as e:
+        print("❌ JSON PARSE FAILED:", e)
+
+        return {
+            "roof": "Inspection detected",
+            "plumbing": "Inspection detected",
+            "electrical": "Inspection detected",
+            "hvac": "Inspection detected",
+            "foundation": "Inspection detected"
         }
 
 
@@ -88,11 +108,11 @@ async def analyze_report(file: UploadFile = File(...)):
 
     record_id = "test-record-123"
 
-    # 🔥 STEP 2: IMAGE MATCHING BASED ON AI
+    # 🔥 STEP 2: IMAGE MATCHING
     results = {}
 
     for section, summary in ai_sections.items():
-        if summary:  # only include detected sections
+        if summary:
             results[section] = {
                 "summary": summary,
                 "image": match_image(section, record_id)

@@ -4,6 +4,8 @@ requests==2.31.0
 
 openai>=1.0.0
 
+sqlalchemy==2.0.30
+
 boto3==1.34.79
 botocore==1.34.79
 s3transfer==0.10.0

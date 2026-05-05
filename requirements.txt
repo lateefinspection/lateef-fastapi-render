@@ -1,8 +1,12 @@
 fastapi==0.110.0
 uvicorn==0.29.0
-requests==2.31.0
+pydantic==2.13.3
 
-openai>=1.0.0
+python-dotenv==1.0.1
+PyJWT==2.8.0
+pymysql==1.1.0
+
+twilio==9.0.0
 
 sqlalchemy==2.0.30
 
@@ -15,8 +19,5 @@ pdfminer.six==20221105
 pdf2image==1.17.0
 Pillow==10.3.0
 PyMuPDF==1.23.26
-PyJWT==2.8.0
 
 python-multipart==0.0.9
-pymysql
-python-dotenv==1.0.1

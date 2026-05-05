@@ -2,6 +2,9 @@ from sqlalchemy import Column, Integer, String, DateTime, Text
 from database import Base
 import datetime
 
+# =========================
+# DATABASE MODELS (SQLAlchemy)
+# =========================
 
 class Inspection(Base):
     __tablename__ = "inspections"
@@ -106,3 +109,33 @@ class EventEvidence(Base):
     description = Column(Text, default="")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# =========================
+# API REQUEST MODELS (Pydantic)
+# =========================
+
+from typing import List, Optional
+from pydantic import BaseModel
+
+
+class Finding(BaseModel):
+    type: Optional[str] = None
+    severity: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class InspectionProcessRequest(BaseModel):
+    record_id: Optional[str] = None
+    recordId: Optional[str] = None
+    inspectionId: Optional[str] = None
+    findings: Optional[List[Finding]] = []
+
+    def get_record_id(self):
+        return (
+            self.record_id
+            or self.recordId
+            or self.inspectionId
+            or "unknown"
+        )

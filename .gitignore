@@ -1,6 +1,19 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.save
-output/
+
+# Virtual environment
 venv/
+
+# Environment variables (CRITICAL)
+.env
+
+# Databases
+*.db
+
+# Output / temp files
+output/
+
+# OS / misc
+.DS_Store

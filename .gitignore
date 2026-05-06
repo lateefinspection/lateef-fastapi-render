@@ -1,19 +1,69 @@
-# Python
+# =========================
+# Python cache / compiled files
+# =========================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.pyo
 
-# Virtual environment
+# =========================
+# Virtual environments
+# =========================
 venv/
+.venv/
+env/
+ENV/
 
-# Environment variables (CRITICAL)
+# =========================
+# Environment variables / secrets
+# =========================
 .env
+.env.*
+!.env.example
 
-# Databases
+# =========================
+# Database files
+# =========================
 *.db
+*.sqlite
+*.sqlite3
 
-# Output / temp files
+# =========================
+# SQL exports / backups
+# IMPORTANT: prevents homefax_backup.sql from being committed
+# =========================
+*.sql
+*.dump
+*.bak
+
+# =========================
+# Output / generated files
+# =========================
 output/
+tmp/
+temp/
+logs/
+*.log
 
-# OS / misc
+# =========================
+# OS / editor files
+# =========================
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Test / cache folders
+# =========================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Local backup files
+# =========================
+*_backup*.py
+main_backup_*.py

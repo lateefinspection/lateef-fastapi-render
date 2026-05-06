@@ -2,6 +2,10 @@ from sqlalchemy import Column, Integer, String, DateTime, Text
 from database import Base
 import datetime
 
+from pydantic import BaseModel
+from typing import List, Optional, Literal
+
+
 # =========================
 # DATABASE MODELS (SQLAlchemy)
 # =========================
@@ -10,7 +14,6 @@ class Inspection(Base):
     __tablename__ = "inspections"
 
     id = Column(Integer, primary_key=True, index=True)
-
     record_id = Column(String, unique=True, index=True)
 
     homeowner_email = Column(String, default="test@homefax.ai")
@@ -30,14 +33,17 @@ class Inspection(Base):
     baseline_note = Column(Text, default="")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow
+    )
 
 
 class VerifiedIssue(Base):
     __tablename__ = "verified_issues"
 
     id = Column(Integer, primary_key=True, index=True)
-
     record_id = Column(String, index=True)
 
     section = Column(String, default="")
@@ -65,7 +71,11 @@ class VerifiedIssue(Base):
     priority = Column(String, default="monitor")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow
+    )
 
 
 class HomeEvent(Base):
@@ -115,27 +125,13 @@ class EventEvidence(Base):
 # API REQUEST MODELS (Pydantic)
 # =========================
 
-from typing import List, Optional
-from pydantic import BaseModel
-
-
 class Finding(BaseModel):
-    type: Optional[str] = None
-    severity: Optional[str] = None
-    location: Optional[str] = None
-    notes: Optional[str] = None
+    type: Optional[str] = "unknown"
+    severity: Optional[Literal["low", "medium", "high", "critical"]] = "low"
+    location: Optional[str] = "unknown"
+    notes: Optional[str] = ""
 
 
 class InspectionProcessRequest(BaseModel):
-    record_id: Optional[str] = None
-    recordId: Optional[str] = None
-    inspectionId: Optional[str] = None
-    findings: Optional[List[Finding]] = []
-
-    def get_record_id(self):
-        return (
-            self.record_id
-            or self.recordId
-            or self.inspectionId
-            or "unknown"
-        )
+    record_id: str
+    findings: List[Finding]

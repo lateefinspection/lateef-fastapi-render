@@ -1,6 +1,7 @@
 # =========================
 # HomeFax FastAPI Backend
 # Main API Service
+# Parser Quality Pass 1
 # =========================
 
 import os
@@ -44,7 +45,7 @@ APP_ENV = os.getenv("APP_ENV", "development")
 app = FastAPI(
     title="HomeFax AI Backend",
     description="HomeFax AI ingestion, parser, automation, and alert backend.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -64,12 +65,12 @@ def get_db_connection():
     """
     Central MySQL/RDS connection helper.
 
-    Uses Render/AWS environment variables:
-    DB_HOST
-    DB_PORT
-    DB_USER
-    DB_PASSWORD
-    DB_NAME
+    Uses:
+      DB_HOST
+      DB_PORT
+      DB_USER
+      DB_PASSWORD
+      DB_NAME
     """
     return pymysql.connect(
         host=DB_HOST,
@@ -180,8 +181,8 @@ def process_inspection(data: InspectionProcessRequest):
     """
     Receives normalized findings from n8n and creates:
 
-    1. alerts
-    2. automation_tasks
+      1. alerts
+      2. automation_tasks
 
     Expected JSON:
     {
@@ -195,6 +196,13 @@ def process_inspection(data: InspectionProcessRequest):
         }
       ]
     }
+
+    Parser Quality Pass 1 dedupe:
+      old: record_id + type + location
+      new: record_id + type + location + notes hash
+
+    This prevents exact duplicates while preserving separate real defects
+    in the same system/location.
     """
 
     conn = get_db_connection()
@@ -223,7 +231,11 @@ def process_inspection(data: InspectionProcessRequest):
             if severity not in ["low", "medium", "high", "critical"]:
                 severity = "low"
 
-            alert_key = f"{record_id}:{finding_type}:{location}".lower()
+            # Parser Quality Pass 1:
+            # include a short notes hash so distinct issues in the same
+            # system/location do not collapse into one alert/task.
+            notes_hash = hashlib.sha1(notes.encode("utf-8")).hexdigest()[:10]
+            alert_key = f"{record_id}:{finding_type}:{location}:{notes_hash}".lower()
 
             cursor.execute(
                 """
@@ -322,6 +334,7 @@ def process_inspection(data: InspectionProcessRequest):
 
 # =========================
 # PDF PARSER HELPERS
+# Parser Quality Pass 1
 # =========================
 
 def _safe_slug(value: str) -> str:
@@ -336,8 +349,11 @@ def _make_pdf_record_id(filename: str) -> str:
     """
     Creates a unique record ID for PDF parser ingestion.
 
-    Later, we can replace this with a real record_id from the intake form,
-    property record, uploaded report metadata, or database.
+    Later, this can be replaced with a real record_id from:
+      - intake form
+      - property record
+      - upload metadata
+      - inspections table
     """
     base = _safe_slug(filename.rsplit(".", 1)[0] if filename else "inspection")
     suffix = uuid.uuid4().hex[:8]
@@ -346,6 +362,8 @@ def _make_pdf_record_id(filename: str) -> str:
 
 def _clean_line(line: str) -> str:
     line = line or ""
+    line = line.replace("\u2014", " - ")
+    line = line.replace("\u2013", " - ")
     line = re.sub(r"\s+", " ", line)
     return line.strip()
 
@@ -360,12 +378,11 @@ def _extract_pdf_pages_from_bytes(content: bytes) -> List[dict]:
     Fallback:
       pypdf
 
-    Make sure requirements.txt includes at least:
+    Make sure requirements.txt includes:
       pypdf==5.1.0
     """
     pages = []
 
-    # Try PyMuPDF first if installed.
     try:
         import fitz  # PyMuPDF
 
@@ -385,7 +402,6 @@ def _extract_pdf_pages_from_bytes(content: bytes) -> List[dict]:
     except Exception as fitz_error:
         print("PyMuPDF extraction skipped or failed:", fitz_error)
 
-    # Fallback to pypdf.
     try:
         from pypdf import PdfReader
 
@@ -442,6 +458,7 @@ def _classify_report_from_pages(pages: List[dict]) -> str:
         "internachi" in text
         or "standards of practice" in text
         or "big ben inspections" in text
+        or "big ben home inspections" in text
     ):
         return "bigben_internachi"
 
@@ -462,6 +479,130 @@ def _classify_report_from_pages(pages: List[dict]) -> str:
     return "section_based"
 
 
+def _is_noise_line(line: str) -> bool:
+    """
+    Removes cover-page, table-of-contents, header/footer, and generic label noise.
+    """
+    cleaned = _clean_line(line)
+    low = cleaned.lower()
+
+    if not cleaned:
+        return True
+
+    if len(cleaned) < 4:
+        return True
+
+    # URLs, emails, phone numbers, addresses, branding.
+    noise_contains = [
+        "lateef home inspection services",
+        "lateefinspection",
+        "lateef home inspection",
+        "www.",
+        "http://",
+        "https://",
+        ".com",
+        "@",
+        "prepared for",
+        "prepared by",
+        "inspector:",
+        "client:",
+        "property:",
+        "inspection date",
+        "report id",
+        "page ",
+        "table of contents",
+        "contents",
+        "inspection detail",
+        "inspection details",
+        "home inspection report",
+        "residential inspection report",
+        "standards of practice",
+        "inter-nachi",
+        "internachi",
+        "copyright",
+        "confidential",
+        "agreement",
+        "invoice",
+        "summary",
+        "overview",
+        "definitions",
+        "legend",
+    ]
+
+    if any(fragment in low for fragment in noise_contains):
+        return True
+
+    # Generic labels that are not standalone issues.
+    exact_noise = {
+        "minor defect",
+        "major defect",
+        "material defect",
+        "safety hazard",
+        "maintenance item",
+        "monitor",
+        "inspected",
+        "not inspected",
+        "not present",
+        "not applicable",
+        "limitation",
+        "limitations",
+        "recommendation",
+        "recommendations",
+        "deficient",
+        "defect",
+        "defects",
+        "repair",
+        "repairs",
+        "notes",
+        "comments",
+        "description",
+        "descriptions",
+        "observations",
+        "observation",
+        "information",
+        "general information",
+    }
+
+    if low in exact_noise:
+        return True
+
+    # Mostly punctuation / separators.
+    if re.fullmatch(r"[-_=|•\s]+", cleaned):
+        return True
+
+    # TOC-style lines like "3 Exterior" or "9 Electrical".
+    if re.fullmatch(r"\d+\.?\s+[A-Za-z &/-]{3,40}", cleaned):
+        return True
+
+    return False
+
+
+def _normalize_section_name(value: str) -> str:
+    value = _clean_line(value)
+
+    if not value:
+        return "General"
+
+    aliases = {
+        "ac": "HVAC",
+        "a/c": "HVAC",
+        "heating": "HVAC",
+        "cooling": "HVAC",
+        "roofing": "Roof",
+        "exteriors": "Exterior",
+        "interiors": "Interior",
+        "electric": "Electrical",
+        "plumb": "Plumbing",
+    }
+
+    low = value.lower().strip()
+
+    if low in aliases:
+        return aliases[low]
+
+    return value[:80]
+
+
 def _guess_system(text: str) -> str:
     value = (text or "").lower()
 
@@ -478,6 +619,8 @@ def _guess_system(text: str) -> str:
                 "fascia",
                 "gutter",
                 "downspout",
+                "roof-covering",
+                "roof covering",
             ],
         ),
         (
@@ -492,6 +635,9 @@ def _guess_system(text: str) -> str:
                 "steps",
                 "driveway",
                 "walkway",
+                "grading",
+                "vegetation",
+                "doorbell",
             ],
         ),
         (
@@ -500,7 +646,6 @@ def _guess_system(text: str) -> str:
                 "basement",
                 "crawlspace",
                 "crawl space",
-                "foundation",
                 "sump",
                 "moisture",
                 "water intrusion",
@@ -515,6 +660,8 @@ def _guess_system(text: str) -> str:
                 "beam",
                 "joist",
                 "crack",
+                "floor structure",
+                "wall structure",
             ],
         ),
         (
@@ -523,12 +670,16 @@ def _guess_system(text: str) -> str:
                 "electrical",
                 "breaker",
                 "panel",
+                "panelboard",
                 "gfci",
+                "gfcis",
                 "outlet",
                 "receptacle",
                 "wiring",
                 "ground",
                 "bonding",
+                "service drop",
+                "service conductors",
             ],
         ),
         (
@@ -542,6 +693,8 @@ def _guess_system(text: str) -> str:
                 "faucet",
                 "water heater",
                 "drain",
+                "main water shut",
+                "hose bib",
             ],
         ),
         (
@@ -554,6 +707,9 @@ def _guess_system(text: str) -> str:
                 "ac unit",
                 "heat pump",
                 "duct",
+                "thermostat",
+                "cooling system",
+                "heating system",
             ],
         ),
         (
@@ -568,6 +724,8 @@ def _guess_system(text: str) -> str:
                 "stair",
                 "handrail",
                 "guardrail",
+                "cabinet",
+                "countertop",
             ],
         ),
         (
@@ -579,6 +737,7 @@ def _guess_system(text: str) -> str:
                 "oven",
                 "microwave",
                 "disposal",
+                "refrigerator",
             ],
         ),
         (
@@ -610,6 +769,7 @@ def _guess_system(text: str) -> str:
                 "carbon monoxide",
                 "co detector",
                 "trip hazard",
+                "fall hazard",
             ],
         ),
     ]
@@ -639,6 +799,7 @@ def _guess_type(text: str) -> str:
                 "gutter",
                 "downspout",
                 "basement",
+                "sump",
             ],
         ),
         (
@@ -651,6 +812,8 @@ def _guess_type(text: str) -> str:
                 "attic",
                 "soffit",
                 "fascia",
+                "roof-covering",
+                "roof covering",
             ],
         ),
         (
@@ -668,11 +831,15 @@ def _guess_type(text: str) -> str:
                 "electrical",
                 "breaker",
                 "panel",
+                "panelboard",
                 "gfci",
+                "gfcis",
                 "outlet",
                 "receptacle",
                 "wiring",
                 "ground",
+                "bonding",
+                "knockout",
             ],
         ),
         (
@@ -685,6 +852,7 @@ def _guess_type(text: str) -> str:
                 "sink",
                 "faucet",
                 "water heater",
+                "hose bib",
             ],
         ),
         (
@@ -709,6 +877,8 @@ def _guess_type(text: str) -> str:
                 "ac unit",
                 "heat pump",
                 "duct",
+                "cooling",
+                "heating",
             ],
         ),
         (
@@ -733,6 +903,7 @@ def _guess_type(text: str) -> str:
                 "handrail",
                 "smoke",
                 "carbon monoxide",
+                "co detector",
             ],
         ),
     ]
@@ -756,6 +927,8 @@ def _guess_severity(text: str) -> str:
             "danger",
             "urgent",
             "immediate safety",
+            "fire hazard",
+            "shock hazard",
         ]
     ):
         return "critical"
@@ -765,11 +938,15 @@ def _guess_severity(text: str) -> str:
         for k in [
             "high",
             "major",
+            "material defect",
             "deficient",
             "repair",
             "further evaluation",
             "correction",
             "not functional",
+            "active leak",
+            "missing gfci",
+            "open breaker",
         ]
     ):
         return "high"
@@ -791,7 +968,14 @@ def _guess_severity(text: str) -> str:
 
 
 def _looks_like_issue_text(text: str) -> bool:
+    if _is_noise_line(text):
+        return False
+
     value = (text or "").lower()
+
+    # Strong pattern: numbered inspection defect lines.
+    if re.match(r"^\d+(\.\d+){1,3}\s+", value):
+        return True
 
     issue_keywords = [
         "deficient",
@@ -821,23 +1005,130 @@ def _looks_like_issue_text(text: str) -> bool:
         "failed",
         "service",
         "monitor",
+        "open breaker",
+        "gfci",
+        "knockout",
     ]
 
     return any(keyword in value for keyword in issue_keywords)
 
 
+def _parse_numbered_defect_line(line: str) -> Optional[dict]:
+    """
+    Parses lines shaped like:
+
+      9.5.1 Electrical - Panelboards & Breakers: Open Breaker Knockout
+      9.8.1 Electrical - GFCIs: Missing GFCI
+      8.1.1 Plumbing - Main Water Shut-Off Valve: Active Water Leak at Valve
+
+    Returns structured issue fields when possible.
+    """
+    cleaned = _clean_line(line)
+
+    pattern = re.compile(
+        r"^(?P<number>\d+(?:\.\d+){1,3})\s+"
+        r"(?P<section>[A-Za-z][A-Za-z &/+-]{2,80})"
+        r"(?:\s+-\s+(?P<component>[^:]{2,140}))?"
+        r"(?:\s*:\s*(?P<title>.+))?$"
+    )
+
+    match = pattern.match(cleaned)
+
+    if not match:
+        return None
+
+    number = _clean_line(match.group("number") or "")
+    section = _normalize_section_name(match.group("section") or "")
+    component = _clean_line(match.group("component") or "")
+    title = _clean_line(match.group("title") or "")
+
+    # Avoid treating TOC lines as defects.
+    if not title and not component:
+        return None
+
+    if _is_noise_line(section) or _is_noise_line(title):
+        return None
+
+    if not title:
+        title = component or cleaned
+
+    combined = f"{section} {component} {title}"
+
+    return {
+        "number": number,
+        "section": section,
+        "component": component or section,
+        "issueTitle": title,
+        "type": _guess_type(combined),
+        "severity": _guess_severity(combined),
+    }
+
+
+def _build_issue_from_context(
+    title: str,
+    page: int,
+    context_lines: List[str],
+    parsed: Optional[dict] = None,
+) -> dict:
+    context_lines = [
+        _clean_line(line)
+        for line in context_lines
+        if line and not _is_noise_line(line)
+    ]
+
+    context = " — ".join(context_lines)
+    context = context[:1200]
+
+    parsed = parsed or {}
+
+    section = (
+        parsed.get("section")
+        or _guess_system(f"{title} {context}")
+        or "General"
+    )
+
+    component = (
+        parsed.get("component")
+        or section
+        or "General"
+    )
+
+    issue_title = (
+        parsed.get("issueTitle")
+        or title
+        or "Inspection issue"
+    )
+
+    combined = f"{issue_title} {section} {component} {context}"
+
+    return {
+        "issueTitle": issue_title[:180],
+        "severity": _guess_severity(combined),
+        "system": section,
+        "component": component,
+        "description": context or issue_title,
+        "recommendation": "Review and correct as recommended by a qualified contractor.",
+        "page": page,
+        "type": parsed.get("type") or _guess_type(combined),
+        "source_number": parsed.get("number"),
+    }
+
+
 def _extract_issue_candidates_from_pages(
     pages: List[dict],
-    max_issues: int = 40,
+    max_issues: int = 60,
 ) -> List[dict]:
     """
-    Heuristic PDF issue extraction.
+    Parser Quality Pass 1.
 
-    This is not the final AI-grade parser, but it gives the workflow real,
-    non-empty parser findings from inspection PDFs so the full rail works:
-
-    PDF → n8n → Render parser → normalized findings → /process-inspection → RDS
+    Strategy:
+      1. Extract clean lines from PDF text.
+      2. Prefer numbered defect lines.
+      3. Attach nearby context.
+      4. Skip cover page / TOC / footer noise.
+      5. Return cleaner structured issues.
     """
+
     all_lines = []
 
     for page in pages:
@@ -847,16 +1138,7 @@ def _extract_issue_candidates_from_pages(
         for raw_line in raw_text.splitlines():
             line = _clean_line(raw_line)
 
-            if len(line) < 8:
-                continue
-
-            low = line.lower()
-
-            # Remove common noisy page/footer fragments.
-            if low.startswith("page ") and len(line) < 25:
-                continue
-
-            if low in ["inspected", "not inspected", "not present", "not applicable"]:
+            if _is_noise_line(line):
                 continue
 
             all_lines.append(
@@ -869,59 +1151,82 @@ def _extract_issue_candidates_from_pages(
     issues = []
     seen = set()
 
+    # Pass A: strong numbered defect extraction.
     for index, item in enumerate(all_lines):
         line = item["text"]
+        parsed = _parse_numbered_defect_line(line)
 
-        if not _looks_like_issue_text(line):
+        if not parsed:
             continue
 
-        context_items = all_lines[max(0, index - 2): min(len(all_lines), index + 4)]
-        context_lines = [x["text"] for x in context_items]
-        context = " — ".join(context_lines)
+        start = max(0, index)
+        end = min(len(all_lines), index + 6)
+        context_lines = [x["text"] for x in all_lines[start:end]]
 
-        title = line
+        issue = _build_issue_from_context(
+            title=parsed.get("issueTitle") or line,
+            page=item.get("page"),
+            context_lines=context_lines,
+            parsed=parsed,
+        )
 
-        if title.lower() in [
-            "recommendation",
-            "recommendations",
-            "deficient",
-            "defect",
-            "defects",
-            "repair",
-            "repairs",
-        ]:
-            if index > 0:
-                title = all_lines[index - 1]["text"]
+        dedupe_base = (
+            f"{issue.get('source_number')}|"
+            f"{issue.get('system')}|"
+            f"{issue.get('component')}|"
+            f"{issue.get('issueTitle')}"
+        ).lower()
 
-        title = title[:180]
-        description = context[:900]
-
-        dedupe = re.sub(r"[^a-z0-9]+", "", (title + description).lower())[:220]
+        dedupe = hashlib.sha1(dedupe_base.encode("utf-8")).hexdigest()[:16]
 
         if dedupe in seen:
             continue
 
         seen.add(dedupe)
-
-        system = _guess_system(context)
-        issue_type = _guess_type(context)
-        severity = _guess_severity(context)
-
-        issues.append(
-            {
-                "issueTitle": title,
-                "severity": severity,
-                "system": system,
-                "component": system,
-                "description": description,
-                "recommendation": "Review and correct as recommended by a qualified contractor.",
-                "page": item.get("page"),
-                "type": issue_type,
-            }
-        )
+        issues.append(issue)
 
         if len(issues) >= max_issues:
             break
+
+    # Pass B: fallback keyword extraction if numbered issues are too few.
+    if len(issues) < 5:
+        for index, item in enumerate(all_lines):
+            line = item["text"]
+
+            if not _looks_like_issue_text(line):
+                continue
+
+            parsed = _parse_numbered_defect_line(line)
+
+            start = max(0, index - 1)
+            end = min(len(all_lines), index + 5)
+            context_lines = [x["text"] for x in all_lines[start:end]]
+
+            issue = _build_issue_from_context(
+                title=line,
+                page=item.get("page"),
+                context_lines=context_lines,
+                parsed=parsed,
+            )
+
+            dedupe_base = (
+                f"{issue.get('page')}|"
+                f"{issue.get('system')}|"
+                f"{issue.get('component')}|"
+                f"{issue.get('issueTitle')}|"
+                f"{issue.get('description')[:180]}"
+            ).lower()
+
+            dedupe = hashlib.sha1(dedupe_base.encode("utf-8")).hexdigest()[:16]
+
+            if dedupe in seen:
+                continue
+
+            seen.add(dedupe)
+            issues.append(issue)
+
+            if len(issues) >= max_issues:
+                break
 
     return issues
 
@@ -932,6 +1237,19 @@ def _normalize_extracted_issue_to_finding(issue: dict) -> dict:
         or issue.get("title")
         or issue.get("name")
         or "Inspection issue"
+    )
+
+    section = (
+        issue.get("system")
+        or issue.get("section")
+        or issue.get("location")
+        or "General"
+    )
+
+    component = (
+        issue.get("component")
+        or section
+        or "General"
     )
 
     description = (
@@ -949,29 +1267,31 @@ def _normalize_extracted_issue_to_finding(issue: dict) -> dict:
         or ""
     )
 
-    notes_parts = [
-        str(part).strip()
-        for part in [title, description, recommendation]
-        if part is not None and str(part).strip()
-    ]
+    source_number = issue.get("source_number")
+
+    notes_parts = []
+
+    if source_number:
+        notes_parts.append(f"Report item {source_number}")
+
+    notes_parts.extend(
+        [
+            str(title).strip(),
+            str(description).strip(),
+            str(recommendation).strip(),
+        ]
+    )
+
+    notes_parts = [part for part in notes_parts if part]
 
     notes = " — ".join(notes_parts)
 
-    location = (
-        issue.get("location")
-        or issue.get("room")
-        or issue.get("area")
-        or issue.get("section")
-        or issue.get("system")
-        or "unspecified"
-    )
-
-    combined_text = f"{title} {description} {recommendation} {location}"
+    combined_text = f"{title} {description} {recommendation} {section} {component}"
 
     return {
         "type": issue.get("type") or _guess_type(combined_text),
         "severity": _guess_severity(str(issue.get("severity") or combined_text)),
-        "location": str(location),
+        "location": str(section),
         "notes": notes or str(issue),
     }
 
@@ -1046,6 +1366,7 @@ async def analyze_report(file: UploadFile = File(...)):
                     "recommendation": "Review this report manually or improve the adapter parser.",
                     "page": 1,
                     "type": "general_issue",
+                    "source_number": None,
                 }
             ]
 

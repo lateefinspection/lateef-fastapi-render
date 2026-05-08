@@ -1,24 +1,51 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from typing import Optional, List
-import pymysql
+# =========================
+# HomeFax FastAPI Backend
+# Main API Service
+# =========================
+
 import os
+import re
+import uuid
 import secrets
 import hashlib
 import hmac
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
-import jwt
+from typing import Optional, List
 
-from twilio.rest import Client
-import smtplib
-from email.mime.text import MIMEText
+import pymysql
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+
+from pydantic import BaseModel
+
+
+# =========================
+# ENV SETUP
+# =========================
 
 load_dotenv()
 
-app = FastAPI(title="HomeFax AI SaaS Backend")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "homefax_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "homefax")
+
+APP_ENV = os.getenv("APP_ENV", "development")
+
+
+# =========================
+# FASTAPI APP
+# =========================
+
+app = FastAPI(
+    title="HomeFax AI Backend",
+    description="HomeFax AI ingestion, parser, automation, and alert backend.",
+    version="1.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,53 +55,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-security = HTTPBearer()
 
 # =========================
-# CONFIG
-# =========================
-
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-change-this-secret")
-JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_MINUTES = 60 * 24 * 7
-
-# Database config
-# IMPORTANT:
-# On Render, these values must come from Render Environment Variables.
-# Locally, defaults let Raspberry Pi continue using local MariaDB.
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("DB_PORT", "3306"))
-DB_USER = os.getenv("DB_USER", "homefax_user")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "StrongPassword123!")
-DB_NAME = os.getenv("DB_NAME", "homefax")
-
-# Twilio config
-TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID") or os.getenv("TWILIO_SID")
-TWILIO_AUTH = os.getenv("TWILIO_AUTH_TOKEN") or os.getenv("TWILIO_AUTH")
-TWILIO_PHONE = os.getenv("TWILIO_PHONE") or os.getenv("TWILIO_PHONE_NUMBER")
-
-FALLBACK_USER_PHONE = os.getenv("USER_PHONE") or os.getenv("USER_PHONE_NUMBER")
-
-# Email config
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS") or os.getenv("EMAIL_USER")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD") or os.getenv("EMAIL_PASS")
-FALLBACK_EMAIL_TO = os.getenv("EMAIL_TO") or EMAIL_ADDRESS
-
-
-# =========================
-# DATABASE
+# DATABASE CONNECTION
 # =========================
 
 def get_db_connection():
     """
-    Creates a MySQL connection.
+    Central MySQL/RDS connection helper.
 
-    Local development:
-      DB_HOST defaults to 127.0.0.1
-
-    Render production:
-      Set DB_HOST to your AWS RDS endpoint:
-      homefax-db.cypms2wauq5r.us-east-1.rds.amazonaws.com
+    Uses Render/AWS environment variables:
+    DB_HOST
+    DB_PORT
+    DB_USER
+    DB_PASSWORD
+    DB_NAME
     """
     return pymysql.connect(
         host=DB_HOST,
@@ -84,168 +79,15 @@ def get_db_connection():
         database=DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
+        connect_timeout=10,
+        read_timeout=30,
+        write_timeout=30,
     )
 
 
 # =========================
-# AUTH HELPERS
+# PYDANTIC MODELS
 # =========================
-
-def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode(),
-        salt.encode(),
-        120000
-    ).hex()
-    return f"{salt}${digest}"
-
-
-def verify_password(password: str, stored_hash: str) -> bool:
-    try:
-        salt, digest = stored_hash.split("$", 1)
-        check = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode(),
-            salt.encode(),
-            120000
-        ).hex()
-        return hmac.compare_digest(check, digest)
-    except Exception:
-        return False
-
-
-def create_access_token(user_id: int, email: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
-
-    payload = {
-        "sub": str(user_id),
-        "email": email,
-        "exp": expire,
-    }
-
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(
-            credentials.credentials,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM]
-        )
-        user_id = int(payload["sub"])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute("SELECT * FROM saas_users WHERE id=%s", (user_id,))
-        user = cursor.fetchone()
-    finally:
-        cursor.close()
-        conn.close()
-
-    if not user or not user.get("is_active", 1):
-        raise HTTPException(status_code=401, detail="User inactive")
-
-    return user
-
-
-# =========================
-# NOTIFICATIONS
-# =========================
-
-def send_sms(to_phone, message):
-    try:
-        if not to_phone:
-            print("SMS skipped: no phone number")
-            return False
-
-        if not TWILIO_SID or not TWILIO_AUTH or not TWILIO_PHONE:
-            print("SMS skipped: missing Twilio config")
-            return False
-
-        client = Client(TWILIO_SID, TWILIO_AUTH)
-
-        client.messages.create(
-            body=message,
-            from_=TWILIO_PHONE,
-            to=to_phone
-        )
-
-        return True
-
-    except Exception as e:
-        print("SMS ERROR:", e)
-        return False
-
-
-def send_email(to_email, subject, body):
-    try:
-        if not to_email:
-            print("EMAIL skipped: no email destination")
-            return False
-
-        if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
-            print("EMAIL skipped: missing email config")
-            return False
-
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_ADDRESS
-        msg["To"] = to_email
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
-
-        return True
-
-    except Exception as e:
-        print("EMAIL ERROR:", e)
-        return False
-
-
-def notify_record_owner(record_id, subject, message):
-    """
-    Temporary notification helper.
-
-    Later, this should look up the real homeowner/admin notification settings
-    by record_id. For now it uses fallback environment variables.
-    """
-    send_sms(FALLBACK_USER_PHONE, message)
-    send_email(FALLBACK_EMAIL_TO, subject, message)
-
-
-# =========================
-# REQUEST MODELS
-# =========================
-
-class RegisterRequest(BaseModel):
-    email: str
-    password: str
-
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-
-class DeviceCreate(BaseModel):
-    device_name: str
-    capabilities: List[str]
-
-
-class ReadingCreate(BaseModel):
-    device_id: int
-    capability_key: str
-    reading_type: str
-    numeric_value: Optional[float] = None
-
 
 class Finding(BaseModel):
     type: Optional[str] = "unknown"
@@ -260,14 +102,15 @@ class InspectionProcessRequest(BaseModel):
 
 
 # =========================
-# ROOT / HEALTH
+# BASIC ROUTES
 # =========================
 
 @app.get("/")
 def root():
     return {
-        "status": "running",
-        "service": "HomeFax AI SaaS Backend",
+        "success": True,
+        "service": "HomeFax AI Backend",
+        "environment": APP_ENV,
         "db_host": DB_HOST,
         "db_name": DB_NAME,
     }
@@ -277,22 +120,21 @@ def root():
 def health():
     return {
         "status": "ok",
-        "service": "HomeFax AI SaaS Backend"
+        "service": "homefax-fastapi",
     }
 
 
 @app.get("/db-health")
 def db_health():
     """
-    Quick database connectivity check.
-    Use this after setting Render environment variables.
+    Confirms that Render/FastAPI can reach AWS RDS.
     """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
         cursor.execute("SELECT 1 AS ok")
-        result = cursor.fetchone()
+        row = cursor.fetchone()
 
         cursor.close()
         conn.close()
@@ -302,193 +144,31 @@ def db_health():
             "db_connected": True,
             "db_host": DB_HOST,
             "db_name": DB_NAME,
-            "result": result,
+            "result": row,
         }
 
     except Exception as e:
-        print("DB HEALTH ERROR:", e)
         raise HTTPException(
             status_code=500,
-            detail=f"Database connection failed: {str(e)}"
+            detail=f"Database connection failed: {str(e)}",
         )
 
 
 # =========================
-# AUTH
+# NOTIFICATION STUB
 # =========================
 
-@app.post("/auth/register")
-def register(payload: RegisterRequest):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+def notify_record_owner(record_id: str, subject: str, message: str):
+    """
+    Placeholder notification function.
 
-    try:
-        cursor.execute(
-            "SELECT id FROM saas_users WHERE email=%s",
-            (payload.email,)
-        )
-        existing = cursor.fetchone()
-
-        if existing:
-            raise HTTPException(status_code=400, detail="Email already registered")
-
-        password_hash = hash_password(payload.password)
-
-        cursor.execute(
-            """
-            INSERT INTO saas_users (email, password_hash)
-            VALUES (%s, %s)
-            """,
-            (payload.email, password_hash)
-        )
-
-        conn.commit()
-        user_id = cursor.lastrowid
-
-        token = create_access_token(user_id, payload.email)
-
-        return {
-            "status": "registered",
-            "user_id": user_id,
-            "token": token,
-            "token_type": "bearer",
-        }
-
-    except HTTPException:
-        conn.rollback()
-        raise
-
-    except Exception as e:
-        conn.rollback()
-        print("REGISTER ERROR:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.post("/auth/login")
-def login(payload: LoginRequest):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            "SELECT * FROM saas_users WHERE email=%s",
-            (payload.email,)
-        )
-        user = cursor.fetchone()
-
-        if not user or not verify_password(payload.password, user["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid login")
-
-        token = create_access_token(user["id"], user["email"])
-
-        return {
-            "token": token,
-            "token_type": "bearer",
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        print("LOGIN ERROR:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        cursor.close()
-        conn.close()
-
-
-# =========================
-# AUTOMATION ENGINE
-# =========================
-
-@app.post("/inspections/{record_id}/automation/run")
-def run_automation(record_id: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    alerts = 0
-    tasks = 0
-
-    try:
-        cursor.execute(
-            "SELECT * FROM device_readings WHERE record_id=%s",
-            (record_id,)
-        )
-        readings = cursor.fetchall()
-
-        for r in readings:
-            numeric_value = float(r.get("numeric_value") or 0)
-            capability_key = r.get("capability_key")
-            device_id = r.get("device_id") or 0
-
-            if capability_key == "weather_monitoring" and numeric_value >= 0.2:
-                alert_key = f"{record_id}:{device_id}:rain_detected"
-
-                cursor.execute(
-                    """
-                    INSERT IGNORE INTO alerts
-                    (record_id, device_id, capability_key, alert_type, severity, message, dedupe_key, status)
-                    VALUES (%s, %s, %s, 'rain_detected', 'high', %s, %s, 'active')
-                    """,
-                    (
-                        record_id,
-                        device_id,
-                        capability_key,
-                        "Rain detected — potential roof vulnerability",
-                        alert_key,
-                    )
-                )
-
-                if cursor.rowcount > 0:
-                    alerts += 1
-                    notify_record_owner(
-                        record_id,
-                        "HomeFax Rain Alert",
-                        "Rain detected — potential roof vulnerability"
-                    )
-
-                task_key = f"{record_id}:{device_id}:rain_task"
-
-                cursor.execute(
-                    """
-                    INSERT IGNORE INTO automation_tasks
-                    (record_id, task_type, priority, title, description, recommended_trade, status, source, dedupe_key)
-                    VALUES (%s, 'inspection', 'medium', %s, %s, %s, 'open', 'automation_engine', %s)
-                    """,
-                    (
-                        record_id,
-                        "Rain inspection",
-                        "Inspect property due to rain conditions",
-                        "roofer",
-                        task_key,
-                    )
-                )
-
-                if cursor.rowcount > 0:
-                    tasks += 1
-
-        conn.commit()
-
-        return {
-            "success": True,
-            "record_id": record_id,
-            "alerts": alerts,
-            "tasks": tasks,
-        }
-
-    except Exception as e:
-        conn.rollback()
-        print("AUTOMATION ERROR:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        cursor.close()
-        conn.close()
+    This keeps /process-inspection stable even before email/SMS notification
+    is fully connected.
+    """
+    print("NOTIFY_RECORD_OWNER")
+    print("record_id:", record_id)
+    print("subject:", subject)
+    print("message:", message)
 
 
 # =========================
@@ -498,17 +178,20 @@ def run_automation(record_id: str):
 @app.post("/process-inspection")
 def process_inspection(data: InspectionProcessRequest):
     """
-    Receives normalized findings from n8n.
+    Receives normalized findings from n8n and creates:
+
+    1. alerts
+    2. automation_tasks
 
     Expected JSON:
     {
-      "record_id": "test-2",
+      "record_id": "string",
       "findings": [
         {
           "type": "water_leak",
           "severity": "high",
           "location": "basement",
-          "notes": "Active leak"
+          "notes": "Active leak under stairs"
         }
       ]
     }
@@ -517,19 +200,22 @@ def process_inspection(data: InspectionProcessRequest):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    record_id = data.record_id
-    findings = data.findings or []
-
-    alerts_created = 0
-    tasks_created = 0
-    processed_findings = []
-
     try:
+        record_id = (data.record_id or "").strip()
+
         if not record_id:
-            raise HTTPException(status_code=400, detail="Missing record_id")
+            raise HTTPException(status_code=400, detail="record_id is required")
+
+        findings = data.findings or []
+
+        alerts_created = 0
+        tasks_created = 0
+        processed_findings = []
 
         for f in findings:
             finding_type = (f.type or "unknown").lower().strip()
+            finding_type = re.sub(r"\s+", "_", finding_type)
+
             severity = (f.severity or "low").lower().strip()
             location = (f.location or "unknown").lower().strip()
             notes = f.notes or ""
@@ -539,33 +225,31 @@ def process_inspection(data: InspectionProcessRequest):
 
             alert_key = f"{record_id}:{finding_type}:{location}".lower()
 
-            # Insert alert.
-            # device_id is set to 0 because this alert comes from AI ingestion,
-            # not a physical sensor device.
             cursor.execute(
                 """
                 INSERT IGNORE INTO alerts
-                (record_id, device_id, capability_key, alert_type, severity, message, dedupe_key, status)
-                VALUES (%s, 0, %s, %s, %s, %s, %s, 'active')
+                (record_id, alert_type, severity, message, dedupe_key, status)
+                VALUES (%s, %s, %s, %s, %s, 'active')
                 """,
                 (
                     record_id,
-                    "ai_ingestion",
                     finding_type,
                     severity,
                     notes,
                     alert_key,
-                )
+                ),
             )
 
-            if cursor.rowcount > 0:
+            new_alert = cursor.rowcount > 0
+
+            if new_alert:
                 alerts_created += 1
 
                 if severity in ["high", "critical"]:
                     notify_record_owner(
                         record_id,
                         f"HomeFax Alert: {finding_type}",
-                        f"{finding_type} detected at {location}. {notes}"
+                        f"{finding_type} detected at {location}. {notes}",
                     )
 
             task_key = f"{alert_key}:task"
@@ -573,7 +257,17 @@ def process_inspection(data: InspectionProcessRequest):
             cursor.execute(
                 """
                 INSERT IGNORE INTO automation_tasks
-                (record_id, task_type, priority, title, description, recommended_trade, status, source, dedupe_key)
+                (
+                    record_id,
+                    task_type,
+                    priority,
+                    title,
+                    description,
+                    recommended_trade,
+                    status,
+                    source,
+                    dedupe_key
+                )
                 VALUES (%s, %s, %s, %s, %s, %s, 'open', 'ai_ingestion', %s)
                 """,
                 (
@@ -584,20 +278,22 @@ def process_inspection(data: InspectionProcessRequest):
                     notes,
                     "general_home_service",
                     task_key,
-                )
+                ),
             )
 
             if cursor.rowcount > 0:
                 tasks_created += 1
 
-            processed_findings.append({
-                "type": finding_type,
-                "severity": severity,
-                "location": location,
-                "notes": notes,
-                "alert_key": alert_key,
-                "task_key": task_key,
-            })
+            processed_findings.append(
+                {
+                    "type": finding_type,
+                    "severity": severity,
+                    "location": location,
+                    "notes": notes,
+                    "alert_key": alert_key,
+                    "task_key": task_key,
+                }
+            )
 
         conn.commit()
 
@@ -625,28 +321,769 @@ def process_inspection(data: InspectionProcessRequest):
 
 
 # =========================
+# PDF PARSER HELPERS
+# =========================
+
+def _safe_slug(value: str) -> str:
+    value = value or "inspection"
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = value.strip("-")
+    return value[:40] or "inspection"
+
+
+def _make_pdf_record_id(filename: str) -> str:
+    """
+    Creates a unique record ID for PDF parser ingestion.
+
+    Later, we can replace this with a real record_id from the intake form,
+    property record, uploaded report metadata, or database.
+    """
+    base = _safe_slug(filename.rsplit(".", 1)[0] if filename else "inspection")
+    suffix = uuid.uuid4().hex[:8]
+    return f"pdf-{base}-{suffix}"
+
+
+def _clean_line(line: str) -> str:
+    line = line or ""
+    line = re.sub(r"\s+", " ", line)
+    return line.strip()
+
+
+def _extract_pdf_pages_from_bytes(content: bytes) -> List[dict]:
+    """
+    Extract text from PDF bytes.
+
+    Preferred:
+      PyMuPDF / fitz
+
+    Fallback:
+      pypdf
+
+    Make sure requirements.txt includes at least:
+      pypdf==5.1.0
+    """
+    pages = []
+
+    # Try PyMuPDF first if installed.
+    try:
+        import fitz  # PyMuPDF
+
+        doc = fitz.open(stream=content, filetype="pdf")
+        for idx, page in enumerate(doc):
+            text = page.get_text("text") or ""
+            pages.append(
+                {
+                    "page": idx + 1,
+                    "text": text,
+                }
+            )
+        doc.close()
+
+        return pages
+
+    except Exception as fitz_error:
+        print("PyMuPDF extraction skipped or failed:", fitz_error)
+
+    # Fallback to pypdf.
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(content))
+
+        for idx, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+
+            pages.append(
+                {
+                    "page": idx + 1,
+                    "text": text,
+                }
+            )
+
+        return pages
+
+    except Exception as pypdf_error:
+        print("pypdf extraction failed:", pypdf_error)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "PDF text extraction failed. Install PyMuPDF or pypdf. "
+                "Recommended: add pypdf==5.1.0 to requirements.txt and redeploy."
+            ),
+        )
+
+
+def _classify_report_from_pages(pages: List[dict]) -> str:
+    """
+    Lightweight report classifier.
+    """
+    if not isinstance(pages, list):
+        return "section_based"
+
+    text = "\n".join((p.get("text") or "") for p in pages[:10]).lower()
+
+    spectora_signals = [
+        "spectora",
+        "rj home inspections",
+        "rj residential report",
+        "deficient",
+        "maintenance",
+        "page 1 of",
+    ]
+
+    if sum(1 for k in spectora_signals if k in text) >= 3:
+        return "spectora"
+
+    if (
+        "internachi" in text
+        or "standards of practice" in text
+        or "big ben inspections" in text
+    ):
+        return "bigben_internachi"
+
+    amerispec_signals = [
+        "amerispec",
+        "condition:",
+        "recommendation:",
+        "defect:",
+        "observation:",
+    ]
+
+    if sum(1 for k in amerispec_signals if k in text) >= 2:
+        return "amerispec"
+
+    if "property inspection report" in text or "home inspection report" in text:
+        return "generic_narrative"
+
+    return "section_based"
+
+
+def _guess_system(text: str) -> str:
+    value = (text or "").lower()
+
+    system_keywords = [
+        (
+            "Roof",
+            [
+                "roof",
+                "shingle",
+                "flashing",
+                "chimney",
+                "attic",
+                "soffit",
+                "fascia",
+                "gutter",
+                "downspout",
+            ],
+        ),
+        (
+            "Exterior",
+            [
+                "siding",
+                "trim",
+                "exterior",
+                "wall cladding",
+                "deck",
+                "porch",
+                "steps",
+                "driveway",
+                "walkway",
+            ],
+        ),
+        (
+            "Basement",
+            [
+                "basement",
+                "crawlspace",
+                "crawl space",
+                "foundation",
+                "sump",
+                "moisture",
+                "water intrusion",
+            ],
+        ),
+        (
+            "Foundation",
+            [
+                "foundation",
+                "settlement",
+                "structural",
+                "beam",
+                "joist",
+                "crack",
+            ],
+        ),
+        (
+            "Electrical",
+            [
+                "electrical",
+                "breaker",
+                "panel",
+                "gfci",
+                "outlet",
+                "receptacle",
+                "wiring",
+                "ground",
+                "bonding",
+            ],
+        ),
+        (
+            "Plumbing",
+            [
+                "plumbing",
+                "pipe",
+                "valve",
+                "toilet",
+                "sink",
+                "faucet",
+                "water heater",
+                "drain",
+            ],
+        ),
+        (
+            "HVAC",
+            [
+                "hvac",
+                "furnace",
+                "air conditioner",
+                "air conditioning",
+                "ac unit",
+                "heat pump",
+                "duct",
+            ],
+        ),
+        (
+            "Interior",
+            [
+                "interior",
+                "ceiling",
+                "floor",
+                "wall",
+                "window",
+                "door",
+                "stair",
+                "handrail",
+                "guardrail",
+            ],
+        ),
+        (
+            "Appliances",
+            [
+                "appliance",
+                "dishwasher",
+                "range",
+                "oven",
+                "microwave",
+                "disposal",
+            ],
+        ),
+        (
+            "Garage",
+            [
+                "garage",
+                "overhead door",
+                "garage door",
+                "opener",
+            ],
+        ),
+        (
+            "Pest",
+            [
+                "termite",
+                "wdi",
+                "wood destroying",
+                "pest",
+                "rodent",
+                "insect",
+            ],
+        ),
+        (
+            "Safety",
+            [
+                "safety",
+                "hazard",
+                "smoke detector",
+                "carbon monoxide",
+                "co detector",
+                "trip hazard",
+            ],
+        ),
+    ]
+
+    for system, keywords in system_keywords:
+        if any(keyword in value for keyword in keywords):
+            return system
+
+    return "General"
+
+
+def _guess_type(text: str) -> str:
+    value = (text or "").lower()
+
+    rules = [
+        (
+            "water_leak",
+            [
+                "water",
+                "leak",
+                "moisture",
+                "stain",
+                "staining",
+                "seep",
+                "wet",
+                "drain",
+                "gutter",
+                "downspout",
+                "basement",
+            ],
+        ),
+        (
+            "roof_damage",
+            [
+                "roof",
+                "shingle",
+                "flashing",
+                "chimney",
+                "attic",
+                "soffit",
+                "fascia",
+            ],
+        ),
+        (
+            "mold",
+            [
+                "mold",
+                "fungal",
+                "microbial",
+                "mildew",
+            ],
+        ),
+        (
+            "electrical_issue",
+            [
+                "electrical",
+                "breaker",
+                "panel",
+                "gfci",
+                "outlet",
+                "receptacle",
+                "wiring",
+                "ground",
+            ],
+        ),
+        (
+            "plumbing_issue",
+            [
+                "plumbing",
+                "pipe",
+                "valve",
+                "toilet",
+                "sink",
+                "faucet",
+                "water heater",
+            ],
+        ),
+        (
+            "foundation_issue",
+            [
+                "foundation",
+                "settlement",
+                "crack",
+                "structural",
+                "framing",
+                "joist",
+                "beam",
+            ],
+        ),
+        (
+            "hvac_issue",
+            [
+                "hvac",
+                "furnace",
+                "air condition",
+                "air conditioning",
+                "ac unit",
+                "heat pump",
+                "duct",
+            ],
+        ),
+        (
+            "pest_issue",
+            [
+                "pest",
+                "termite",
+                "wdi",
+                "wood destroying",
+                "rodent",
+                "insect",
+            ],
+        ),
+        (
+            "safety_issue",
+            [
+                "safety",
+                "hazard",
+                "trip",
+                "fall",
+                "guardrail",
+                "handrail",
+                "smoke",
+                "carbon monoxide",
+            ],
+        ),
+    ]
+
+    for issue_type, keywords in rules:
+        if any(keyword in value for keyword in keywords):
+            return issue_type
+
+    return "general_issue"
+
+
+def _guess_severity(text: str) -> str:
+    value = (text or "").lower()
+
+    if any(
+        k in value
+        for k in [
+            "critical",
+            "unsafe",
+            "safety hazard",
+            "danger",
+            "urgent",
+            "immediate safety",
+        ]
+    ):
+        return "critical"
+
+    if any(
+        k in value
+        for k in [
+            "high",
+            "major",
+            "deficient",
+            "repair",
+            "further evaluation",
+            "correction",
+            "not functional",
+        ]
+    ):
+        return "high"
+
+    if any(
+        k in value
+        for k in [
+            "low",
+            "minor",
+            "cosmetic",
+            "monitor",
+            "maintenance",
+            "service",
+        ]
+    ):
+        return "low"
+
+    return "medium"
+
+
+def _looks_like_issue_text(text: str) -> bool:
+    value = (text or "").lower()
+
+    issue_keywords = [
+        "deficient",
+        "defect",
+        "repair",
+        "replace",
+        "recommend",
+        "recommendation",
+        "further evaluation",
+        "correction",
+        "not functional",
+        "not operating",
+        "unsafe",
+        "safety",
+        "hazard",
+        "moisture",
+        "water",
+        "leak",
+        "stain",
+        "staining",
+        "damaged",
+        "deteriorated",
+        "cracked",
+        "missing",
+        "loose",
+        "improper",
+        "failed",
+        "service",
+        "monitor",
+    ]
+
+    return any(keyword in value for keyword in issue_keywords)
+
+
+def _extract_issue_candidates_from_pages(
+    pages: List[dict],
+    max_issues: int = 40,
+) -> List[dict]:
+    """
+    Heuristic PDF issue extraction.
+
+    This is not the final AI-grade parser, but it gives the workflow real,
+    non-empty parser findings from inspection PDFs so the full rail works:
+
+    PDF → n8n → Render parser → normalized findings → /process-inspection → RDS
+    """
+    all_lines = []
+
+    for page in pages:
+        page_num = page.get("page")
+        raw_text = page.get("text") or ""
+
+        for raw_line in raw_text.splitlines():
+            line = _clean_line(raw_line)
+
+            if len(line) < 8:
+                continue
+
+            low = line.lower()
+
+            # Remove common noisy page/footer fragments.
+            if low.startswith("page ") and len(line) < 25:
+                continue
+
+            if low in ["inspected", "not inspected", "not present", "not applicable"]:
+                continue
+
+            all_lines.append(
+                {
+                    "page": page_num,
+                    "text": line,
+                }
+            )
+
+    issues = []
+    seen = set()
+
+    for index, item in enumerate(all_lines):
+        line = item["text"]
+
+        if not _looks_like_issue_text(line):
+            continue
+
+        context_items = all_lines[max(0, index - 2): min(len(all_lines), index + 4)]
+        context_lines = [x["text"] for x in context_items]
+        context = " — ".join(context_lines)
+
+        title = line
+
+        if title.lower() in [
+            "recommendation",
+            "recommendations",
+            "deficient",
+            "defect",
+            "defects",
+            "repair",
+            "repairs",
+        ]:
+            if index > 0:
+                title = all_lines[index - 1]["text"]
+
+        title = title[:180]
+        description = context[:900]
+
+        dedupe = re.sub(r"[^a-z0-9]+", "", (title + description).lower())[:220]
+
+        if dedupe in seen:
+            continue
+
+        seen.add(dedupe)
+
+        system = _guess_system(context)
+        issue_type = _guess_type(context)
+        severity = _guess_severity(context)
+
+        issues.append(
+            {
+                "issueTitle": title,
+                "severity": severity,
+                "system": system,
+                "component": system,
+                "description": description,
+                "recommendation": "Review and correct as recommended by a qualified contractor.",
+                "page": item.get("page"),
+                "type": issue_type,
+            }
+        )
+
+        if len(issues) >= max_issues:
+            break
+
+    return issues
+
+
+def _normalize_extracted_issue_to_finding(issue: dict) -> dict:
+    title = (
+        issue.get("issueTitle")
+        or issue.get("title")
+        or issue.get("name")
+        or "Inspection issue"
+    )
+
+    description = (
+        issue.get("description")
+        or issue.get("summary")
+        or issue.get("details")
+        or issue.get("text")
+        or ""
+    )
+
+    recommendation = (
+        issue.get("recommendation")
+        or issue.get("recommended_action")
+        or issue.get("nextAction")
+        or ""
+    )
+
+    notes_parts = [
+        str(part).strip()
+        for part in [title, description, recommendation]
+        if part is not None and str(part).strip()
+    ]
+
+    notes = " — ".join(notes_parts)
+
+    location = (
+        issue.get("location")
+        or issue.get("room")
+        or issue.get("area")
+        or issue.get("section")
+        or issue.get("system")
+        or "unspecified"
+    )
+
+    combined_text = f"{title} {description} {recommendation} {location}"
+
+    return {
+        "type": issue.get("type") or _guess_type(combined_text),
+        "severity": _guess_severity(str(issue.get("severity") or combined_text)),
+        "location": str(location),
+        "notes": notes or str(issue),
+    }
+
+
+# =========================
 # PDF UPLOAD ENDPOINT — ADAPTER PATH
 # =========================
 
 @app.post("/analyze-report/")
 async def analyze_report(file: UploadFile = File(...)):
     """
-    Keeps the existing file-upload parser route alive.
+    Real PDF parser endpoint for n8n.
 
-    Later, your adapter pipeline can plug in here:
-    PDF → classify_report → adapter → extract_findings → normalize → image_matcher
+    Input:
+      multipart/form-data
+      field name: file
+
+    Output:
+      {
+        success,
+        record_id,
+        filename,
+        detectedAdapter,
+        extractedIssues,
+        findings,
+        parser_debug
+      }
+
+    n8n flow:
+      Webhook
+      → Determine Input Type
+      → FastAPI PDF Parser and Adapter Extraction
+      → Transform Parser Output to Normalized Format
+      → Send Parser Findings to FastAPI
+      → /process-inspection
+      → RDS alerts/tasks
     """
 
     try:
         content = await file.read()
 
+        if not content:
+            raise HTTPException(status_code=400, detail="Uploaded PDF was empty")
+
+        filename = file.filename or "inspection-report.pdf"
+
+        pages = _extract_pdf_pages_from_bytes(content)
+        detected_adapter = _classify_report_from_pages(pages)
+        extracted_issues = _extract_issue_candidates_from_pages(pages)
+
+        findings = [
+            _normalize_extracted_issue_to_finding(issue)
+            for issue in extracted_issues
+        ]
+
+        # If text extraction succeeds but issue detection finds nothing,
+        # return a visible review item instead of silently returning empty findings.
+        if not findings:
+            combined_text = "\n".join((p.get("text") or "") for p in pages[:3])
+            preview = _clean_line(combined_text[:600])
+
+            extracted_issues = [
+                {
+                    "issueTitle": "Manual inspection report review needed",
+                    "severity": "medium",
+                    "system": "General",
+                    "component": "Inspection Report",
+                    "description": (
+                        "The PDF was received and text was extracted, but no specific "
+                        "defect lines were confidently detected by the current parser."
+                    ),
+                    "recommendation": "Review this report manually or improve the adapter parser.",
+                    "page": 1,
+                    "type": "general_issue",
+                }
+            ]
+
+            findings = [
+                {
+                    "type": "general_issue",
+                    "severity": "medium",
+                    "location": "General",
+                    "notes": (
+                        "Manual inspection report review needed — "
+                        "The PDF was received, but the current parser did not confidently "
+                        f"extract specific defects. Preview: {preview}"
+                    ),
+                }
+            ]
+
+        record_id = _make_pdf_record_id(filename)
+
         return {
             "success": True,
-            "filename": file.filename,
-            "message": "File received by HomeFax parser endpoint",
+            "record_id": record_id,
+            "filename": filename,
+            "message": "PDF parsed by HomeFax parser endpoint",
             "size_bytes": len(content),
-            "findings": [],
+            "page_count": len(pages),
+            "detectedAdapter": detected_adapter,
+            "extractedIssues": extracted_issues,
+            "findings": findings,
+            "parser_debug": {
+                "text_pages": len(pages),
+                "detected_adapter": detected_adapter,
+                "extracted_issue_count": len(extracted_issues),
+                "normalized_finding_count": len(findings),
+            },
         }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         print("ANALYZE REPORT ERROR:", e)

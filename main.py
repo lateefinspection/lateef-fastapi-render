@@ -1,7 +1,7 @@
 # =========================
 # HomeFax FastAPI Backend
 # Main API Service
-# Parser Quality Pass 1
+# Parser Quality Pass 1 + Verified Issues
 # =========================
 
 import os
@@ -27,7 +27,7 @@ from pydantic import BaseModel
 # ENV SETUP
 # =========================
 
-load_dotenv()
+load_dotenv(dotenv_path=".env")
 
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
@@ -44,8 +44,8 @@ APP_ENV = os.getenv("APP_ENV", "development")
 
 app = FastAPI(
     title="HomeFax AI Backend",
-    description="HomeFax AI ingestion, parser, automation, and alert backend.",
-    version="1.1.0",
+    description="HomeFax AI ingestion, parser, automation, alerts, and verified issue backend.",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -128,7 +128,7 @@ def health():
 @app.get("/db-health")
 def db_health():
     """
-    Confirms that Render/FastAPI can reach AWS RDS.
+    Confirms that FastAPI can reach AWS RDS.
     """
     try:
         conn = get_db_connection()
@@ -173,6 +173,106 @@ def notify_record_owner(record_id: str, subject: str, message: str):
 
 
 # =========================
+# ISSUE NORMALIZATION HELPERS
+# =========================
+
+def derive_issue_title(finding_type: str, location: str, notes: str) -> str:
+    """
+    Creates a readable issue title for verified_issues.
+
+    Example notes:
+      Report item 9.8.1 — Missing GFCI — GFCI protection missing...
+
+    Output:
+      Missing GFCI
+    """
+    notes = notes or ""
+    finding_type = finding_type or "general_issue"
+    location = location or "General"
+
+    normalized_notes = notes.replace(" - ", " — ")
+
+    parts = [
+        part.strip()
+        for part in normalized_notes.split("—")
+        if part and part.strip()
+    ]
+
+    for part in parts:
+        lowered = part.lower()
+
+        if lowered.startswith("report item"):
+            continue
+
+        if len(part) < 4:
+            continue
+
+        return part[:180]
+
+    readable_type = finding_type.replace("_", " ").title()
+    readable_location = str(location).title()
+
+    return f"{readable_location}: {readable_type}"[:180]
+
+
+def derive_risk_fields(severity: str):
+    """
+    Converts severity into verified_issues risk fields.
+    """
+    severity = (severity or "low").lower().strip()
+
+    if severity == "critical":
+        return {
+            "risk_score": 95,
+            "risk_level": "CRITICAL",
+            "priority": "urgent",
+        }
+
+    if severity == "high":
+        return {
+            "risk_score": 80,
+            "risk_level": "HIGH",
+            "priority": "repair",
+        }
+
+    if severity == "medium":
+        return {
+            "risk_score": 50,
+            "risk_level": "MEDIUM",
+            "priority": "review",
+        }
+
+    return {
+        "risk_score": 20,
+        "risk_level": "LOW",
+        "priority": "monitor",
+    }
+
+
+def verified_issue_exists(cursor, record_id: str, title: str, summary: str) -> bool:
+    """
+    Prevents duplicate verified_issues without requiring a database unique index.
+    """
+    cursor.execute(
+        """
+        SELECT id
+        FROM verified_issues
+        WHERE record_id = %s
+          AND title = %s
+          AND summary = %s
+        LIMIT 1
+        """,
+        (
+            record_id,
+            title,
+            summary,
+        ),
+    )
+
+    return cursor.fetchone() is not None
+
+
+# =========================
 # AI INGESTION — JSON FROM N8N
 # =========================
 
@@ -183,6 +283,7 @@ def process_inspection(data: InspectionProcessRequest):
 
       1. alerts
       2. automation_tasks
+      3. verified_issues
 
     Expected JSON:
     {
@@ -197,12 +298,11 @@ def process_inspection(data: InspectionProcessRequest):
       ]
     }
 
-    Parser Quality Pass 1 dedupe:
-      old: record_id + type + location
-      new: record_id + type + location + notes hash
+    Dedupe:
+      alerts/tasks use record_id + type + location + notes hash
 
-    This prevents exact duplicates while preserving separate real defects
-    in the same system/location.
+    Verified issues:
+      one verified_issues row per distinct parsed finding
     """
 
     conn = get_db_connection()
@@ -218,6 +318,8 @@ def process_inspection(data: InspectionProcessRequest):
 
         alerts_created = 0
         tasks_created = 0
+        verified_issues_created = 0
+        verified_issues_existing = 0
         processed_findings = []
 
         for f in findings:
@@ -225,17 +327,19 @@ def process_inspection(data: InspectionProcessRequest):
             finding_type = re.sub(r"\s+", "_", finding_type)
 
             severity = (f.severity or "low").lower().strip()
-            location = (f.location or "unknown").lower().strip()
+            location = (f.location or "unknown").strip()
+            location_key = location.lower().strip()
             notes = f.notes or ""
 
             if severity not in ["low", "medium", "high", "critical"]:
                 severity = "low"
 
-            # Parser Quality Pass 1:
-            # include a short notes hash so distinct issues in the same
-            # system/location do not collapse into one alert/task.
+            # -------------------------------------------------
+            # 1. Create alert
+            # -------------------------------------------------
+
             notes_hash = hashlib.sha1(notes.encode("utf-8")).hexdigest()[:10]
-            alert_key = f"{record_id}:{finding_type}:{location}:{notes_hash}".lower()
+            alert_key = f"{record_id}:{finding_type}:{location_key}:{notes_hash}".lower()
 
             cursor.execute(
                 """
@@ -264,6 +368,10 @@ def process_inspection(data: InspectionProcessRequest):
                         f"{finding_type} detected at {location}. {notes}",
                     )
 
+            # -------------------------------------------------
+            # 2. Create automation task
+            # -------------------------------------------------
+
             task_key = f"{alert_key}:task"
 
             cursor.execute(
@@ -286,7 +394,7 @@ def process_inspection(data: InspectionProcessRequest):
                     record_id,
                     finding_type,
                     severity,
-                    f"{finding_type} issue",
+                    f"{finding_type.replace('_', ' ').title()} issue",
                     notes,
                     "general_home_service",
                     task_key,
@@ -296,6 +404,87 @@ def process_inspection(data: InspectionProcessRequest):
             if cursor.rowcount > 0:
                 tasks_created += 1
 
+            # -------------------------------------------------
+            # 3. Create verified issue
+            # -------------------------------------------------
+
+            issue_title = derive_issue_title(
+                finding_type=finding_type,
+                location=location,
+                notes=notes,
+            )
+
+            risk_fields = derive_risk_fields(severity)
+
+            if verified_issue_exists(cursor, record_id, issue_title, notes):
+                verified_issues_existing += 1
+                verified_issue_created = False
+
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO verified_issues
+                    (
+                        record_id,
+                        section,
+                        title,
+                        summary,
+                        image_url,
+                        severity,
+                        status,
+                        homeowner_decision,
+                        homeowner_note,
+                        admin_review_status,
+                        admin_note,
+                        baseline_locked,
+                        baseline_locked_at,
+                        current_status,
+                        resolved_by_event_id,
+                        risk_score,
+                        risk_level,
+                        priority,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES
+                    (
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        '',
+                        %s,
+                        'new',
+                        'unreviewed',
+                        '',
+                        'pending',
+                        '',
+                        'no',
+                        NULL,
+                        'open',
+                        NULL,
+                        %s,
+                        %s,
+                        %s,
+                        NOW(),
+                        NOW()
+                    )
+                    """,
+                    (
+                        record_id,
+                        location,
+                        issue_title,
+                        notes,
+                        severity,
+                        risk_fields["risk_score"],
+                        risk_fields["risk_level"],
+                        risk_fields["priority"],
+                    ),
+                )
+
+                verified_issues_created += 1
+                verified_issue_created = True
+
             processed_findings.append(
                 {
                     "type": finding_type,
@@ -304,6 +493,11 @@ def process_inspection(data: InspectionProcessRequest):
                     "notes": notes,
                     "alert_key": alert_key,
                     "task_key": task_key,
+                    "verified_issue_title": issue_title,
+                    "verified_issue_created": verified_issue_created,
+                    "risk_score": risk_fields["risk_score"],
+                    "risk_level": risk_fields["risk_level"],
+                    "priority": risk_fields["priority"],
                 }
             )
 
@@ -315,6 +509,8 @@ def process_inspection(data: InspectionProcessRequest):
             "findings_count": len(findings),
             "alerts_created": alerts_created,
             "tasks_created": tasks_created,
+            "verified_issues_created": verified_issues_created,
+            "verified_issues_existing": verified_issues_existing,
             "processed_findings": processed_findings,
         }
 
@@ -492,7 +688,6 @@ def _is_noise_line(line: str) -> bool:
     if len(cleaned) < 4:
         return True
 
-    # URLs, emails, phone numbers, addresses, branding.
     noise_contains = [
         "lateef home inspection services",
         "lateefinspection",
@@ -532,7 +727,6 @@ def _is_noise_line(line: str) -> bool:
     if any(fragment in low for fragment in noise_contains):
         return True
 
-    # Generic labels that are not standalone issues.
     exact_noise = {
         "minor defect",
         "major defect",
@@ -566,11 +760,9 @@ def _is_noise_line(line: str) -> bool:
     if low in exact_noise:
         return True
 
-    # Mostly punctuation / separators.
     if re.fullmatch(r"[-_=|•\s]+", cleaned):
         return True
 
-    # TOC-style lines like "3 Exterior" or "9 Electrical".
     if re.fullmatch(r"\d+\.?\s+[A-Za-z &/-]{3,40}", cleaned):
         return True
 
@@ -973,7 +1165,6 @@ def _looks_like_issue_text(text: str) -> bool:
 
     value = (text or "").lower()
 
-    # Strong pattern: numbered inspection defect lines.
     if re.match(r"^\d+(\.\d+){1,3}\s+", value):
         return True
 
@@ -1020,8 +1211,6 @@ def _parse_numbered_defect_line(line: str) -> Optional[dict]:
       9.5.1 Electrical - Panelboards & Breakers: Open Breaker Knockout
       9.8.1 Electrical - GFCIs: Missing GFCI
       8.1.1 Plumbing - Main Water Shut-Off Valve: Active Water Leak at Valve
-
-    Returns structured issue fields when possible.
     """
     cleaned = _clean_line(line)
 
@@ -1042,7 +1231,6 @@ def _parse_numbered_defect_line(line: str) -> Optional[dict]:
     component = _clean_line(match.group("component") or "")
     title = _clean_line(match.group("title") or "")
 
-    # Avoid treating TOC lines as defects.
     if not title and not component:
         return None
 
@@ -1246,12 +1434,6 @@ def _normalize_extracted_issue_to_finding(issue: dict) -> dict:
         or "General"
     )
 
-    component = (
-        issue.get("component")
-        or section
-        or "General"
-    )
-
     description = (
         issue.get("description")
         or issue.get("summary")
@@ -1286,7 +1468,7 @@ def _normalize_extracted_issue_to_finding(issue: dict) -> dict:
 
     notes = " — ".join(notes_parts)
 
-    combined_text = f"{title} {description} {recommendation} {section} {component}"
+    combined_text = f"{title} {description} {recommendation} {section}"
 
     return {
         "type": issue.get("type") or _guess_type(combined_text),
@@ -1327,7 +1509,7 @@ async def analyze_report(file: UploadFile = File(...)):
       → Transform Parser Output to Normalized Format
       → Send Parser Findings to FastAPI
       → /process-inspection
-      → RDS alerts/tasks
+      → RDS alerts/tasks/verified_issues
     """
 
     try:
@@ -1347,8 +1529,6 @@ async def analyze_report(file: UploadFile = File(...)):
             for issue in extracted_issues
         ]
 
-        # If text extraction succeeds but issue detection finds nothing,
-        # return a visible review item instead of silently returning empty findings.
         if not findings:
             combined_text = "\n".join((p.get("text") or "") for p in pages[:3])
             preview = _clean_line(combined_text[:600])

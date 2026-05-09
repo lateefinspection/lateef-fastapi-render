@@ -1,17 +1,14 @@
 # =========================
 # HomeFax FastAPI Backend
 # Main API Service
-# Parser Quality Pass 1 + Verified Issues
+# Parser Quality Pass 1 + Verified Issues + Dashboard Routes
 # =========================
 
 import os
 import re
 import uuid
-import secrets
 import hashlib
-import hmac
 from io import BytesIO
-from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 import pymysql
@@ -44,8 +41,8 @@ APP_ENV = os.getenv("APP_ENV", "development")
 
 app = FastAPI(
     title="HomeFax AI Backend",
-    description="HomeFax AI ingestion, parser, automation, alerts, and verified issue backend.",
-    version="1.2.0",
+    description="HomeFax AI ingestion, parser, automation, alerts, verified issues, and dashboard API.",
+    version="1.3.0",
 )
 
 app.add_middleware(
@@ -64,13 +61,6 @@ app.add_middleware(
 def get_db_connection():
     """
     Central MySQL/RDS connection helper.
-
-    Uses:
-      DB_HOST
-      DB_PORT
-      DB_USER
-      DB_PASSWORD
-      DB_NAME
     """
     return pymysql.connect(
         host=DB_HOST,
@@ -100,6 +90,15 @@ class Finding(BaseModel):
 class InspectionProcessRequest(BaseModel):
     record_id: str
     findings: List[Finding]
+
+
+class VerifiedIssueStatusUpdate(BaseModel):
+    status: Optional[str] = None
+    current_status: Optional[str] = None
+    homeowner_decision: Optional[str] = None
+    homeowner_note: Optional[str] = None
+    admin_review_status: Optional[str] = None
+    admin_note: Optional[str] = None
 
 
 # =========================
@@ -162,9 +161,6 @@ def db_health():
 def notify_record_owner(record_id: str, subject: str, message: str):
     """
     Placeholder notification function.
-
-    This keeps /process-inspection stable even before email/SMS notification
-    is fully connected.
     """
     print("NOTIFY_RECORD_OWNER")
     print("record_id:", record_id)
@@ -180,7 +176,7 @@ def derive_issue_title(finding_type: str, location: str, notes: str) -> str:
     """
     Creates a readable issue title for verified_issues.
 
-    Example notes:
+    Example:
       Report item 9.8.1 — Missing GFCI — GFCI protection missing...
 
     Output:
@@ -284,25 +280,6 @@ def process_inspection(data: InspectionProcessRequest):
       1. alerts
       2. automation_tasks
       3. verified_issues
-
-    Expected JSON:
-    {
-      "record_id": "string",
-      "findings": [
-        {
-          "type": "water_leak",
-          "severity": "high",
-          "location": "basement",
-          "notes": "Active leak under stairs"
-        }
-      ]
-    }
-
-    Dedupe:
-      alerts/tasks use record_id + type + location + notes hash
-
-    Verified issues:
-      one verified_issues row per distinct parsed finding
     """
 
     conn = get_db_connection()
@@ -529,6 +506,510 @@ def process_inspection(data: InspectionProcessRequest):
 
 
 # =========================
+# VERIFIED ISSUE API ROUTES
+# Dashboard Display + Status Updates
+# =========================
+
+def normalize_verified_issue_row(row: dict) -> dict:
+    """
+    Converts MySQL row values into dashboard-friendly JSON.
+    """
+    if not row:
+        return {}
+
+    return {
+        "id": row.get("id"),
+        "record_id": row.get("record_id"),
+        "section": row.get("section"),
+        "title": row.get("title"),
+        "summary": row.get("summary"),
+        "image_url": row.get("image_url"),
+        "severity": row.get("severity"),
+        "status": row.get("status"),
+        "homeowner_decision": row.get("homeowner_decision"),
+        "homeowner_note": row.get("homeowner_note"),
+        "admin_review_status": row.get("admin_review_status"),
+        "admin_note": row.get("admin_note"),
+        "baseline_locked": row.get("baseline_locked"),
+        "baseline_locked_at": (
+            row.get("baseline_locked_at").isoformat()
+            if row.get("baseline_locked_at")
+            else None
+        ),
+        "current_status": row.get("current_status"),
+        "resolved_by_event_id": row.get("resolved_by_event_id"),
+        "risk_score": row.get("risk_score"),
+        "risk_level": row.get("risk_level"),
+        "priority": row.get("priority"),
+        "created_at": (
+            row.get("created_at").isoformat()
+            if row.get("created_at")
+            else None
+        ),
+        "updated_at": (
+            row.get("updated_at").isoformat()
+            if row.get("updated_at")
+            else None
+        ),
+    }
+
+
+@app.get("/verified-issues")
+def list_verified_issues(
+    limit: int = 50,
+    offset: int = 0,
+    status: Optional[str] = None,
+    current_status: Optional[str] = None,
+    severity: Optional[str] = None,
+    priority: Optional[str] = None,
+):
+    """
+    Dashboard route.
+
+    Returns verified issues across all records.
+
+    Examples:
+      /verified-issues
+      /verified-issues?limit=20
+      /verified-issues?severity=high
+      /verified-issues?current_status=open
+    """
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    where_clauses = []
+    params = []
+
+    if status:
+        where_clauses.append("status = %s")
+        params.append(status)
+
+    if current_status:
+        where_clauses.append("current_status = %s")
+        params.append(current_status)
+
+    if severity:
+        where_clauses.append("severity = %s")
+        params.append(severity)
+
+    if priority:
+        where_clauses.append("priority = %s")
+        params.append(priority)
+
+    where_sql = ""
+
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM verified_issues
+            {where_sql}
+            """,
+            params,
+        )
+
+        total_row = cursor.fetchone()
+        total = total_row["total"] if total_row else 0
+
+        cursor.execute(
+            f"""
+            SELECT
+                id,
+                record_id,
+                section,
+                title,
+                summary,
+                image_url,
+                severity,
+                status,
+                homeowner_decision,
+                homeowner_note,
+                admin_review_status,
+                admin_note,
+                baseline_locked,
+                baseline_locked_at,
+                current_status,
+                resolved_by_event_id,
+                risk_score,
+                risk_level,
+                priority,
+                created_at,
+                updated_at
+            FROM verified_issues
+            {where_sql}
+            ORDER BY
+                CASE
+                    WHEN risk_level = 'CRITICAL' THEN 1
+                    WHEN risk_level = 'HIGH' THEN 2
+                    WHEN risk_level = 'MEDIUM' THEN 3
+                    WHEN risk_level = 'LOW' THEN 4
+                    ELSE 5
+                END,
+                created_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            params + [limit, offset],
+        )
+
+        rows = cursor.fetchall()
+
+        return {
+            "success": True,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "count": len(rows),
+            "issues": [normalize_verified_issue_row(row) for row in rows],
+        }
+
+    except Exception as e:
+        print("ERROR IN /verified-issues:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/verified-issues/{record_id}")
+def get_verified_issues_by_record(record_id: str):
+    """
+    Dashboard route.
+
+    Returns all verified issues for one inspection/report record.
+    """
+
+    record_id = (record_id or "").strip()
+
+    if not record_id:
+        raise HTTPException(status_code=400, detail="record_id is required")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                record_id,
+                section,
+                title,
+                summary,
+                image_url,
+                severity,
+                status,
+                homeowner_decision,
+                homeowner_note,
+                admin_review_status,
+                admin_note,
+                baseline_locked,
+                baseline_locked_at,
+                current_status,
+                resolved_by_event_id,
+                risk_score,
+                risk_level,
+                priority,
+                created_at,
+                updated_at
+            FROM verified_issues
+            WHERE record_id = %s
+            ORDER BY
+                CASE
+                    WHEN risk_level = 'CRITICAL' THEN 1
+                    WHEN risk_level = 'HIGH' THEN 2
+                    WHEN risk_level = 'MEDIUM' THEN 3
+                    WHEN risk_level = 'LOW' THEN 4
+                    ELSE 5
+                END,
+                id ASC
+            """,
+            (record_id,),
+        )
+
+        rows = cursor.fetchall()
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "count": len(rows),
+            "issues": [normalize_verified_issue_row(row) for row in rows],
+        }
+
+    except Exception as e:
+        print("ERROR IN /verified-issues/{record_id}:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/verified-issue/{issue_id}")
+def get_verified_issue(issue_id: int):
+    """
+    Dashboard route.
+
+    Returns one verified issue by ID.
+    """
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                record_id,
+                section,
+                title,
+                summary,
+                image_url,
+                severity,
+                status,
+                homeowner_decision,
+                homeowner_note,
+                admin_review_status,
+                admin_note,
+                baseline_locked,
+                baseline_locked_at,
+                current_status,
+                resolved_by_event_id,
+                risk_score,
+                risk_level,
+                priority,
+                created_at,
+                updated_at
+            FROM verified_issues
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (issue_id,),
+        )
+
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Verified issue not found")
+
+        return {
+            "success": True,
+            "issue": normalize_verified_issue_row(row),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print("ERROR IN /verified-issue/{issue_id}:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.patch("/verified-issue/{issue_id}/status")
+def update_verified_issue_status(issue_id: int, update: VerifiedIssueStatusUpdate):
+    """
+    Dashboard route.
+
+    Updates homeowner/admin workflow fields for one verified issue.
+
+    Allowed dashboard flow examples:
+      current_status: open, monitoring, scheduled, repaired, verified, resolved
+      status: new, active, dismissed, resolved
+      homeowner_decision: unreviewed, accepted, rejected, needs_help
+      admin_review_status: pending, approved, rejected, needs_review
+    """
+
+    allowed_statuses = {
+        "new",
+        "active",
+        "dismissed",
+        "resolved",
+    }
+
+    allowed_current_statuses = {
+        "open",
+        "monitoring",
+        "scheduled",
+        "repaired",
+        "verified",
+        "resolved",
+    }
+
+    allowed_homeowner_decisions = {
+        "unreviewed",
+        "accepted",
+        "rejected",
+        "needs_help",
+    }
+
+    allowed_admin_review_statuses = {
+        "pending",
+        "approved",
+        "rejected",
+        "needs_review",
+    }
+
+    fields = []
+    params = []
+
+    if update.status is not None:
+        value = update.status.lower().strip()
+
+        if value not in allowed_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status. Allowed: {sorted(allowed_statuses)}",
+            )
+
+        fields.append("status = %s")
+        params.append(value)
+
+    if update.current_status is not None:
+        value = update.current_status.lower().strip()
+
+        if value not in allowed_current_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid current_status. Allowed: {sorted(allowed_current_statuses)}",
+            )
+
+        fields.append("current_status = %s")
+        params.append(value)
+
+        if value == "resolved":
+            fields.append("status = %s")
+            params.append("resolved")
+
+    if update.homeowner_decision is not None:
+        value = update.homeowner_decision.lower().strip()
+
+        if value not in allowed_homeowner_decisions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid homeowner_decision. Allowed: {sorted(allowed_homeowner_decisions)}",
+            )
+
+        fields.append("homeowner_decision = %s")
+        params.append(value)
+
+    if update.homeowner_note is not None:
+        fields.append("homeowner_note = %s")
+        params.append(update.homeowner_note)
+
+    if update.admin_review_status is not None:
+        value = update.admin_review_status.lower().strip()
+
+        if value not in allowed_admin_review_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid admin_review_status. Allowed: {sorted(allowed_admin_review_statuses)}",
+            )
+
+        fields.append("admin_review_status = %s")
+        params.append(value)
+
+    if update.admin_note is not None:
+        fields.append("admin_note = %s")
+        params.append(update.admin_note)
+
+    if not fields:
+        raise HTTPException(
+            status_code=400,
+            detail="No update fields provided",
+        )
+
+    fields.append("updated_at = NOW()")
+    params.append(issue_id)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT id FROM verified_issues WHERE id = %s LIMIT 1",
+            (issue_id,),
+        )
+
+        existing = cursor.fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Verified issue not found")
+
+        sql = f"""
+            UPDATE verified_issues
+            SET {", ".join(fields)}
+            WHERE id = %s
+        """
+
+        cursor.execute(sql, params)
+        conn.commit()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                record_id,
+                section,
+                title,
+                summary,
+                image_url,
+                severity,
+                status,
+                homeowner_decision,
+                homeowner_note,
+                admin_review_status,
+                admin_note,
+                baseline_locked,
+                baseline_locked_at,
+                current_status,
+                resolved_by_event_id,
+                risk_score,
+                risk_level,
+                priority,
+                created_at,
+                updated_at
+            FROM verified_issues
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (issue_id,),
+        )
+
+        updated_row = cursor.fetchone()
+
+        return {
+            "success": True,
+            "message": "Verified issue updated",
+            "issue": normalize_verified_issue_row(updated_row),
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        print("ERROR IN PATCH /verified-issue/{issue_id}/status:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# =========================
 # PDF PARSER HELPERS
 # Parser Quality Pass 1
 # =========================
@@ -544,12 +1025,6 @@ def _safe_slug(value: str) -> str:
 def _make_pdf_record_id(filename: str) -> str:
     """
     Creates a unique record ID for PDF parser ingestion.
-
-    Later, this can be replaced with a real record_id from:
-      - intake form
-      - property record
-      - upload metadata
-      - inspections table
     """
     base = _safe_slug(filename.rsplit(".", 1)[0] if filename else "inspection")
     suffix = uuid.uuid4().hex[:8]
@@ -573,14 +1048,11 @@ def _extract_pdf_pages_from_bytes(content: bytes) -> List[dict]:
 
     Fallback:
       pypdf
-
-    Make sure requirements.txt includes:
-      pypdf==5.1.0
     """
     pages = []
 
     try:
-        import fitz  # PyMuPDF
+        import fitz
 
         doc = fitz.open(stream=content, filetype="pdf")
         for idx, page in enumerate(doc):
@@ -1308,13 +1780,6 @@ def _extract_issue_candidates_from_pages(
 ) -> List[dict]:
     """
     Parser Quality Pass 1.
-
-    Strategy:
-      1. Extract clean lines from PDF text.
-      2. Prefer numbered defect lines.
-      3. Attach nearby context.
-      4. Skip cover page / TOC / footer noise.
-      5. Return cleaner structured issues.
     """
 
     all_lines = []
@@ -1501,15 +1966,6 @@ async def analyze_report(file: UploadFile = File(...)):
         findings,
         parser_debug
       }
-
-    n8n flow:
-      Webhook
-      → Determine Input Type
-      → FastAPI PDF Parser and Adapter Extraction
-      → Transform Parser Output to Normalized Format
-      → Send Parser Findings to FastAPI
-      → /process-inspection
-      → RDS alerts/tasks/verified_issues
     """
 
     try:

@@ -2026,8 +2026,27 @@ def normalize_verified_issue_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "status": row.get("status"),
         "homeowner_decision": row.get("homeowner_decision"),
         "homeowner_note": row.get("homeowner_note") or "",
+        "homeowner_image_decision": row.get("homeowner_image_decision") or "unreviewed",
+        "homeowner_reviewed_at": (
+            row.get("homeowner_reviewed_at").isoformat()
+            if row.get("homeowner_reviewed_at")
+            else None
+        ),
         "admin_review_status": row.get("admin_review_status"),
+        "admin_image_decision": row.get("admin_image_decision") or "pending",
+        "admin_reviewed_at": (
+            row.get("admin_reviewed_at").isoformat()
+            if row.get("admin_reviewed_at")
+            else None
+        ),
         "admin_note": row.get("admin_note") or "",
+        "final_approval_status": row.get("final_approval_status") or "not_approved",
+        "final_approved_at": (
+            row.get("final_approved_at").isoformat()
+            if row.get("final_approved_at")
+            else None
+        ),
+        "final_approved_by": row.get("final_approved_by") or "",
         "baseline_locked": row.get("baseline_locked"),
         "baseline_locked_at": iso(row.get("baseline_locked_at")),
         "current_status": row.get("current_status"),
@@ -2437,3 +2456,1027 @@ def update_issue_image_verification(issue_id: int, update: ImageVerificationUpda
     finally:
         cursor.close()
         conn.close()
+
+
+# =========================
+# HOMEOWNER + ADMIN VERIFICATION WORKFLOW CONTRACT PASS 1
+# =========================
+
+class HomeownerReviewUpdate(BaseModel):
+    homeowner_decision: str
+    homeowner_image_decision: Optional[str] = "unreviewed"
+    homeowner_note: Optional[str] = ""
+
+
+class AdminReviewUpdate(BaseModel):
+    admin_review_status: str
+    admin_image_decision: Optional[str] = "pending"
+    verified_image_url: Optional[str] = ""
+    admin_note: Optional[str] = ""
+
+
+class FinalApprovalUpdate(BaseModel):
+    final_approval_status: str = "approved"
+    final_approved_by: Optional[str] = "admin"
+    admin_note: Optional[str] = ""
+
+
+def ensure_review_workflow_schema():
+    """
+    Adds homeowner/admin/final approval fields without dropping existing data.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "homeowner_image_decision",
+            "homeowner_image_decision VARCHAR(100) DEFAULT 'unreviewed'",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "homeowner_reviewed_at",
+            "homeowner_reviewed_at DATETIME NULL",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "admin_image_decision",
+            "admin_image_decision VARCHAR(100) DEFAULT 'pending'",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "admin_reviewed_at",
+            "admin_reviewed_at DATETIME NULL",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "final_approval_status",
+            "final_approval_status VARCHAR(100) DEFAULT 'not_approved'",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "final_approved_at",
+            "final_approved_at DATETIME NULL",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "final_approved_by",
+            "final_approved_by VARCHAR(255) DEFAULT ''",
+        )
+
+        conn.commit()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def normalize_issue_with_review_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Keeps compatibility with the existing dashboard response while adding
+    homeowner/admin/final approval workflow fields.
+    """
+    issue = normalize_verified_issue_row(row)
+
+    def iso(value):
+        return value.isoformat() if value else None
+
+    issue.update(
+        {
+            "homeowner_image_decision": row.get("homeowner_image_decision") or "unreviewed",
+            "homeowner_reviewed_at": iso(row.get("homeowner_reviewed_at")),
+            "admin_image_decision": row.get("admin_image_decision") or "pending",
+            "admin_reviewed_at": iso(row.get("admin_reviewed_at")),
+            "final_approval_status": row.get("final_approval_status") or "not_approved",
+            "final_approved_at": iso(row.get("final_approved_at")),
+            "final_approved_by": row.get("final_approved_by") or "",
+        }
+    )
+
+    return issue
+
+
+def fetch_verified_issue_row(issue_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        return cursor.fetchone()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.patch("/verified-issue/{issue_id}/homeowner-review")
+def submit_homeowner_issue_review(issue_id: int, update: HomeownerReviewUpdate):
+    """
+    Homeowner review route.
+
+    Homeowner can:
+      - confirm issue
+      - say needs repair
+      - monitor
+      - already fixed
+      - not a concern
+      - flag image mismatch
+      - add note
+
+    Homeowner does NOT final-approve or lock baseline.
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+
+    allowed_homeowner_decisions = {
+        "unreviewed",
+        "confirmed",
+        "accepted",
+        "needs_repair",
+        "monitor",
+        "already_fixed",
+        "not_a_concern",
+        "image_mismatch",
+        "rejected",
+        "needs_help",
+    }
+
+    allowed_image_decisions = {
+        "unreviewed",
+        "accepted",
+        "mismatch",
+        "needs_review",
+        "no_image",
+    }
+
+    homeowner_decision = clean_text(update.homeowner_decision).lower()
+    homeowner_image_decision = clean_text(update.homeowner_image_decision or "unreviewed").lower()
+    homeowner_note = clean_text(update.homeowner_note or "")
+
+    if homeowner_decision not in allowed_homeowner_decisions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid homeowner_decision. Allowed: {sorted(allowed_homeowner_decisions)}",
+        )
+
+    if homeowner_image_decision not in allowed_image_decisions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid homeowner_image_decision. Allowed: {sorted(allowed_image_decisions)}",
+        )
+
+    # Map homeowner decision to current status.
+    current_status = "open"
+
+    if homeowner_decision == "needs_repair":
+        current_status = "needs_repair"
+    elif homeowner_decision == "monitor":
+        current_status = "monitoring"
+    elif homeowner_decision == "already_fixed":
+        current_status = "repaired"
+    elif homeowner_decision in {"not_a_concern", "rejected"}:
+        current_status = "needs_review"
+    elif homeowner_decision in {"confirmed", "accepted"}:
+        current_status = "open"
+
+    # Homeowner review always sends to admin queue.
+    admin_review_status = "needs_review"
+
+    image_match_status_sql = ""
+    image_match_params = []
+
+    if homeowner_decision == "image_mismatch" or homeowner_image_decision == "mismatch":
+        image_match_status_sql = """
+            image_match_status = %s,
+            needs_image_review = %s,
+            verified_image_url = %s,
+        """
+        image_match_params = ["mismatch", "yes", ""]
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT id FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        existing = cursor.fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Verified issue not found")
+
+        cursor.execute(
+            f"""
+            UPDATE verified_issues
+            SET
+                homeowner_decision = %s,
+                homeowner_image_decision = %s,
+                homeowner_note = %s,
+                homeowner_reviewed_at = NOW(),
+                admin_review_status = %s,
+                current_status = %s,
+                {image_match_status_sql}
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                homeowner_decision,
+                homeowner_image_decision,
+                homeowner_note,
+                admin_review_status,
+                current_status,
+                *image_match_params,
+                issue_id,
+            ),
+        )
+
+        conn.commit()
+
+        cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        row = cursor.fetchone()
+
+        return {
+            "success": True,
+            "message": "Homeowner review saved. Issue is now queued for admin review.",
+            "issue": normalize_issue_with_review_fields(row),
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        print("ERROR IN /verified-issue/{issue_id}/homeowner-review:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.patch("/verified-issue/{issue_id}/admin-review")
+def submit_admin_issue_review(issue_id: int, update: AdminReviewUpdate):
+    """
+    Admin review route.
+
+    Admin can:
+      - approve finding
+      - reject finding
+      - request more review
+      - approve image
+      - mark image mismatch
+
+    This does NOT lock baseline yet. Final approval route does that.
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+
+    allowed_admin_statuses = {
+        "pending",
+        "approved",
+        "rejected",
+        "needs_review",
+        "send_back",
+        "dismissed",
+        "resolved",
+    }
+
+    allowed_admin_image_decisions = {
+        "pending",
+        "approved",
+        "mismatch",
+        "needs_review",
+        "no_image",
+    }
+
+    admin_review_status = clean_text(update.admin_review_status).lower()
+    admin_image_decision = clean_text(update.admin_image_decision or "pending").lower()
+    verified_image_url = clean_text(update.verified_image_url or "")
+    admin_note = clean_text(update.admin_note or "")
+
+    if admin_review_status not in allowed_admin_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid admin_review_status. Allowed: {sorted(allowed_admin_statuses)}",
+        )
+
+    if admin_image_decision not in allowed_admin_image_decisions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid admin_image_decision. Allowed: {sorted(allowed_admin_image_decisions)}",
+        )
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        existing = cursor.fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Verified issue not found")
+
+        image_match_status = existing.get("image_match_status") or "suggested"
+        needs_image_review = existing.get("needs_image_review") or "yes"
+
+        if admin_image_decision == "approved":
+            image_match_status = "verified"
+            needs_image_review = "no"
+
+            if not verified_image_url:
+                verified_image_url = existing.get("image_url") or ""
+
+        elif admin_image_decision == "mismatch":
+            image_match_status = "mismatch"
+            needs_image_review = "yes"
+            verified_image_url = ""
+
+        elif admin_image_decision in {"needs_review", "pending"}:
+            if image_match_status != "verified":
+                image_match_status = "suggested" if existing.get("image_url") else "none"
+                needs_image_review = "yes"
+                verified_image_url = ""
+
+        # Do not baseline-lock here.
+        final_approval_status = "not_approved"
+
+        if admin_review_status in {"rejected", "dismissed"}:
+            final_approval_status = "rejected"
+
+        cursor.execute(
+            """
+            UPDATE verified_issues
+            SET
+                admin_review_status = %s,
+                admin_image_decision = %s,
+                admin_note = CASE
+                    WHEN %s != '' THEN %s
+                    ELSE admin_note
+                END,
+                admin_reviewed_at = NOW(),
+                image_match_status = %s,
+                verified_image_url = %s,
+                needs_image_review = %s,
+                final_approval_status = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                admin_review_status,
+                admin_image_decision,
+                admin_note,
+                admin_note,
+                image_match_status,
+                verified_image_url,
+                needs_image_review,
+                final_approval_status,
+                issue_id,
+            ),
+        )
+
+        conn.commit()
+
+        cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        row = cursor.fetchone()
+
+        return {
+            "success": True,
+            "message": "Admin review saved. Use final approval to lock this issue into the baseline.",
+            "issue": normalize_issue_with_review_fields(row),
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        print("ERROR IN /verified-issue/{issue_id}/admin-review:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.patch("/verified-issue/{issue_id}/final-approval")
+def final_approve_verified_issue(issue_id: int, update: FinalApprovalUpdate):
+    """
+    Final platform approval route.
+
+    This is the official admin lock:
+      admin_review_status must be approved
+      image must either be verified, no_image, or intentionally needs_review
+      baseline_locked becomes yes
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+
+    allowed_final_statuses = {
+        "approved",
+        "rejected",
+        "needs_review",
+    }
+
+    final_approval_status = clean_text(update.final_approval_status or "approved").lower()
+    final_approved_by = clean_text(update.final_approved_by or "admin")
+    admin_note = clean_text(update.admin_note or "")
+
+    if final_approval_status not in allowed_final_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid final_approval_status. Allowed: {sorted(allowed_final_statuses)}",
+        )
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        existing = cursor.fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Verified issue not found")
+
+        current_admin_status = existing.get("admin_review_status") or "pending"
+
+        if final_approval_status == "approved" and current_admin_status != "approved":
+            raise HTTPException(
+                status_code=400,
+                detail="Admin review must be approved before final approval.",
+            )
+
+        if final_approval_status == "approved":
+            baseline_locked = "yes"
+            status = "active"
+            current_status = existing.get("current_status") or "open"
+            baseline_locked_at_sql = "NOW()"
+            final_approved_at_sql = "NOW()"
+        elif final_approval_status == "rejected":
+            baseline_locked = "no"
+            status = "dismissed"
+            current_status = "closed"
+            baseline_locked_at_sql = "NULL"
+            final_approved_at_sql = "NOW()"
+        else:
+            baseline_locked = "no"
+            status = existing.get("status") or "new"
+            current_status = "needs_review"
+            baseline_locked_at_sql = "NULL"
+            final_approved_at_sql = "NULL"
+
+        cursor.execute(
+            f"""
+            UPDATE verified_issues
+            SET
+                final_approval_status = %s,
+                final_approved_by = %s,
+                final_approved_at = {final_approved_at_sql},
+                baseline_locked = %s,
+                baseline_locked_at = {baseline_locked_at_sql},
+                status = %s,
+                current_status = %s,
+                admin_note = CASE
+                    WHEN %s != '' THEN %s
+                    ELSE admin_note
+                END,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                final_approval_status,
+                final_approved_by,
+                baseline_locked,
+                status,
+                current_status,
+                admin_note,
+                admin_note,
+                issue_id,
+            ),
+        )
+
+        conn.commit()
+
+        cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        row = cursor.fetchone()
+
+        return {
+            "success": True,
+            "message": "Final approval status updated.",
+            "issue": normalize_issue_with_review_fields(row),
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        print("ERROR IN /verified-issue/{issue_id}/final-approval:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/verified-issues-review-queue")
+def get_verified_issues_review_queue(limit: int = 200, offset: int = 0):
+    """
+    Admin queue route.
+
+    Returns issues where homeowner has responded or image/finding needs admin review,
+    but final approval is not complete.
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM verified_issues
+            WHERE
+                COALESCE(final_approval_status, 'not_approved') != 'approved'
+                AND COALESCE(hidden_from_review_queue, 'no') != 'yes'
+                AND (
+                    COALESCE(homeowner_decision, 'unreviewed') != 'unreviewed'
+                    OR COALESCE(homeowner_image_decision, 'unreviewed') != 'unreviewed'
+                    OR COALESCE(admin_review_status, 'pending') IN ('needs_review', 'pending')
+                    OR COALESCE(needs_image_review, 'yes') = 'yes'
+                    OR COALESCE(image_match_status, 'suggested') IN ('suggested', 'mismatch')
+                )
+            """
+        )
+
+        total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM verified_issues
+            WHERE
+                COALESCE(final_approval_status, 'not_approved') != 'approved'
+                AND COALESCE(hidden_from_review_queue, 'no') != 'yes'
+                AND (
+                    COALESCE(homeowner_decision, 'unreviewed') != 'unreviewed'
+                    OR COALESCE(homeowner_image_decision, 'unreviewed') != 'unreviewed'
+                    OR COALESCE(admin_review_status, 'pending') IN ('needs_review', 'pending')
+                    OR COALESCE(needs_image_review, 'yes') = 'yes'
+                    OR COALESCE(image_match_status, 'suggested') IN ('suggested', 'mismatch')
+                )
+            ORDER BY
+                CASE
+                    WHEN risk_level = 'CRITICAL' THEN 1
+                    WHEN risk_level = 'HIGH' THEN 2
+                    WHEN risk_level = 'MEDIUM' THEN 3
+                    WHEN risk_level = 'LOW' THEN 4
+                    ELSE 5
+                END,
+                updated_at DESC,
+                id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
+        )
+
+        rows = cursor.fetchall()
+
+        return {
+            "success": True,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "count": len(rows),
+            "issues": [normalize_issue_with_review_fields(row) for row in rows],
+        }
+
+    except Exception as e:
+        print("ERROR IN /verified-issues-review-queue:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/verification-workflow-health")
+def verification_workflow_health():
+    """
+    Quick schema/status check for the homeowner/admin verification workflow.
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        columns = get_table_columns(cursor, "verified_issues")
+
+        required = [
+            "homeowner_image_decision",
+            "homeowner_reviewed_at",
+            "admin_image_decision",
+            "admin_reviewed_at",
+            "final_approval_status",
+            "final_approved_at",
+            "final_approved_by",
+        ]
+
+        missing = [column for column in required if column not in columns]
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN COALESCE(homeowner_decision, 'unreviewed') != 'unreviewed' THEN 1 ELSE 0 END) AS homeowner_reviewed,
+                SUM(CASE WHEN COALESCE(admin_review_status, 'pending') = 'approved' THEN 1 ELSE 0 END) AS admin_approved,
+                SUM(CASE WHEN COALESCE(final_approval_status, 'not_approved') = 'approved' THEN 1 ELSE 0 END) AS final_approved,
+                SUM(CASE WHEN COALESCE(baseline_locked, 'no') = 'yes' THEN 1 ELSE 0 END) AS baseline_locked
+            FROM verified_issues
+            """
+        )
+
+        stats = cursor.fetchone()
+
+        return {
+            "success": True,
+            "schema_ready": len(missing) == 0,
+            "missing_columns": missing,
+            "stats": stats,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# =========================
+# REVIEW QUEUE CLEANUP + TEST RECORD HYGIENE PASS 1
+# =========================
+
+class ReviewQueueCleanupRequest(BaseModel):
+    record_id: Optional[str] = None
+    reason: Optional[str] = "cleanup"
+    admin_note: Optional[str] = ""
+    cleanup_mode: Optional[str] = "hide_from_review_queue"
+
+
+class ReviewQueueDismissIssueRequest(BaseModel):
+    reason: Optional[str] = "dismissed_from_review_queue"
+    admin_note: Optional[str] = ""
+
+
+def ensure_review_queue_cleanup_schema():
+    """
+    Adds cleanup/hygiene fields without deleting historical records.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "hidden_from_review_queue",
+            "hidden_from_review_queue VARCHAR(10) DEFAULT 'no'",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "cleanup_reason",
+            "cleanup_reason VARCHAR(255) DEFAULT ''",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "cleanup_at",
+            "cleanup_at DATETIME NULL",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "cleanup_by",
+            "cleanup_by VARCHAR(255) DEFAULT ''",
+        )
+
+        conn.commit()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/review-queue-cleanup-health")
+def review_queue_cleanup_health():
+    """
+    Confirms cleanup fields exist and gives queue hygiene stats.
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+    ensure_review_queue_cleanup_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        columns = get_table_columns(cursor, "verified_issues")
+
+        required = [
+            "hidden_from_review_queue",
+            "cleanup_reason",
+            "cleanup_at",
+            "cleanup_by",
+        ]
+
+        missing = [column for column in required if column not in columns]
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN COALESCE(hidden_from_review_queue, 'no') = 'yes' THEN 1 ELSE 0 END) AS hidden_from_queue,
+                SUM(CASE WHEN record_id LIKE 'detail-recovery-test-%' THEN 1 ELSE 0 END) AS detail_recovery_tests,
+                SUM(CASE WHEN record_id LIKE 'hybrid-image-match-test-%' THEN 1 ELSE 0 END) AS hybrid_tests,
+                SUM(CASE WHEN record_id LIKE 'restored-image-match-test-%' THEN 1 ELSE 0 END) AS restored_tests,
+                SUM(CASE WHEN record_id LIKE 'pdf-fullreportforupload-%' THEN 1 ELSE 0 END) AS old_fullreport_uploads,
+                SUM(CASE WHEN title LIKE '%%inspector is not required%%' THEN 1 ELSE 0 END) AS inspector_not_required_noise,
+                SUM(CASE WHEN title LIKE '%%Inspect erosion control%%' THEN 1 ELSE 0 END) AS erosion_control_noise
+            FROM verified_issues
+            """
+        )
+
+        stats = cursor.fetchone()
+
+        return {
+            "success": True,
+            "schema_ready": len(missing) == 0,
+            "missing_columns": missing,
+            "stats": stats,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/review-queue-cleanup/hide-old-noise")
+def hide_old_noise_from_review_queue():
+    """
+    Hides known old parser-noise records from the admin review queue.
+
+    This does NOT delete records.
+    It marks them hidden and dismissed so the review queue is useful again.
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+    ensure_review_queue_cleanup_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            UPDATE verified_issues
+            SET
+                hidden_from_review_queue = 'yes',
+                cleanup_reason = 'old_parser_noise_hidden',
+                cleanup_at = NOW(),
+                cleanup_by = 'admin_cleanup_pass_1',
+                admin_review_status = CASE
+                    WHEN COALESCE(admin_review_status, 'pending') = 'approved' THEN admin_review_status
+                    ELSE 'dismissed'
+                END,
+                final_approval_status = CASE
+                    WHEN COALESCE(final_approval_status, 'not_approved') = 'approved' THEN final_approval_status
+                    ELSE 'rejected'
+                END,
+                status = CASE
+                    WHEN COALESCE(status, 'new') = 'active' THEN status
+                    ELSE 'dismissed'
+                END,
+                current_status = CASE
+                    WHEN COALESCE(current_status, 'open') IN ('resolved', 'repaired') THEN current_status
+                    ELSE 'closed'
+                END,
+                admin_note = CASE
+                    WHEN COALESCE(admin_note, '') = '' THEN 'Hidden by review queue cleanup pass: old parser/test noise.'
+                    ELSE CONCAT(admin_note, ' | Hidden by review queue cleanup pass: old parser/test noise.')
+                END,
+                updated_at = NOW()
+            WHERE
+                COALESCE(final_approval_status, 'not_approved') != 'approved'
+                AND COALESCE(baseline_locked, 'no') != 'yes'
+                AND (
+                    record_id LIKE 'pdf-fullreportforupload-%%'
+                    OR title LIKE '%%inspector is not required%%'
+                    OR title LIKE '%%Inspect erosion control%%'
+                    OR title LIKE '%%Perform a water test%%'
+                    OR title LIKE '%%warrant or certify%%'
+                    OR summary LIKE '%%The inspector is not required to%%'
+                    OR summary LIKE '%%Standards of Practice%%'
+                    OR summary LIKE '%%Inspect erosion control%%'
+                )
+            """
+        )
+
+        affected = cursor.rowcount
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Old parser/test noise hidden from review queue.",
+            "affected_rows": affected,
+        }
+
+    except Exception as e:
+        conn.rollback()
+        print("ERROR IN /review-queue-cleanup/hide-old-noise:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/review-queue-cleanup/hide-record")
+def hide_record_from_review_queue(update: ReviewQueueCleanupRequest):
+    """
+    Hides every non-final-approved issue for a specific record_id.
+
+    Use this for test records you do not want in the active admin queue.
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+    ensure_review_queue_cleanup_schema()
+
+    record_id = clean_text(update.record_id or "")
+    reason = clean_text(update.reason or "record_hidden_from_review_queue")
+    admin_note = clean_text(update.admin_note or "")
+
+    if not record_id:
+        raise HTTPException(status_code=400, detail="record_id is required")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            UPDATE verified_issues
+            SET
+                hidden_from_review_queue = 'yes',
+                cleanup_reason = %s,
+                cleanup_at = NOW(),
+                cleanup_by = 'admin_cleanup_pass_1',
+                admin_review_status = CASE
+                    WHEN COALESCE(admin_review_status, 'pending') = 'approved' THEN admin_review_status
+                    ELSE 'dismissed'
+                END,
+                final_approval_status = CASE
+                    WHEN COALESCE(final_approval_status, 'not_approved') = 'approved' THEN final_approval_status
+                    ELSE 'rejected'
+                END,
+                status = CASE
+                    WHEN COALESCE(status, 'new') = 'active' THEN status
+                    ELSE 'dismissed'
+                END,
+                current_status = CASE
+                    WHEN COALESCE(current_status, 'open') IN ('resolved', 'repaired') THEN current_status
+                    ELSE 'closed'
+                END,
+                admin_note = CASE
+                    WHEN %s != '' THEN %s
+                    WHEN COALESCE(admin_note, '') = '' THEN 'Hidden by review queue cleanup pass.'
+                    ELSE CONCAT(admin_note, ' | Hidden by review queue cleanup pass.')
+                END,
+                updated_at = NOW()
+            WHERE
+                record_id = %s
+                AND COALESCE(final_approval_status, 'not_approved') != 'approved'
+                AND COALESCE(baseline_locked, 'no') != 'yes'
+            """,
+            (
+                reason,
+                admin_note,
+                admin_note,
+                record_id,
+            ),
+        )
+
+        affected = cursor.rowcount
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Record hidden from review queue.",
+            "record_id": record_id,
+            "affected_rows": affected,
+        }
+
+    except Exception as e:
+        conn.rollback()
+        print("ERROR IN /review-queue-cleanup/hide-record:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.patch("/verified-issue/{issue_id}/hide-from-review-queue")
+def hide_single_issue_from_review_queue(issue_id: int, update: ReviewQueueDismissIssueRequest):
+    """
+    Hides one issue from the admin review queue without deleting it.
+    """
+    ensure_core_tables()
+    ensure_review_workflow_schema()
+    ensure_review_queue_cleanup_schema()
+
+    reason = clean_text(update.reason or "issue_hidden_from_review_queue")
+    admin_note = clean_text(update.admin_note or "")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        existing = cursor.fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Verified issue not found")
+
+        if existing.get("final_approval_status") == "approved" or existing.get("baseline_locked") == "yes":
+            raise HTTPException(
+                status_code=400,
+                detail="Final-approved/baseline-locked issues cannot be hidden by cleanup.",
+            )
+
+        cursor.execute(
+            """
+            UPDATE verified_issues
+            SET
+                hidden_from_review_queue = 'yes',
+                cleanup_reason = %s,
+                cleanup_at = NOW(),
+                cleanup_by = 'admin_cleanup_pass_1',
+                admin_review_status = 'dismissed',
+                final_approval_status = 'rejected',
+                status = 'dismissed',
+                current_status = 'closed',
+                admin_note = CASE
+                    WHEN %s != '' THEN %s
+                    WHEN COALESCE(admin_note, '') = '' THEN 'Hidden by review queue cleanup pass.'
+                    ELSE CONCAT(admin_note, ' | Hidden by review queue cleanup pass.')
+                END,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                reason,
+                admin_note,
+                admin_note,
+                issue_id,
+            ),
+        )
+
+        conn.commit()
+
+        cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+        row = cursor.fetchone()
+
+        return {
+            "success": True,
+            "message": "Issue hidden from review queue.",
+            "issue": normalize_issue_with_review_fields(row),
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        print("ERROR IN /verified-issue/{issue_id}/hide-from-review-queue:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+

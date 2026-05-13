@@ -4516,3 +4516,964 @@ def list_ai_adapter_profiles(limit: int = 100, offset: int = 0, status: str = ""
     finally:
         cursor.close()
         conn.close()
+
+# =========================
+# DYNAMIC ADAPTER RULE APPLICATION PASS 2
+# =========================
+#
+# Purpose:
+#   Take promoted ai_adapter_profiles from Pass 1 and use them as
+#   reusable matching/application hints for future parser results.
+#
+# Product rule:
+#   Profiles can guide extraction/normalization/image matching.
+#   Profiles do NOT automatically make findings official.
+#   Homeowner review + admin final approval still control baseline truth.
+#
+# This pass:
+#   - scores parser results against active ai_adapter_profiles
+#   - chooses the best profile above threshold
+#   - enriches parser_debug and findings with profile metadata
+#   - logs profile match/application events
+#
+# This pass does NOT generate Python adapter files yet.
+
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import HTTPException
+from pydantic import BaseModel
+
+
+class DynamicAdapterMatchPayload(BaseModel):
+    result: Dict[str, Any]
+    threshold: Optional[int] = 55
+    log_event: Optional[bool] = True
+
+
+class DynamicAdapterApplyPayload(BaseModel):
+    result: Dict[str, Any]
+    threshold: Optional[int] = 55
+    log_event: Optional[bool] = True
+    apply_hints: Optional[bool] = True
+
+
+def dynamic_clean_text(value: Any) -> str:
+    """
+    Safe local clean text helper.
+    Uses existing clean_text if present.
+    """
+    try:
+        return clean_text(value)  # type: ignore[name-defined]
+    except Exception:
+        if value is None:
+            return ""
+        return " ".join(str(value).strip().split())
+
+
+def dynamic_safe_int(value: Any) -> Optional[int]:
+    """
+    Safe local integer helper.
+    Uses existing safe_int if present.
+    """
+    try:
+        return safe_int(value)  # type: ignore[name-defined]
+    except Exception:
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+
+def dynamic_json_load_safe(value: Any, fallback: Any = None):
+    """
+    Safely load JSON/TEXT column values.
+    """
+    if value is None:
+        return fallback
+
+    if isinstance(value, (dict, list)):
+        return value
+
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback if fallback is not None else value
+
+
+def dynamic_json_safe(value: Any) -> str:
+    """
+    JSON dump helper for DB JSON columns.
+    """
+    try:
+        return json.dumps(value, default=str)
+    except Exception:
+        return json.dumps({"raw": str(value)})
+
+
+def ensure_dynamic_adapter_rule_application_schema():
+    """
+    Creates profile application/match event table.
+
+    Requires ai_adapter_profiles from Dynamic AI Adapter Learning Pass 1.
+    """
+    try:
+        ensure_ai_adapter_learning_schema()  # type: ignore[name-defined]
+    except Exception:
+        # If the Pass 1 function is not loaded, this endpoint will still fail later
+        # when ai_adapter_profiles does not exist. This keeps import safe.
+        pass
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_adapter_profile_match_events (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                record_id VARCHAR(255) DEFAULT '',
+                filename VARCHAR(500) DEFAULT '',
+                selected_profile_id INT NULL,
+                selected_profile_name VARCHAR(255) DEFAULT '',
+                selected_report_family VARCHAR(255) DEFAULT '',
+                selected_vendor_name VARCHAR(255) DEFAULT '',
+                match_score INT DEFAULT 0,
+                threshold_score INT DEFAULT 55,
+                matched VARCHAR(10) DEFAULT 'no',
+                score_breakdown JSON NULL,
+                matched_features JSON NULL,
+                applied_hints JSON NULL,
+                parser_debug_before JSON NULL,
+                parser_debug_after JSON NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        conn.commit()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def dynamic_tokenize(value: Any) -> List[str]:
+    """
+    Lowercase tokenization for profile matching.
+    Keeps meaningful words and removes tiny tokens.
+    """
+    text = dynamic_clean_text(value).lower()
+    words = re.findall(r"[a-z0-9]+", text)
+
+    stopwords = {
+        "the",
+        "and",
+        "or",
+        "at",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "by",
+        "a",
+        "an",
+        "is",
+        "are",
+        "be",
+        "was",
+        "were",
+        "this",
+        "that",
+        "report",
+        "inspection",
+        "system",
+        "component",
+    }
+
+    return [w for w in words if len(w) > 2 and w not in stopwords]
+
+
+def dynamic_extract_source_numbers_from_text(text: Any) -> List[str]:
+    """
+    Extract common report section/source numbers:
+      2.1.1
+      8.4.2
+      S1.1
+      A-2
+    """
+    raw = dynamic_clean_text(text)
+
+    patterns = []
+    patterns.extend(re.findall(r"\b\d{1,2}\.\d{1,2}(?:\.\d{1,2})?\b", raw))
+    patterns.extend(re.findall(r"\b[A-Z]\d{1,2}\.\d{1,2}\b", raw))
+    patterns.extend(re.findall(r"\b[A-Z]-\d{1,3}\b", raw))
+
+    output = []
+    seen = set()
+
+    for item in patterns:
+        key = item.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        output.append(item)
+
+    return output[:100]
+
+
+def dynamic_unique(values: List[Any]) -> List[str]:
+    output = []
+    seen = set()
+
+    for value in values:
+        cleaned = dynamic_clean_text(value)
+
+        if not cleaned:
+            continue
+
+        key = cleaned.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        output.append(cleaned)
+
+    return output
+
+
+def dynamic_get_result_issues(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    issues = result.get("extractedIssues") or result.get("findings") or []
+
+    if not isinstance(issues, list):
+        return []
+
+    return [issue for issue in issues if isinstance(issue, dict)]
+
+
+def dynamic_build_result_signature(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Creates a signature from a fresh parser result to compare against profiles.
+    """
+    issues = dynamic_get_result_issues(result)
+    parser_debug = result.get("parser_debug") or {}
+
+    filename = dynamic_clean_text(result.get("filename") or "")
+    record_id = dynamic_clean_text(result.get("record_id") or "")
+    detected_adapter = dynamic_clean_text(
+        result.get("detectedAdapter")
+        or result.get("detected_adapter")
+        or parser_debug.get("detected_adapter")
+        or ""
+    )
+
+    titles = []
+    systems = []
+    components = []
+    severities = []
+    source_numbers = []
+    issue_text_blob_parts = []
+
+    for issue in issues:
+        title = (
+            issue.get("issueTitle")
+            or issue.get("issue_title")
+            or issue.get("title")
+            or ""
+        )
+
+        system = issue.get("system") or issue.get("section") or ""
+        component = issue.get("component") or ""
+        severity = issue.get("severity") or ""
+
+        source_number = (
+            issue.get("source_number")
+            or issue.get("sourceNumber")
+            or issue.get("issue_code")
+            or issue.get("issueCode")
+            or ""
+        )
+
+        summary = issue.get("summary") or issue.get("notes") or issue.get("description") or ""
+
+        if title:
+            titles.append(title)
+            issue_text_blob_parts.append(title)
+
+        if system:
+            systems.append(system)
+            issue_text_blob_parts.append(system)
+
+        if component:
+            components.append(component)
+            issue_text_blob_parts.append(component)
+
+        if severity:
+            severities.append(severity)
+
+        if source_number:
+            source_numbers.append(source_number)
+
+        if summary:
+            issue_text_blob_parts.append(summary)
+
+    full_blob = " ".join([filename, detected_adapter, *issue_text_blob_parts])
+
+    # Add source numbers detected in text blob too.
+    source_numbers.extend(dynamic_extract_source_numbers_from_text(full_blob))
+
+    all_tokens = []
+    all_tokens.extend(dynamic_tokenize(filename))
+    all_tokens.extend(dynamic_tokenize(detected_adapter))
+
+    for value in titles[:50] + systems[:50] + components[:50]:
+        all_tokens.extend(dynamic_tokenize(value))
+
+    return {
+        "record_id": record_id,
+        "filename": filename,
+        "detected_adapter": detected_adapter,
+        "finding_count": len(issues),
+        "systems": dynamic_unique(systems)[:50],
+        "components": dynamic_unique(components)[:50],
+        "sample_titles": dynamic_unique(titles)[:50],
+        "severity_examples": dynamic_unique([s.lower() for s in severities])[:20],
+        "source_number_examples": dynamic_unique(source_numbers)[:100],
+        "has_images": any(bool(issue.get("image_url")) for issue in issues),
+        "has_candidate_images": any(bool(issue.get("candidate_image_urls")) for issue in issues),
+        "tokens": dynamic_unique(all_tokens)[:300],
+    }
+
+
+def dynamic_load_active_profiles() -> List[Dict[str, Any]]:
+    """
+    Loads active ai_adapter_profiles.
+    """
+    ensure_dynamic_adapter_rule_application_schema()
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT *
+            FROM ai_adapter_profiles
+            WHERE COALESCE(status, 'active') = 'active'
+            ORDER BY id DESC
+            """
+        )
+
+        rows = cursor.fetchall()
+
+        profiles = []
+
+        for row in rows:
+            row["adapter_signature"] = dynamic_json_load_safe(row.get("adapter_signature"), {}) or {}
+            row["extraction_rules"] = dynamic_json_load_safe(row.get("extraction_rules"), {}) or {}
+            row["normalization_rules"] = dynamic_json_load_safe(row.get("normalization_rules"), {}) or {}
+            row["image_matching_notes"] = dynamic_json_load_safe(row.get("image_matching_notes"), {}) or {}
+            profiles.append(row)
+
+        return profiles
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def dynamic_overlap_score(
+    result_values: List[str],
+    profile_values: List[str],
+    weight: int,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Scores overlap between result signature lists and profile lists.
+    """
+    result_set = {dynamic_clean_text(v).lower() for v in result_values if dynamic_clean_text(v)}
+    profile_set = {dynamic_clean_text(v).lower() for v in profile_values if dynamic_clean_text(v)}
+
+    if not result_set or not profile_set:
+        return 0, {
+            "matched": [],
+            "result_count": len(result_set),
+            "profile_count": len(profile_set),
+            "ratio": 0,
+            "points": 0,
+        }
+
+    matched = sorted(result_set.intersection(profile_set))
+    ratio = len(matched) / max(1, min(len(result_set), len(profile_set)))
+    points = round(ratio * weight)
+
+    return points, {
+        "matched": matched[:50],
+        "result_count": len(result_set),
+        "profile_count": len(profile_set),
+        "ratio": ratio,
+        "points": points,
+    }
+
+
+def dynamic_token_similarity_score(
+    result_tokens: List[str],
+    profile_values: List[str],
+    weight: int,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Soft similarity between result tokens and profile titles/systems/components.
+    """
+    result_set = {dynamic_clean_text(v).lower() for v in result_tokens if dynamic_clean_text(v)}
+
+    profile_tokens = []
+    for value in profile_values:
+        profile_tokens.extend(dynamic_tokenize(value))
+
+    profile_set = {v.lower() for v in profile_tokens if v}
+
+    if not result_set or not profile_set:
+        return 0, {
+            "matched_tokens": [],
+            "result_token_count": len(result_set),
+            "profile_token_count": len(profile_set),
+            "ratio": 0,
+            "points": 0,
+        }
+
+    matched = sorted(result_set.intersection(profile_set))
+    ratio = len(matched) / max(1, min(len(result_set), len(profile_set)))
+    points = round(ratio * weight)
+
+    return points, {
+        "matched_tokens": matched[:75],
+        "result_token_count": len(result_set),
+        "profile_token_count": len(profile_set),
+        "ratio": ratio,
+        "points": points,
+    }
+
+
+def dynamic_score_profile_against_result(
+    result_signature: Dict[str, Any],
+    profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Scores one active profile against a parser result signature.
+
+    Score is 0-100-ish:
+      source numbers: 30
+      systems: 20
+      components: 15
+      title/token similarity: 20
+      image contract: 5
+      filename/vendor/profile hints: 10
+    """
+    adapter_signature = profile.get("adapter_signature") or {}
+    extraction_rules = profile.get("extraction_rules") or {}
+    image_notes = profile.get("image_matching_notes") or {}
+
+    profile_source_numbers = (
+        adapter_signature.get("source_number_examples")
+        or extraction_rules.get("preferred_source_number_patterns")
+        or []
+    )
+
+    profile_systems = adapter_signature.get("systems") or extraction_rules.get("systems_seen") or []
+    profile_components = adapter_signature.get("components") or extraction_rules.get("components_seen") or []
+    profile_titles = adapter_signature.get("sample_titles") or extraction_rules.get("sample_titles") or []
+
+    score = 0
+    breakdown = {}
+
+    points, detail = dynamic_overlap_score(
+        result_signature.get("source_number_examples") or [],
+        profile_source_numbers,
+        weight=30,
+    )
+    score += points
+    breakdown["source_number_overlap"] = detail
+
+    points, detail = dynamic_overlap_score(
+        result_signature.get("systems") or [],
+        profile_systems,
+        weight=20,
+    )
+    score += points
+    breakdown["system_overlap"] = detail
+
+    points, detail = dynamic_overlap_score(
+        result_signature.get("components") or [],
+        profile_components,
+        weight=15,
+    )
+    score += points
+    breakdown["component_overlap"] = detail
+
+    points, detail = dynamic_token_similarity_score(
+        result_signature.get("tokens") or [],
+        list(profile_titles) + list(profile_systems) + list(profile_components),
+        weight=20,
+    )
+    score += points
+    breakdown["token_similarity"] = detail
+
+    image_points = 0
+    if result_signature.get("has_images") and adapter_signature.get("has_images"):
+        image_points += 2
+    if result_signature.get("has_candidate_images") and adapter_signature.get("has_candidate_images"):
+        image_points += 2
+    if image_notes.get("detail_page_recovery"):
+        image_points += 1
+
+    score += image_points
+    breakdown["image_contract"] = {
+        "points": image_points,
+        "result_has_images": bool(result_signature.get("has_images")),
+        "profile_has_images": bool(adapter_signature.get("has_images")),
+        "result_has_candidate_images": bool(result_signature.get("has_candidate_images")),
+        "profile_has_candidate_images": bool(adapter_signature.get("has_candidate_images")),
+    }
+
+    filename_vendor_points = 0
+    filename = dynamic_clean_text(result_signature.get("filename") or "").lower()
+    vendor = dynamic_clean_text(profile.get("vendor_name") or "").lower()
+    profile_name = dynamic_clean_text(profile.get("profile_name") or "").lower()
+    report_family = dynamic_clean_text(profile.get("report_family") or "").lower()
+
+    for token in dynamic_tokenize(vendor):
+        if token and token in filename:
+            filename_vendor_points += 3
+            break
+
+    for token in dynamic_tokenize(profile_name):
+        if token and token in filename:
+            filename_vendor_points += 2
+            break
+
+    detected_adapter = dynamic_clean_text(result_signature.get("detected_adapter") or "").lower()
+
+    if report_family and report_family in detected_adapter:
+        filename_vendor_points += 3
+
+    if "internachi" in report_family and "internachi" in detected_adapter:
+        filename_vendor_points += 2
+
+    filename_vendor_points = min(filename_vendor_points, 10)
+    score += filename_vendor_points
+
+    breakdown["filename_vendor_hints"] = {
+        "points": filename_vendor_points,
+        "filename": filename,
+        "vendor": vendor,
+        "profile_name": profile_name,
+        "report_family": report_family,
+        "detected_adapter": detected_adapter,
+    }
+
+    return {
+        "profile_id": profile.get("id"),
+        "profile_name": profile.get("profile_name"),
+        "report_family": profile.get("report_family"),
+        "vendor_name": profile.get("vendor_name"),
+        "score": int(score),
+        "breakdown": breakdown,
+    }
+
+
+def dynamic_match_best_profile(
+    result: Dict[str, Any],
+    threshold: int = 55,
+) -> Dict[str, Any]:
+    """
+    Finds best active profile for parser result.
+    """
+    threshold = max(0, min(100, dynamic_safe_int(threshold) or 55))
+
+    result_signature = dynamic_build_result_signature(result)
+    profiles = dynamic_load_active_profiles()
+
+    scored_profiles = []
+
+    for profile in profiles:
+        scored = dynamic_score_profile_against_result(result_signature, profile)
+        scored_profiles.append(scored)
+
+    scored_profiles.sort(key=lambda item: item.get("score", 0), reverse=True)
+
+    best = scored_profiles[0] if scored_profiles else None
+    matched = bool(best and best.get("score", 0) >= threshold)
+
+    return {
+        "success": True,
+        "threshold": threshold,
+        "matched": matched,
+        "best_profile": best,
+        "scores": scored_profiles[:10],
+        "result_signature": result_signature,
+    }
+
+
+def dynamic_apply_profile_hints_to_result(
+    result: Dict[str, Any],
+    match_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Non-destructively applies profile hints to parser result.
+
+    It does NOT overwrite issue title/summary/severity.
+    It adds metadata and fills missing parser_debug fields.
+    """
+    output = json.loads(json.dumps(result, default=str))
+
+    if not match_result.get("matched"):
+        output.setdefault("parser_debug", {})
+        output["parser_debug"]["dynamic_adapter_profile_matched"] = False
+        output["parser_debug"]["dynamic_adapter_profile_score"] = (
+            match_result.get("best_profile") or {}
+        ).get("score")
+        return output
+
+    best = match_result.get("best_profile") or {}
+
+    profile_id = best.get("profile_id")
+    profile_name = best.get("profile_name")
+    report_family = best.get("report_family")
+    vendor_name = best.get("vendor_name")
+    score = best.get("score")
+
+    output.setdefault("parser_debug", {})
+    output["parser_debug"]["dynamic_adapter_profile_matched"] = True
+    output["parser_debug"]["dynamic_adapter_profile_id"] = profile_id
+    output["parser_debug"]["dynamic_adapter_profile_name"] = profile_name
+    output["parser_debug"]["dynamic_adapter_profile_score"] = score
+    output["parser_debug"]["dynamic_adapter_report_family"] = report_family
+    output["parser_debug"]["dynamic_adapter_vendor_name"] = vendor_name
+    output["parser_debug"]["dynamic_adapter_rule_application"] = "pass_2_non_destructive_hints"
+
+    # Keep known adapter if already present, but add profile suggestion.
+    output["dynamicAdapterProfile"] = {
+        "matched": True,
+        "profile_id": profile_id,
+        "profile_name": profile_name,
+        "report_family": report_family,
+        "vendor_name": vendor_name,
+        "score": score,
+        "threshold": match_result.get("threshold"),
+    }
+
+    issues_key = "extractedIssues" if isinstance(output.get("extractedIssues"), list) else "findings"
+
+    if isinstance(output.get(issues_key), list):
+        for issue in output[issues_key]:
+            if not isinstance(issue, dict):
+                continue
+
+            issue["dynamic_adapter_profile_id"] = profile_id
+            issue["dynamic_adapter_profile_name"] = profile_name
+            issue["dynamic_adapter_profile_score"] = score
+            issue["dynamic_adapter_report_family"] = report_family
+
+            # Preserve image verification contract.
+            if issue.get("image_url") and not issue.get("image_match_status"):
+                issue["image_match_status"] = "suggested"
+            if issue.get("image_url") and not issue.get("needs_image_review"):
+                issue["needs_image_review"] = "yes"
+            if not issue.get("verified_image_url"):
+                issue["verified_image_url"] = ""
+
+    # Keep mirrored findings/extractedIssues consistent when both exist.
+    if issues_key == "extractedIssues" and isinstance(output.get("findings"), list):
+        for issue in output["findings"]:
+            if not isinstance(issue, dict):
+                continue
+
+            issue["dynamic_adapter_profile_id"] = profile_id
+            issue["dynamic_adapter_profile_name"] = profile_name
+            issue["dynamic_adapter_profile_score"] = score
+            issue["dynamic_adapter_report_family"] = report_family
+            if issue.get("image_url") and not issue.get("image_match_status"):
+                issue["image_match_status"] = "suggested"
+            if issue.get("image_url") and not issue.get("needs_image_review"):
+                issue["needs_image_review"] = "yes"
+            if not issue.get("verified_image_url"):
+                issue["verified_image_url"] = ""
+
+    return output
+
+
+def dynamic_log_profile_match_event(
+    original_result: Dict[str, Any],
+    match_result: Dict[str, Any],
+    applied_result: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """
+    Logs profile matching/application event.
+    """
+    try:
+        ensure_dynamic_adapter_rule_application_schema()
+
+        best = match_result.get("best_profile") or {}
+        result_signature = match_result.get("result_signature") or {}
+        parser_debug_before = original_result.get("parser_debug") or {}
+        parser_debug_after = (applied_result or {}).get("parser_debug") or {}
+
+        applied_hints = {
+            "applied": bool(applied_result),
+            "application": "pass_2_non_destructive_hints" if applied_result else "match_only",
+        }
+
+        conn = get_db_connection()  # type: ignore[name-defined]
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                """
+                INSERT INTO ai_adapter_profile_match_events (
+                    record_id,
+                    filename,
+                    selected_profile_id,
+                    selected_profile_name,
+                    selected_report_family,
+                    selected_vendor_name,
+                    match_score,
+                    threshold_score,
+                    matched,
+                    score_breakdown,
+                    matched_features,
+                    applied_hints,
+                    parser_debug_before,
+                    parser_debug_after
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    dynamic_clean_text(original_result.get("record_id") or ""),
+                    dynamic_clean_text(original_result.get("filename") or ""),
+                    best.get("profile_id"),
+                    dynamic_clean_text(best.get("profile_name") or ""),
+                    dynamic_clean_text(best.get("report_family") or ""),
+                    dynamic_clean_text(best.get("vendor_name") or ""),
+                    dynamic_safe_int(best.get("score")) or 0,
+                    dynamic_safe_int(match_result.get("threshold")) or 55,
+                    "yes" if match_result.get("matched") else "no",
+                    dynamic_json_safe(best.get("breakdown") or {}),
+                    dynamic_json_safe(result_signature),
+                    dynamic_json_safe(applied_hints),
+                    dynamic_json_safe(parser_debug_before),
+                    dynamic_json_safe(parser_debug_after),
+                ),
+            )
+
+            event_id = cursor.lastrowid
+            conn.commit()
+            return event_id
+
+        finally:
+            cursor.close()
+            conn.close()
+
+    except Exception as e:
+        print("DYNAMIC ADAPTER PROFILE MATCH LOG WARNING:", e)
+        return None
+
+
+@app.get("/dynamic-adapter-rule-application-health")
+def dynamic_adapter_rule_application_health():
+    """
+    Health check for Dynamic Adapter Rule Application Pass 2.
+    """
+    ensure_dynamic_adapter_rule_application_schema()
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT COUNT(*) AS total FROM ai_adapter_profiles WHERE COALESCE(status, 'active') = 'active'")
+        active_profiles = cursor.fetchone()["total"]
+
+        cursor.execute("SELECT COUNT(*) AS total FROM ai_adapter_profile_match_events")
+        match_events = cursor.fetchone()["total"]
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN matched = 'yes' THEN 1 ELSE 0 END) AS matched,
+                SUM(CASE WHEN matched = 'no' THEN 1 ELSE 0 END) AS not_matched,
+                MAX(match_score) AS max_score,
+                AVG(match_score) AS avg_score
+            FROM ai_adapter_profile_match_events
+            """
+        )
+        event_stats = cursor.fetchone()
+
+        return {
+            "success": True,
+            "schema_ready": True,
+            "active_profiles": active_profiles,
+            "match_events": match_events,
+            "event_stats": event_stats,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/dynamic-adapter-profiles/match-result")
+def dynamic_adapter_match_result(payload: DynamicAdapterMatchPayload):
+    """
+    Scores a parser result against active dynamic adapter profiles.
+
+    Does not change the parser result.
+    """
+    threshold = dynamic_safe_int(payload.threshold) or 55
+    match_result = dynamic_match_best_profile(payload.result, threshold=threshold)
+
+    event_id = None
+    if payload.log_event:
+        event_id = dynamic_log_profile_match_event(payload.result, match_result, applied_result=None)
+
+    match_result["event_id"] = event_id
+    return match_result
+
+
+@app.post("/dynamic-adapter-profiles/apply-to-result")
+def dynamic_adapter_apply_to_result(payload: DynamicAdapterApplyPayload):
+    """
+    Scores a parser result against active dynamic profiles and returns an enriched result.
+
+    This is non-destructive:
+      - no titles overwritten
+      - no summaries overwritten
+      - no severity overwritten
+      - no verified_image_url filled
+    """
+    threshold = dynamic_safe_int(payload.threshold) or 55
+    match_result = dynamic_match_best_profile(payload.result, threshold=threshold)
+
+    if payload.apply_hints:
+        applied_result = dynamic_apply_profile_hints_to_result(payload.result, match_result)
+    else:
+        applied_result = payload.result
+
+    event_id = None
+    if payload.log_event:
+        event_id = dynamic_log_profile_match_event(payload.result, match_result, applied_result=applied_result)
+
+    return {
+        "success": True,
+        "matched": match_result.get("matched"),
+        "event_id": event_id,
+        "match": match_result,
+        "result": applied_result,
+    }
+
+
+@app.get("/dynamic-adapter-profile-match-events")
+def list_dynamic_adapter_profile_match_events(limit: int = 100, offset: int = 0):
+    """
+    Lists profile match/application events.
+    """
+    ensure_dynamic_adapter_rule_application_schema()
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT COUNT(*) AS total FROM ai_adapter_profile_match_events")
+        total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                record_id,
+                filename,
+                selected_profile_id,
+                selected_profile_name,
+                selected_report_family,
+                selected_vendor_name,
+                match_score,
+                threshold_score,
+                matched,
+                created_at
+            FROM ai_adapter_profile_match_events
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
+        )
+
+        rows = cursor.fetchall()
+
+        for row in rows:
+            if row.get("created_at"):
+                row["created_at"] = row["created_at"].isoformat()
+
+        return {
+            "success": True,
+            "total": total,
+            "count": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "events": rows,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/dynamic-adapter-profile-match-events/{event_id}")
+def get_dynamic_adapter_profile_match_event(event_id: int):
+    """
+    Gets one profile match/application event with breakdown.
+    """
+    ensure_dynamic_adapter_rule_application_schema()
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT * FROM ai_adapter_profile_match_events WHERE id = %s LIMIT 1",
+            (event_id,),
+        )
+
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Dynamic adapter profile match event not found")
+
+        for key in [
+            "score_breakdown",
+            "matched_features",
+            "applied_hints",
+            "parser_debug_before",
+            "parser_debug_after",
+        ]:
+            row[key] = dynamic_json_load_safe(row.get(key), None)
+
+        if row.get("created_at"):
+            row["created_at"] = row["created_at"].isoformat()
+
+        return {
+            "success": True,
+            "event": row,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()

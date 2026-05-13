@@ -714,7 +714,7 @@ def attach_images_locally_if_needed(issues: List[Dict[str, Any]]) -> List[Dict[s
         next_issue["candidate_image_urls"] = [make_public_image_url(path) for path in ranked[:10]]
         next_issue["all_page_image_paths"] = images_by_page.get(page, []) if page else []
         next_issue["verified_image_path"] = best_path
-        next_issue["verified_image_url"] = make_public_image_url(best_path)
+        next_issue["verified_image_url"] = ""
         next_issue["image_url"] = make_public_image_url(best_path)
 
         if best_path:
@@ -1351,7 +1351,7 @@ def normalize_extracted_issue_to_finding(issue: Dict[str, Any], detected_adapter
         "recommendation": recommendation,
         "detectedAdapter": detected_adapter,
         "image_url": issue.get("image_url") or "",
-        "verified_image_url": issue.get("verified_image_url") or issue.get("image_url") or "",
+        "verified_image_url": issue.get("verified_image_url") if issue.get("image_match_status") == "verified" else "",
         "verified_image_path": issue.get("verified_image_path") or "",
         "candidate_image_paths": issue.get("candidate_image_paths") or [],
         "candidate_image_urls": issue.get("candidate_image_urls") or [],
@@ -1418,9 +1418,10 @@ async def analyze_report(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Uploaded PDF was empty")
 
         filename = file.filename or "inspection-report.pdf"
-        pages, image_count = extract_pdf_pages(content)
 
+        pages, image_count = extract_pdf_pages(content)
         detected_adapter = classify_report(filename, pages)
+
         extracted_issues = extract_issues_from_pages(pages)
 
         try:
@@ -1456,19 +1457,39 @@ async def analyze_report(file: UploadFile = File(...)):
                     "component": "Inspection Report",
                     "source_number": "",
                     "page": 1,
+                    "summary_page": 1,
+                    "detail_page": 1,
                     "recommendation": "Review this report manually or improve the adapter parser.",
                     "image_url": "",
+                    "verified_image_url": "",
+                    "candidate_image_urls": [],
                     "image_match_status": "none",
                     "image_match_confidence": "no_candidate_found",
                     "needs_image_review": "yes",
                 }
             ]
 
-            extracted_issues = findings
+        # Image verification contract:
+        # Any parser-proposed image is only suggested until admin verifies it.
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
 
+            status = clean_text(finding.get("image_match_status") or "suggested").lower()
+
+            if status != "verified":
+                finding["verified_image_url"] = ""
+
+            if finding.get("image_url") and not finding.get("image_match_status"):
+                finding["image_match_status"] = "suggested"
+
+            if finding.get("image_url") and not finding.get("needs_image_review"):
+                finding["needs_image_review"] = "yes"
+
+        extracted_issues = findings
         record_id = make_pdf_record_id(filename)
 
-        return {
+        response_payload = {
             "success": True,
             "record_id": record_id,
             "filename": filename,
@@ -1480,7 +1501,10 @@ async def analyze_report(file: UploadFile = File(...)):
             "extractedIssues": extracted_issues,
             "findings": findings,
             "findings_count": len(findings),
-            "issuesWithImagesCount": sum(1 for item in findings if item.get("image_url")),
+            "issuesWithImagesCount": sum(
+                1 for item in findings
+                if isinstance(item, dict) and item.get("image_url")
+            ),
             "parser_debug": {
                 "workflow": "current_parser_with_image_contract",
                 "text_pages": len(pages),
@@ -1491,8 +1515,79 @@ async def analyze_report(file: UploadFile = File(...)):
                 "image_linking_enabled": True,
                 "image_contract": "suggested_until_admin_verified",
                 "inspection_images_url_base": "/inspection-images/",
+                "dynamic_profile_auto_apply_enabled": True,
             },
         }
+
+        # -------------------------------------------------
+        # Dynamic Adapter Rule Application Pass 2B
+        # Auto-apply promoted dynamic profile hints.
+        #
+        # Non-destructive:
+        # - does not overwrite issue titles
+        # - does not overwrite summaries
+        # - does not overwrite severities
+        # - does not fill verified_image_url
+        # -------------------------------------------------
+        try:
+            if "dynamic_match_best_profile" in globals() and "dynamic_apply_profile_hints_to_result" in globals():
+                original_response_payload = json.loads(json.dumps(response_payload, default=str))
+
+                dynamic_match_result = dynamic_match_best_profile(
+                    response_payload,
+                    threshold=55,
+                )
+
+                response_payload = dynamic_apply_profile_hints_to_result(
+                    response_payload,
+                    dynamic_match_result,
+                )
+
+                dynamic_event_id = None
+
+                if "dynamic_log_profile_match_event" in globals():
+                    dynamic_event_id = dynamic_log_profile_match_event(
+                        original_response_payload,
+                        dynamic_match_result,
+                        applied_result=response_payload,
+                    )
+
+                response_payload.setdefault("parser_debug", {})
+                response_payload["parser_debug"]["dynamic_adapter_profile_match_event_id"] = dynamic_event_id
+            else:
+                response_payload.setdefault("parser_debug", {})
+                response_payload["parser_debug"]["dynamic_adapter_profile_matched"] = False
+                response_payload["parser_debug"]["dynamic_adapter_profile_error"] = "dynamic adapter functions not loaded"
+
+        except Exception as dynamic_profile_error:
+            print("DYNAMIC PROFILE AUTO-APPLY WARNING:", dynamic_profile_error)
+
+            response_payload.setdefault("parser_debug", {})
+            response_payload["parser_debug"]["dynamic_adapter_profile_matched"] = False
+            response_payload["parser_debug"]["dynamic_adapter_profile_error"] = str(dynamic_profile_error)
+
+        # Re-enforce image verification contract after dynamic hint application.
+        for key in ["extractedIssues", "findings"]:
+            if isinstance(response_payload.get(key), list):
+                for issue in response_payload[key]:
+                    if not isinstance(issue, dict):
+                        continue
+
+                    if clean_text(issue.get("image_match_status") or "").lower() != "verified":
+                        issue["verified_image_url"] = ""
+
+        # Optional AI adapter learning log. This does not auto-trust AI.
+        try:
+            if "log_ai_adapter_learning_run" in globals():
+                learning_run_id = log_ai_adapter_learning_run(response_payload)
+                response_payload["ai_adapter_learning_run_id"] = learning_run_id
+            else:
+                response_payload["ai_adapter_learning_run_id"] = None
+        except Exception as learning_error:
+            print("AI ADAPTER LEARNING WARNING:", learning_error)
+            response_payload["ai_adapter_learning_run_id"] = None
+
+        return response_payload
 
     except HTTPException:
         raise

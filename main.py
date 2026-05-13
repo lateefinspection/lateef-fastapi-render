@@ -3480,3 +3480,1039 @@ def hide_single_issue_from_review_queue(issue_id: int, update: ReviewQueueDismis
         conn.close()
 
 
+# =========================
+# DYNAMIC AI ADAPTER LEARNING PASS 1
+# =========================
+#
+# Purpose:
+#   Unknown / weakly matched report
+#   -> AI fallback extracts findings
+#   -> system saves adapter-learning run metadata
+#   -> admin reviews learning run
+#   -> admin can promote it into a reusable dynamic adapter profile
+#
+# Product rule:
+#   AI can suggest.
+#   Admin must approve/promote.
+#   Only approved profiles become reusable.
+#
+# This pass creates database-backed profiles.
+# It does NOT automatically generate Python adapter files yet.
+
+import json
+from typing import Any, Dict, Optional
+
+from fastapi import HTTPException
+from pydantic import BaseModel
+
+
+class AIAdapterLearningReview(BaseModel):
+    admin_status: str = "reviewed"
+    admin_note: Optional[str] = ""
+    quality_score: Optional[int] = None
+
+
+class AIAdapterProfilePromotion(BaseModel):
+    profile_name: str
+    report_family: Optional[str] = "ai_dynamic"
+    vendor_name: Optional[str] = ""
+    admin_note: Optional[str] = ""
+
+
+class AIAdapterLearningLogPayload(BaseModel):
+    result: Dict[str, Any]
+    force: Optional[bool] = False
+
+
+def ai_learning_clean_text(value: Any) -> str:
+    """
+    Local safe text helper.
+
+    Uses existing clean_text if available, otherwise falls back.
+    """
+    try:
+        return clean_text(value)  # type: ignore[name-defined]
+    except Exception:
+        if value is None:
+            return ""
+        return " ".join(str(value).strip().split())
+
+
+def ai_learning_safe_int(value: Any) -> Optional[int]:
+    """
+    Local safe integer helper.
+
+    Uses existing safe_int if available, otherwise falls back.
+    """
+    try:
+        return safe_int(value)  # type: ignore[name-defined]
+    except Exception:
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+
+def ai_learning_get_table_columns(cursor, table_name: str):
+    """
+    Returns table columns.
+
+    Uses existing get_table_columns if available, otherwise direct SHOW COLUMNS.
+    """
+    try:
+        return get_table_columns(cursor, table_name)  # type: ignore[name-defined]
+    except Exception:
+        cursor.execute(f"SHOW COLUMNS FROM {table_name}")
+        rows = cursor.fetchall()
+
+        columns = set()
+
+        for row in rows:
+            if isinstance(row, dict):
+                columns.add(row.get("Field"))
+            else:
+                columns.add(row[0])
+
+        return columns
+
+
+def ai_learning_add_column_if_missing(cursor, table_name: str, column_name: str, column_definition: str):
+    """
+    Adds a column only if missing.
+
+    Uses existing add_column_if_missing if available, otherwise local implementation.
+    """
+    try:
+        add_column_if_missing(cursor, table_name, column_name, column_definition)  # type: ignore[name-defined]
+        return
+    except NameError:
+        pass
+    except Exception:
+        # If existing helper exists but fails, use local fallback.
+        pass
+
+    columns = ai_learning_get_table_columns(cursor, table_name)
+
+    if column_name not in columns:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_definition}")
+
+
+def json_safe(value: Any) -> str:
+    """
+    Converts Python values into JSON text safe for MySQL JSON columns.
+    """
+    try:
+        return json.dumps(value, default=str)
+    except Exception:
+        return json.dumps({"raw": str(value)})
+
+
+def json_load_safe(value: Any, fallback: Any = None):
+    """
+    Safely loads JSON values from MySQL JSON/TEXT columns.
+    """
+    if value is None:
+        return fallback
+
+    if isinstance(value, (dict, list)):
+        return value
+
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback if fallback is not None else value
+
+
+def ensure_ai_adapter_learning_schema():
+    """
+    Creates tables used to learn from unknown or AI-assisted inspection formats.
+
+    Important:
+      This does not auto-trust AI.
+      It stores AI parser runs for admin review and optional profile promotion.
+    """
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_adapter_learning_runs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                record_id VARCHAR(255) DEFAULT '',
+                filename VARCHAR(500) DEFAULT '',
+                detected_adapter VARCHAR(255) DEFAULT '',
+                adapter_confidence VARCHAR(100) DEFAULT '',
+                parser_mode VARCHAR(100) DEFAULT 'unknown',
+                report_family VARCHAR(255) DEFAULT '',
+                vendor_name VARCHAR(255) DEFAULT '',
+                page_count INT DEFAULT 0,
+                image_count INT DEFAULT 0,
+                issue_count INT DEFAULT 0,
+                issues_with_images_count INT DEFAULT 0,
+                sample_issue_titles JSON NULL,
+                extracted_schema JSON NULL,
+                parser_debug JSON NULL,
+                raw_result JSON NULL,
+                admin_status VARCHAR(100) DEFAULT 'pending',
+                admin_note TEXT NULL,
+                quality_score INT NULL,
+                promoted_profile_id INT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_adapter_profiles (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                profile_name VARCHAR(255) NOT NULL,
+                report_family VARCHAR(255) DEFAULT 'ai_dynamic',
+                vendor_name VARCHAR(255) DEFAULT '',
+                source_learning_run_id INT NULL,
+                adapter_signature JSON NULL,
+                extraction_rules JSON NULL,
+                normalization_rules JSON NULL,
+                image_matching_notes JSON NULL,
+                status VARCHAR(100) DEFAULT 'active',
+                admin_note TEXT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        # Defensive upgrades in case table existed from earlier partial pass.
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "adapter_confidence",
+            "adapter_confidence VARCHAR(100) DEFAULT ''",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "parser_mode",
+            "parser_mode VARCHAR(100) DEFAULT 'unknown'",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "report_family",
+            "report_family VARCHAR(255) DEFAULT ''",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "vendor_name",
+            "vendor_name VARCHAR(255) DEFAULT ''",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "sample_issue_titles",
+            "sample_issue_titles JSON NULL",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "extracted_schema",
+            "extracted_schema JSON NULL",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "parser_debug",
+            "parser_debug JSON NULL",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "raw_result",
+            "raw_result JSON NULL",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "admin_status",
+            "admin_status VARCHAR(100) DEFAULT 'pending'",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "admin_note",
+            "admin_note TEXT NULL",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "quality_score",
+            "quality_score INT NULL",
+        )
+        ai_learning_add_column_if_missing(
+            cursor,
+            "ai_adapter_learning_runs",
+            "promoted_profile_id",
+            "promoted_profile_id INT NULL",
+        )
+
+        conn.commit()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def infer_adapter_learning_needed(result: Dict[str, Any], force: bool = False) -> bool:
+    """
+    Determines whether this parser run should be captured for dynamic adapter learning.
+    """
+    if force:
+        return True
+
+    detected_adapter = ai_learning_clean_text(
+        result.get("detectedAdapter")
+        or result.get("detected_adapter")
+        or ""
+    ).lower()
+
+    parser_debug = result.get("parser_debug") or {}
+
+    findings = result.get("findings") or []
+    extracted_issues = result.get("extractedIssues") or []
+
+    findings_count = (
+        ai_learning_safe_int(result.get("findings_count"))
+        or len(findings)
+        or len(extracted_issues)
+        or 0
+    )
+
+    # Unknown or AI-generated formats should be logged.
+    if detected_adapter in {"", "unknown", "ai_extractor", "ai_dynamic", "dynamic_ai_adapter"}:
+        return True
+
+    # Explicit AI fallback flags.
+    if parser_debug.get("used_ai_fallback") is True:
+        return True
+
+    if parser_debug.get("learning_enabled") is True and parser_debug.get("force_learning") is True:
+        return True
+
+    if parser_debug.get("workflow") in {
+        "restored_previous_image_matching_pass_1",
+        "ai_extractor",
+        "dynamic_ai_adapter",
+        "ai_or_unknown",
+    }:
+        return True
+
+    # Very low issue count from a report can indicate weak adapter matching.
+    if findings_count > 0 and findings_count < 8:
+        return True
+
+    return False
+
+
+def build_adapter_signature_from_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Creates a reusable fingerprint/profile seed from a parser result.
+    """
+    issues = result.get("extractedIssues") or result.get("findings") or []
+
+    sample_titles = []
+    systems = []
+    components = []
+    source_patterns = []
+    severities = []
+    image_statuses = []
+
+    for issue in issues[:50]:
+        if not isinstance(issue, dict):
+            continue
+
+        title = (
+            issue.get("issueTitle")
+            or issue.get("issue_title")
+            or issue.get("title")
+            or ""
+        )
+
+        system = issue.get("system") or issue.get("section") or ""
+        component = issue.get("component") or ""
+        severity = issue.get("severity") or ""
+        image_match_status = issue.get("image_match_status") or ""
+
+        source_number = (
+            issue.get("source_number")
+            or issue.get("sourceNumber")
+            or issue.get("issue_code")
+            or issue.get("issueCode")
+            or ""
+        )
+
+        if title:
+            sample_titles.append(ai_learning_clean_text(title))
+
+        if system:
+            systems.append(ai_learning_clean_text(system))
+
+        if component:
+            components.append(ai_learning_clean_text(component))
+
+        if source_number:
+            source_patterns.append(ai_learning_clean_text(source_number))
+
+        if severity:
+            severities.append(ai_learning_clean_text(severity).lower())
+
+        if image_match_status:
+            image_statuses.append(ai_learning_clean_text(image_match_status).lower())
+
+    def unique(values):
+        output = []
+        seen = set()
+
+        for value in values:
+            key = str(value).lower()
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            output.append(value)
+
+        return output
+
+    return {
+        "detected_adapter": result.get("detectedAdapter") or result.get("detected_adapter"),
+        "filename": result.get("filename"),
+        "record_id": result.get("record_id"),
+        "sample_titles": unique(sample_titles)[:25],
+        "systems": unique(systems)[:25],
+        "components": unique(components)[:25],
+        "source_number_examples": unique(source_patterns)[:25],
+        "severity_examples": unique(severities)[:10],
+        "image_status_examples": unique(image_statuses)[:10],
+        "finding_count": len(issues),
+        "has_images": any(
+            bool(issue.get("image_url"))
+            for issue in issues
+            if isinstance(issue, dict)
+        ),
+        "has_candidate_images": any(
+            bool(issue.get("candidate_image_urls"))
+            for issue in issues
+            if isinstance(issue, dict)
+        ),
+        "schema_version": "dynamic_ai_adapter_learning_pass_1",
+    }
+
+
+def log_ai_adapter_learning_run(result: Dict[str, Any], force: bool = False) -> Optional[int]:
+    """
+    Stores parser output as a learning run when the report is unknown,
+    weakly matched, or AI fallback assisted.
+
+    Safe to call after /analyze-report/ builds its response.
+    """
+    try:
+        if not infer_adapter_learning_needed(result, force=force):
+            return None
+
+        ensure_ai_adapter_learning_schema()
+
+        issues = result.get("extractedIssues") or result.get("findings") or []
+        parser_debug = result.get("parser_debug") or {}
+        adapter_signature = build_adapter_signature_from_result(result)
+
+        sample_issue_titles = adapter_signature.get("sample_titles", [])
+
+        conn = get_db_connection()  # type: ignore[name-defined]
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                """
+                INSERT INTO ai_adapter_learning_runs (
+                    record_id,
+                    filename,
+                    detected_adapter,
+                    adapter_confidence,
+                    parser_mode,
+                    report_family,
+                    vendor_name,
+                    page_count,
+                    image_count,
+                    issue_count,
+                    issues_with_images_count,
+                    sample_issue_titles,
+                    extracted_schema,
+                    parser_debug,
+                    raw_result,
+                    admin_status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+                """,
+                (
+                    ai_learning_clean_text(result.get("record_id") or ""),
+                    ai_learning_clean_text(result.get("filename") or ""),
+                    ai_learning_clean_text(
+                        result.get("detectedAdapter")
+                        or result.get("detected_adapter")
+                        or "unknown"
+                    ),
+                    ai_learning_clean_text(parser_debug.get("adapter_confidence") or ""),
+                    ai_learning_clean_text(
+                        parser_debug.get("workflow")
+                        or parser_debug.get("parser_mode")
+                        or "ai_or_unknown"
+                    ),
+                    ai_learning_clean_text(parser_debug.get("report_family") or ""),
+                    ai_learning_clean_text(parser_debug.get("vendor_name") or ""),
+                    ai_learning_safe_int(result.get("page_count"))
+                    or ai_learning_safe_int(parser_debug.get("page_count"))
+                    or 0,
+                    ai_learning_safe_int(result.get("image_count"))
+                    or ai_learning_safe_int(parser_debug.get("image_count"))
+                    or 0,
+                    len(issues),
+                    ai_learning_safe_int(result.get("issuesWithImagesCount"))
+                    or sum(
+                        1
+                        for issue in issues
+                        if isinstance(issue, dict) and issue.get("image_url")
+                    ),
+                    json_safe(sample_issue_titles),
+                    json_safe(adapter_signature),
+                    json_safe(parser_debug),
+                    json_safe(result),
+                ),
+            )
+
+            run_id = cursor.lastrowid
+            conn.commit()
+            return run_id
+
+        finally:
+            cursor.close()
+            conn.close()
+
+    except Exception as e:
+        print("AI ADAPTER LEARNING LOG WARNING:", e)
+        return None
+
+
+@app.get("/ai-adapter-learning-health")
+def ai_adapter_learning_health():
+    """
+    Health check for dynamic AI adapter learning.
+    """
+    try:
+        ensure_core_tables()  # type: ignore[name-defined]
+    except Exception:
+        # Some installs may not need/allow this here. Schema creation below is enough.
+        pass
+
+    ensure_ai_adapter_learning_schema()
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT COUNT(*) AS total FROM ai_adapter_learning_runs")
+        runs_total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN admin_status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN admin_status = 'reviewed' THEN 1 ELSE 0 END) AS reviewed,
+                SUM(CASE WHEN admin_status = 'good_candidate' THEN 1 ELSE 0 END) AS good_candidate,
+                SUM(CASE WHEN admin_status = 'promoted' THEN 1 ELSE 0 END) AS promoted,
+                SUM(CASE WHEN admin_status = 'rejected' THEN 1 ELSE 0 END) AS rejected
+            FROM ai_adapter_learning_runs
+            """
+        )
+        run_stats = cursor.fetchone()
+
+        cursor.execute("SELECT COUNT(*) AS total FROM ai_adapter_profiles")
+        profiles_total = cursor.fetchone()["total"]
+
+        return {
+            "success": True,
+            "schema_ready": True,
+            "runs_total": runs_total,
+            "run_stats": run_stats,
+            "profiles_total": profiles_total,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/ai-adapter-learning-runs/log-result")
+def create_ai_adapter_learning_run_from_result(payload: AIAdapterLearningLogPayload):
+    """
+    Logs a parser result as an AI adapter learning run.
+
+    This endpoint is useful for:
+      - manual testing
+      - n8n calling after /analyze-report/
+      - future unknown-adapter pipelines
+
+    Body:
+      {
+        "force": true,
+        "result": { ...parser response... }
+      }
+    """
+    ensure_ai_adapter_learning_schema()
+
+    run_id = log_ai_adapter_learning_run(payload.result, force=bool(payload.force))
+
+    if not run_id:
+        return {
+            "success": True,
+            "created": False,
+            "learning_run_id": None,
+            "message": "Parser result did not meet learning criteria. Pass force=true to store anyway.",
+        }
+
+    return {
+        "success": True,
+        "created": True,
+        "learning_run_id": run_id,
+        "message": "AI adapter learning run stored.",
+    }
+
+
+@app.get("/ai-adapter-learning-runs")
+def list_ai_adapter_learning_runs(limit: int = 100, offset: int = 0, status: str = ""):
+    """
+    Lists AI adapter learning runs for admin review.
+    """
+    ensure_ai_adapter_learning_schema()
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    status = ai_learning_clean_text(status)
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        where = ""
+        params = []
+
+        if status:
+            where = "WHERE admin_status = %s"
+            params.append(status)
+
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM ai_adapter_learning_runs
+            {where}
+            """,
+            params,
+        )
+
+        total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            f"""
+            SELECT
+                id,
+                record_id,
+                filename,
+                detected_adapter,
+                adapter_confidence,
+                parser_mode,
+                report_family,
+                vendor_name,
+                page_count,
+                image_count,
+                issue_count,
+                issues_with_images_count,
+                sample_issue_titles,
+                admin_status,
+                admin_note,
+                quality_score,
+                promoted_profile_id,
+                created_at,
+                updated_at
+            FROM ai_adapter_learning_runs
+            {where}
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (*params, limit, offset),
+        )
+
+        rows = cursor.fetchall()
+
+        for row in rows:
+            row["sample_issue_titles"] = json_load_safe(row.get("sample_issue_titles"), [])
+
+            for key in ["created_at", "updated_at"]:
+                if row.get(key):
+                    row[key] = row[key].isoformat()
+
+        return {
+            "success": True,
+            "total": total,
+            "count": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "runs": rows,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/ai-adapter-learning-runs/{run_id}")
+def get_ai_adapter_learning_run(run_id: int):
+    """
+    Gets a single AI adapter learning run, including raw parser result.
+    """
+    ensure_ai_adapter_learning_schema()
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT * FROM ai_adapter_learning_runs WHERE id = %s LIMIT 1",
+            (run_id,),
+        )
+
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="AI adapter learning run not found")
+
+        for key in ["sample_issue_titles", "extracted_schema", "parser_debug", "raw_result"]:
+            row[key] = json_load_safe(row.get(key), None)
+
+        for key in ["created_at", "updated_at"]:
+            if row.get(key):
+                row[key] = row[key].isoformat()
+
+        return {
+            "success": True,
+            "run": row,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/ai-adapter-learning-runs/{run_id}/admin-review")
+def review_ai_adapter_learning_run(run_id: int, update: AIAdapterLearningReview):
+    """
+    Admin reviews a learning run.
+
+    AI is not trusted automatically. Admin labels whether this run is useful.
+    """
+    ensure_ai_adapter_learning_schema()
+
+    allowed_statuses = {
+        "pending",
+        "reviewed",
+        "good_candidate",
+        "needs_more_samples",
+        "rejected",
+    }
+
+    admin_status = ai_learning_clean_text(update.admin_status).lower()
+    admin_note = ai_learning_clean_text(update.admin_note or "")
+    quality_score = update.quality_score
+
+    if admin_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid admin_status. Allowed: {sorted(allowed_statuses)}",
+        )
+
+    if quality_score is not None and (quality_score < 0 or quality_score > 100):
+        raise HTTPException(status_code=400, detail="quality_score must be between 0 and 100")
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            UPDATE ai_adapter_learning_runs
+            SET
+                admin_status = %s,
+                admin_note = %s,
+                quality_score = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (admin_status, admin_note, quality_score, run_id),
+        )
+
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="AI adapter learning run not found")
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "AI adapter learning run reviewed.",
+            "run_id": run_id,
+            "admin_status": admin_status,
+            "quality_score": quality_score,
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/ai-adapter-learning-runs/{run_id}/promote-profile")
+def promote_ai_adapter_learning_run(run_id: int, update: AIAdapterProfilePromotion):
+    """
+    Promotes a reviewed AI learning run into a reusable dynamic adapter profile.
+
+    This does not create a Python adapter file yet.
+    It creates a database-backed adapter profile seed that can be used
+    for future matching and admin review.
+    """
+    ensure_ai_adapter_learning_schema()
+
+    profile_name = ai_learning_clean_text(update.profile_name)
+    report_family = ai_learning_clean_text(update.report_family or "ai_dynamic")
+    vendor_name = ai_learning_clean_text(update.vendor_name or "")
+    admin_note = ai_learning_clean_text(update.admin_note or "")
+
+    if not profile_name:
+        raise HTTPException(status_code=400, detail="profile_name is required")
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT * FROM ai_adapter_learning_runs WHERE id = %s LIMIT 1",
+            (run_id,),
+        )
+
+        run = cursor.fetchone()
+
+        if not run:
+            raise HTTPException(status_code=404, detail="AI adapter learning run not found")
+
+        adapter_signature = json_load_safe(run.get("extracted_schema"), {}) or {}
+        parser_debug = json_load_safe(run.get("parser_debug"), {}) or {}
+
+        extraction_rules = {
+            "strategy": "dynamic_ai_profile_seed",
+            "source": "ai_adapter_learning_run",
+            "source_learning_run_id": run_id,
+            "detected_adapter": run.get("detected_adapter"),
+            "parser_mode": run.get("parser_mode"),
+            "preferred_source_number_patterns": adapter_signature.get("source_number_examples", []),
+            "systems_seen": adapter_signature.get("systems", []),
+            "components_seen": adapter_signature.get("components", []),
+            "sample_titles": adapter_signature.get("sample_titles", []),
+            "parser_debug": parser_debug,
+            "notes": (
+                "Profile created from AI fallback/admin-reviewed extraction. "
+                "Future pass should convert this into deterministic extraction rules."
+            ),
+        }
+
+        normalization_rules = {
+            "target_schema": "verified_issue",
+            "required_fields": [
+                "title",
+                "summary",
+                "severity",
+                "system",
+                "component",
+                "source_number",
+                "summary_page",
+                "detail_page",
+                "image_url",
+                "candidate_image_urls",
+            ],
+            "human_verification_required": True,
+            "homeowner_review_required": True,
+            "admin_final_approval_required": True,
+        }
+
+        image_matching_notes = {
+            "detail_page_recovery": True,
+            "candidate_images_required": True,
+            "image_status_default": "suggested",
+            "verified_image_url_default": "",
+            "admin_verification_required": True,
+        }
+
+        cursor.execute(
+            """
+            INSERT INTO ai_adapter_profiles (
+                profile_name,
+                report_family,
+                vendor_name,
+                source_learning_run_id,
+                adapter_signature,
+                extraction_rules,
+                normalization_rules,
+                image_matching_notes,
+                status,
+                admin_note
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s)
+            """,
+            (
+                profile_name,
+                report_family,
+                vendor_name,
+                run_id,
+                json_safe(adapter_signature),
+                json_safe(extraction_rules),
+                json_safe(normalization_rules),
+                json_safe(image_matching_notes),
+                admin_note,
+            ),
+        )
+
+        profile_id = cursor.lastrowid
+
+        cursor.execute(
+            """
+            UPDATE ai_adapter_learning_runs
+            SET
+                admin_status = 'promoted',
+                promoted_profile_id = %s,
+                admin_note = CASE
+                    WHEN %s != '' THEN %s
+                    ELSE admin_note
+                END,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                profile_id,
+                admin_note,
+                admin_note,
+                run_id,
+            ),
+        )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "AI adapter learning run promoted to dynamic adapter profile.",
+            "run_id": run_id,
+            "profile_id": profile_id,
+            "profile_name": profile_name,
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/ai-adapter-profiles")
+def list_ai_adapter_profiles(limit: int = 100, offset: int = 0, status: str = ""):
+    """
+    Lists reusable dynamic adapter profile seeds.
+    """
+    ensure_ai_adapter_learning_schema()
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    status = ai_learning_clean_text(status)
+
+    conn = get_db_connection()  # type: ignore[name-defined]
+    cursor = conn.cursor()
+
+    try:
+        where = ""
+        params = []
+
+        if status:
+            where = "WHERE status = %s"
+            params.append(status)
+
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM ai_adapter_profiles
+            {where}
+            """,
+            params,
+        )
+
+        total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            f"""
+            SELECT *
+            FROM ai_adapter_profiles
+            {where}
+            ORDER BY id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (*params, limit, offset),
+        )
+
+        rows = cursor.fetchall()
+
+        for row in rows:
+            for key in [
+                "adapter_signature",
+                "extraction_rules",
+                "normalization_rules",
+                "image_matching_notes",
+            ]:
+                row[key] = json_load_safe(row.get(key), None)
+
+            for key in ["created_at", "updated_at"]:
+                if row.get(key):
+                    row[key] = row[key].isoformat()
+
+        return {
+            "success": True,
+            "total": total,
+            "count": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "profiles": rows,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()

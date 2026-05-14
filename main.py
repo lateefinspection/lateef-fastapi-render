@@ -5572,3 +5572,611 @@ def get_dynamic_adapter_profile_match_event(event_id: int):
     finally:
         cursor.close()
         conn.close()
+
+# =========================
+# SAAS PORTAL SEPARATION + TENANT ISOLATION PASS 1
+# =========================
+#
+# Purpose:
+#   Add tenant/homeowner scoping to verified issues.
+#   Homeowner endpoints only return records owned by that homeowner/tenant.
+#   Admin endpoints remain global.
+#
+# Product rule:
+#   Homeowner can review their own issues.
+#   Admin can review all issues and final-approve.
+#   Parser/n8n output is not tenant-safe unless tenant metadata is stored.
+
+from typing import Optional
+from fastapi import Header
+from pydantic import BaseModel
+
+
+class TenantProcessMetadata(BaseModel):
+    tenant_id: Optional[str] = ""
+    homeowner_user_id: Optional[str] = ""
+    homeowner_email: Optional[str] = ""
+    property_id: Optional[str] = ""
+    property_address: Optional[str] = ""
+    inspection_id: Optional[str] = ""
+
+
+class HomeownerIssueReviewTenantRequest(BaseModel):
+    homeowner_decision: str = "unreviewed"
+    homeowner_image_decision: Optional[str] = "unreviewed"
+    homeowner_note: Optional[str] = ""
+
+
+def tenant_clean_text(value):
+    try:
+        return clean_text(value)
+    except Exception:
+        if value is None:
+            return ""
+        return " ".join(str(value).strip().split())
+
+
+def tenant_normalize_email(value):
+    return tenant_clean_text(value).lower()
+
+
+def ensure_tenant_isolation_schema():
+    """
+    Adds tenant/homeowner/property fields to verified_issues.
+
+    These fields allow us to separate homeowner portal data from admin portal data.
+    """
+    ensure_core_tables()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "tenant_id",
+            "tenant_id VARCHAR(255) DEFAULT ''",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "homeowner_user_id",
+            "homeowner_user_id VARCHAR(255) DEFAULT ''",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "homeowner_email",
+            "homeowner_email VARCHAR(255) DEFAULT ''",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "property_id",
+            "property_id VARCHAR(255) DEFAULT ''",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "property_address",
+            "property_address TEXT NULL",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "inspection_id",
+            "inspection_id VARCHAR(255) DEFAULT ''",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "portal_visibility",
+            "portal_visibility VARCHAR(50) DEFAULT 'homeowner_admin'",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "created_by_source",
+            "created_by_source VARCHAR(100) DEFAULT 'parser_pipeline'",
+        )
+
+        conn.commit()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def tenant_identity_from_headers(
+    x_tenant_id: Optional[str] = None,
+    x_homeowner_user_id: Optional[str] = None,
+    x_homeowner_email: Optional[str] = None,
+):
+    """
+    Dev/proxy-safe identity helper.
+
+    In final Zite integration, these values should come from authenticated
+    context.user, not from public client headers.
+
+    For this FastAPI sidecar service, n8n/Zite can forward:
+      X-Tenant-ID
+      X-Homeowner-User-ID
+      X-Homeowner-Email
+    """
+    tenant_id = tenant_clean_text(x_tenant_id or "")
+    homeowner_user_id = tenant_clean_text(x_homeowner_user_id or "")
+    homeowner_email = tenant_normalize_email(x_homeowner_email or "")
+
+    if not tenant_id:
+        tenant_id = homeowner_user_id or homeowner_email
+
+    return {
+        "tenant_id": tenant_id,
+        "homeowner_user_id": homeowner_user_id,
+        "homeowner_email": homeowner_email,
+    }
+
+
+def tenant_where_clause(identity):
+    """
+    Builds strict homeowner filter.
+
+    A homeowner request must have at least one identity value.
+    """
+    tenant_id = tenant_clean_text(identity.get("tenant_id") or "")
+    homeowner_user_id = tenant_clean_text(identity.get("homeowner_user_id") or "")
+    homeowner_email = tenant_normalize_email(identity.get("homeowner_email") or "")
+
+    conditions = []
+    params = []
+
+    if tenant_id:
+        conditions.append("COALESCE(tenant_id, '') = %s")
+        params.append(tenant_id)
+
+    if homeowner_user_id:
+        conditions.append("COALESCE(homeowner_user_id, '') = %s")
+        params.append(homeowner_user_id)
+
+    if homeowner_email:
+        conditions.append("LOWER(COALESCE(homeowner_email, '')) = %s")
+        params.append(homeowner_email)
+
+    if not conditions:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing homeowner tenant identity. Provide X-Tenant-ID, X-Homeowner-User-ID, or X-Homeowner-Email.",
+        )
+
+    return "(" + " OR ".join(conditions) + ")", params
+
+
+@app.get("/tenant-health")
+def tenant_health():
+    ensure_tenant_isolation_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        columns = get_table_columns(cursor, "verified_issues")
+
+        required = [
+            "tenant_id",
+            "homeowner_user_id",
+            "homeowner_email",
+            "property_id",
+            "property_address",
+            "inspection_id",
+            "portal_visibility",
+            "created_by_source",
+        ]
+
+        missing = [column for column in required if column not in columns]
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total_issues,
+                SUM(CASE WHEN COALESCE(tenant_id, '') != '' THEN 1 ELSE 0 END) AS with_tenant_id,
+                SUM(CASE WHEN COALESCE(homeowner_email, '') != '' THEN 1 ELSE 0 END) AS with_homeowner_email,
+                COUNT(DISTINCT NULLIF(tenant_id, '')) AS tenant_count,
+                COUNT(DISTINCT NULLIF(homeowner_email, '')) AS homeowner_email_count
+            FROM verified_issues
+            """
+        )
+        stats = cursor.fetchone()
+
+        return {
+            "success": True,
+            "schema_ready": len(missing) == 0,
+            "missing_columns": missing,
+            "stats": stats,
+            "rule": "homeowner endpoints must filter by tenant/homeowner identity; admin endpoints can query globally",
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/homeowner/verified-issues")
+def homeowner_verified_issues(
+    limit: int = 100,
+    offset: int = 0,
+    x_tenant_id: Optional[str] = Header(default=None),
+    x_homeowner_user_id: Optional[str] = Header(default=None),
+    x_homeowner_email: Optional[str] = Header(default=None),
+):
+    """
+    Homeowner-safe verified issue list.
+
+    Returns only issues matching the homeowner/tenant identity.
+    """
+    ensure_tenant_isolation_schema()
+    ensure_review_workflow_schema()
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    identity = tenant_identity_from_headers(
+        x_tenant_id=x_tenant_id,
+        x_homeowner_user_id=x_homeowner_user_id,
+        x_homeowner_email=x_homeowner_email,
+    )
+
+    where_identity, identity_params = tenant_where_clause(identity)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM verified_issues
+            WHERE {where_identity}
+            AND COALESCE(portal_visibility, 'homeowner_admin') IN ('homeowner_admin', 'homeowner')
+            """,
+            identity_params,
+        )
+        total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            f"""
+            SELECT *
+            FROM verified_issues
+            WHERE {where_identity}
+            AND COALESCE(portal_visibility, 'homeowner_admin') IN ('homeowner_admin', 'homeowner')
+            ORDER BY
+                CASE
+                    WHEN risk_level = 'CRITICAL' THEN 1
+                    WHEN risk_level = 'HIGH' THEN 2
+                    WHEN risk_level = 'MEDIUM' THEN 3
+                    WHEN risk_level = 'LOW' THEN 4
+                    ELSE 5
+                END,
+                updated_at DESC,
+                id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (*identity_params, limit, offset),
+        )
+
+        rows = cursor.fetchall()
+
+        return {
+            "success": True,
+            "identity": identity,
+            "total": total,
+            "count": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "issues": [normalize_issue_with_review_fields(row) for row in rows],
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/homeowner/verified-issues/{record_id}")
+def homeowner_verified_issues_by_record(
+    record_id: str,
+    x_tenant_id: Optional[str] = Header(default=None),
+    x_homeowner_user_id: Optional[str] = Header(default=None),
+    x_homeowner_email: Optional[str] = Header(default=None),
+):
+    """
+    Homeowner-safe record view.
+
+    Same record_id can only be returned when the tenant/homeowner identity matches.
+    """
+    ensure_tenant_isolation_schema()
+    ensure_review_workflow_schema()
+
+    identity = tenant_identity_from_headers(
+        x_tenant_id=x_tenant_id,
+        x_homeowner_user_id=x_homeowner_user_id,
+        x_homeowner_email=x_homeowner_email,
+    )
+
+    where_identity, identity_params = tenant_where_clause(identity)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            f"""
+            SELECT *
+            FROM verified_issues
+            WHERE record_id = %s
+            AND {where_identity}
+            AND COALESCE(portal_visibility, 'homeowner_admin') IN ('homeowner_admin', 'homeowner')
+            ORDER BY
+                CASE
+                    WHEN risk_level = 'CRITICAL' THEN 1
+                    WHEN risk_level = 'HIGH' THEN 2
+                    WHEN risk_level = 'MEDIUM' THEN 3
+                    WHEN risk_level = 'LOW' THEN 4
+                    ELSE 5
+                END,
+                id ASC
+            """,
+            (record_id, *identity_params),
+        )
+
+        rows = cursor.fetchall()
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "identity": identity,
+            "count": len(rows),
+            "issues": [normalize_issue_with_review_fields(row) for row in rows],
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.patch("/homeowner/verified-issue/{issue_id}/review")
+def homeowner_review_own_issue(
+    issue_id: int,
+    update: HomeownerIssueReviewTenantRequest,
+    x_tenant_id: Optional[str] = Header(default=None),
+    x_homeowner_user_id: Optional[str] = Header(default=None),
+    x_homeowner_email: Optional[str] = Header(default=None),
+):
+    """
+    Tenant-protected homeowner review endpoint.
+
+    Homeowner can only review an issue if it belongs to their tenant identity.
+    """
+    ensure_tenant_isolation_schema()
+    ensure_review_workflow_schema()
+
+    allowed_decisions = {
+        "unreviewed",
+        "confirmed",
+        "needs_repair",
+        "monitor",
+        "already_fixed",
+        "not_a_concern",
+        "image_mismatch",
+    }
+
+    allowed_image_decisions = {
+        "unreviewed",
+        "accepted",
+        "mismatch",
+        "unsure",
+    }
+
+    homeowner_decision = tenant_clean_text(update.homeowner_decision).lower()
+    homeowner_image_decision = tenant_clean_text(update.homeowner_image_decision or "unreviewed").lower()
+    homeowner_note = tenant_clean_text(update.homeowner_note or "")
+
+    if homeowner_decision not in allowed_decisions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid homeowner_decision. Allowed: {sorted(allowed_decisions)}",
+        )
+
+    if homeowner_image_decision not in allowed_image_decisions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid homeowner_image_decision. Allowed: {sorted(allowed_image_decisions)}",
+        )
+
+    identity = tenant_identity_from_headers(
+        x_tenant_id=x_tenant_id,
+        x_homeowner_user_id=x_homeowner_user_id,
+        x_homeowner_email=x_homeowner_email,
+    )
+
+    where_identity, identity_params = tenant_where_clause(identity)
+
+    current_status = "open"
+
+    if homeowner_decision == "needs_repair":
+        current_status = "needs_repair"
+    elif homeowner_decision == "monitor":
+        current_status = "monitoring"
+    elif homeowner_decision in {"already_fixed", "not_a_concern"}:
+        current_status = "resolved"
+    elif homeowner_decision == "image_mismatch":
+        current_status = "needs_review"
+
+    admin_review_status = "needs_review"
+
+    if homeowner_decision == "unreviewed":
+        admin_review_status = "pending"
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            f"""
+            UPDATE verified_issues
+            SET
+                homeowner_decision = %s,
+                homeowner_image_decision = %s,
+                homeowner_note = %s,
+                homeowner_reviewed_at = NOW(),
+                admin_review_status = %s,
+                current_status = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            AND {where_identity}
+            """,
+            (
+                homeowner_decision,
+                homeowner_image_decision,
+                homeowner_note,
+                admin_review_status,
+                current_status,
+                issue_id,
+                *identity_params,
+            ),
+        )
+
+        if cursor.rowcount == 0:
+            conn.rollback()
+            raise HTTPException(
+                status_code=404,
+                detail="Issue not found for this homeowner/tenant identity.",
+            )
+
+        conn.commit()
+
+        cursor.execute(
+            "SELECT * FROM verified_issues WHERE id = %s LIMIT 1",
+            (issue_id,),
+        )
+        row = cursor.fetchone()
+
+        return {
+            "success": True,
+            "message": "Homeowner review saved for tenant-scoped issue.",
+            "identity": identity,
+            "issue": normalize_issue_with_review_fields(row),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/admin/tenants")
+def admin_list_tenants():
+    """
+    Admin-only style tenant overview.
+
+    Pass 1 does not enforce auth here yet.
+    Final Zite integration should gate this behind ZITE_ADMIN_EMAIL.
+    """
+    ensure_tenant_isolation_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(tenant_id, ''), NULLIF(homeowner_email, ''), 'unassigned') AS tenant_key,
+                MAX(homeowner_user_id) AS homeowner_user_id,
+                MAX(homeowner_email) AS homeowner_email,
+                MAX(property_address) AS sample_property_address,
+                COUNT(*) AS issue_count,
+                COUNT(DISTINCT record_id) AS record_count,
+                SUM(CASE WHEN COALESCE(baseline_locked, 'no') = 'yes' THEN 1 ELSE 0 END) AS baseline_locked_count,
+                SUM(CASE WHEN COALESCE(homeowner_decision, 'unreviewed') != 'unreviewed' THEN 1 ELSE 0 END) AS homeowner_reviewed_count,
+                MAX(updated_at) AS last_updated
+            FROM verified_issues
+            GROUP BY tenant_key
+            ORDER BY last_updated DESC
+            """
+        )
+
+        rows = cursor.fetchall()
+
+        for row in rows:
+            if row.get("last_updated"):
+                row["last_updated"] = row["last_updated"].isoformat()
+
+        return {
+            "success": True,
+            "count": len(rows),
+            "tenants": rows,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/admin/tenant/{tenant_id}/verified-issues")
+def admin_get_tenant_issues(tenant_id: str, limit: int = 100, offset: int = 0):
+    """
+    Admin tenant drill-down.
+    """
+    ensure_tenant_isolation_schema()
+    ensure_review_workflow_schema()
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    tenant_id = tenant_clean_text(tenant_id)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM verified_issues
+            WHERE COALESCE(tenant_id, '') = %s
+            OR LOWER(COALESCE(homeowner_email, '')) = LOWER(%s)
+            """,
+            (tenant_id, tenant_id),
+        )
+        total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM verified_issues
+            WHERE COALESCE(tenant_id, '') = %s
+            OR LOWER(COALESCE(homeowner_email, '')) = LOWER(%s)
+            ORDER BY updated_at DESC, id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (tenant_id, tenant_id, limit, offset),
+        )
+        rows = cursor.fetchall()
+
+        return {
+            "success": True,
+            "tenant_id": tenant_id,
+            "total": total,
+            "count": len(rows),
+            "issues": [normalize_issue_with_review_fields(row) for row in rows],
+        }
+
+    finally:
+        cursor.close()
+        conn.close()

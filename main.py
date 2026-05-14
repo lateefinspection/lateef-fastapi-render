@@ -310,6 +310,12 @@ class Finding(BaseModel):
 
 class InspectionProcessRequest(BaseModel):
     record_id: str
+    tenant_id: Optional[str] = ""
+    homeowner_user_id: Optional[str] = ""
+    homeowner_email: Optional[str] = ""
+    property_id: Optional[str] = ""
+    property_address: Optional[str] = ""
+    inspection_id: Optional[str] = ""
     findings: List[Finding]
 
 
@@ -1811,6 +1817,7 @@ def process_inspection(data: InspectionProcessRequest):
     cursor = conn.cursor()
 
     try:
+        tenant_metadata = get_process_inspection_tenant_metadata(data)
         record_id = clean_text(data.record_id)
 
         if not record_id:
@@ -2061,8 +2068,14 @@ def process_inspection(data: InspectionProcessRequest):
 
         conn.commit()
 
+        tenant_metadata_rows_updated = apply_tenant_metadata_to_record(record_id, tenant_metadata)
+        tenant_metadata_applied = tenant_metadata_rows_updated > 0
+
         return {
             "success": True,
+            "tenant_metadata": tenant_metadata,
+            "tenant_metadata_applied": tenant_metadata_applied,
+            "tenant_metadata_rows_updated": tenant_metadata_rows_updated,
             "record_id": record_id,
             "findings_count": len(findings),
             "alerts_created": alerts_created,
@@ -6176,6 +6189,126 @@ def admin_get_tenant_issues(tenant_id: str, limit: int = 100, offset: int = 0):
             "count": len(rows),
             "issues": [normalize_issue_with_review_fields(row) for row in rows],
         }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+
+# =========================
+# PROCESS INSPECTION TENANT METADATA PATCH
+# =========================
+#
+# Purpose:
+#   Store tenant/homeowner/property metadata during /process-inspection.
+#   This removes the need for manual tenant backfill after n8n intake.
+
+def get_process_inspection_tenant_metadata(payload):
+    """
+    Extract tenant/homeowner/property metadata from /process-inspection payload.
+
+    Works with Pydantic model payloads.
+    """
+
+    def get_value(obj, key, default=""):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    try:
+        tenant_id = clean_text(get_value(payload, "tenant_id", "") or "")
+        homeowner_user_id = clean_text(get_value(payload, "homeowner_user_id", "") or "")
+        homeowner_email = clean_text(get_value(payload, "homeowner_email", "") or "").lower()
+        property_id = clean_text(get_value(payload, "property_id", "") or "")
+        property_address = clean_text(get_value(payload, "property_address", "") or "")
+        inspection_id = clean_text(get_value(payload, "inspection_id", "") or "")
+        record_id = clean_text(get_value(payload, "record_id", "") or "")
+
+        if not tenant_id:
+            tenant_id = homeowner_user_id or homeowner_email
+
+        if not inspection_id:
+            inspection_id = record_id
+
+        return {
+            "tenant_id": tenant_id,
+            "homeowner_user_id": homeowner_user_id,
+            "homeowner_email": homeowner_email,
+            "property_id": property_id,
+            "property_address": property_address,
+            "inspection_id": inspection_id,
+            "portal_visibility": "homeowner_admin",
+            "created_by_source": "n8n_process_inspection",
+        }
+
+    except Exception as e:
+        print("TENANT METADATA EXTRACTION WARNING:", e)
+
+        return {
+            "tenant_id": "",
+            "homeowner_user_id": "",
+            "homeowner_email": "",
+            "property_id": "",
+            "property_address": "",
+            "inspection_id": "",
+            "portal_visibility": "homeowner_admin",
+            "created_by_source": "n8n_process_inspection",
+        }
+
+
+def apply_tenant_metadata_to_record(record_id, tenant_metadata):
+    """
+    Applies tenant metadata to every verified_issues row for a record_id.
+
+    This is intentionally done after /process-inspection creates/updates rows,
+    so we do not have to rewrite every insert statement.
+    """
+    if not record_id:
+        return 0
+
+    ensure_tenant_isolation_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            UPDATE verified_issues
+            SET
+                tenant_id = %s,
+                homeowner_user_id = %s,
+                homeowner_email = %s,
+                property_id = %s,
+                property_address = %s,
+                inspection_id = %s,
+                portal_visibility = %s,
+                created_by_source = %s,
+                updated_at = NOW()
+            WHERE record_id = %s
+            """,
+            (
+                tenant_metadata.get("tenant_id", ""),
+                tenant_metadata.get("homeowner_user_id", ""),
+                tenant_metadata.get("homeowner_email", ""),
+                tenant_metadata.get("property_id", ""),
+                tenant_metadata.get("property_address", ""),
+                tenant_metadata.get("inspection_id", ""),
+                tenant_metadata.get("portal_visibility", "homeowner_admin"),
+                tenant_metadata.get("created_by_source", "n8n_process_inspection"),
+                record_id,
+            ),
+        )
+
+        updated = cursor.rowcount
+        conn.commit()
+        return updated
+
+    except Exception as e:
+        conn.rollback()
+        print("TENANT METADATA APPLY WARNING:", e)
+        return 0
 
     finally:
         cursor.close()

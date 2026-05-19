@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 import pymysql
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -1824,6 +1824,7 @@ def process_inspection(data: InspectionProcessRequest):
             raise HTTPException(status_code=400, detail="record_id is required")
 
         findings = [model_to_dict(finding) for finding in (data.findings or [])]
+        findings = upload_findings_images_to_s3(record_id, findings)
 
         alerts_created = 0
         tasks_created = 0
@@ -2071,11 +2072,14 @@ def process_inspection(data: InspectionProcessRequest):
         tenant_metadata_rows_updated = apply_tenant_metadata_to_record(record_id, tenant_metadata)
         tenant_metadata_applied = tenant_metadata_rows_updated > 0
 
+        s3_image_urls_rewritten = rewrite_record_image_urls_to_s3_proxy(record_id)
+
         return {
             "success": True,
             "tenant_metadata": tenant_metadata,
             "tenant_metadata_applied": tenant_metadata_applied,
             "tenant_metadata_rows_updated": tenant_metadata_rows_updated,
+            "s3_image_urls_rewritten": s3_image_urls_rewritten,
             "record_id": record_id,
             "findings_count": len(findings),
             "alerts_created": alerts_created,
@@ -6308,6 +6312,420 @@ def apply_tenant_metadata_to_record(record_id, tenant_metadata):
     except Exception as e:
         conn.rollback()
         print("TENANT METADATA APPLY WARNING:", e)
+        return 0
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# =========================
+# S3 IMAGE STORAGE PASS 1
+# =========================
+#
+# Purpose:
+#   Move extracted inspection images from local ephemeral filesystem
+#   into durable S3 storage and serve them through FastAPI.
+#
+# Why:
+#   /inspection-images/... works locally on the Pi, but production Render
+#   does not have those local files. S3 makes images durable and public-dashboard-safe.
+
+import mimetypes
+from pathlib import Path
+from urllib.parse import unquote
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except Exception:
+    boto3 = None
+    ClientError = Exception
+
+
+def s3_images_enabled():
+    return bool(
+        boto3
+        and os.getenv("S3_INSPECTION_BUCKET", "").strip()
+        and os.getenv("AWS_REGION", "").strip()
+    )
+
+
+def get_s3_client():
+    if not boto3:
+        raise RuntimeError("boto3 is not installed. Add boto3 to requirements.txt and install it.")
+
+    return boto3.client(
+        "s3",
+        region_name=os.getenv("AWS_REGION", "us-east-1").strip(),
+    )
+
+
+def clean_s3_segment(value):
+    value = clean_text(value or "")
+    value = value.replace("\\", "/")
+    value = value.replace("..", "")
+    value = value.strip("/")
+
+    safe = []
+    for char in value:
+        if char.isalnum() or char in "-_./":
+            safe.append(char)
+        else:
+            safe.append("-")
+
+    return "".join(safe).strip("/")
+
+
+def local_image_path_from_url(image_url):
+    """
+    Converts /inspection-images/page_x_img_y.jpeg into a local file path.
+
+    Expected local file:
+      output/images/page_x_img_y.jpeg
+    """
+    image_url = clean_text(image_url or "")
+
+    if not image_url:
+        return None
+
+    if image_url.startswith("http://") or image_url.startswith("https://"):
+        return None
+
+    marker = "/inspection-images/"
+    if marker not in image_url:
+        return None
+
+    filename = image_url.split(marker, 1)[1].strip("/")
+    filename = unquote(filename)
+
+    if not filename:
+        return None
+
+    filename = filename.replace("\\", "/").split("/")[-1]
+
+    path = Path("output/images") / filename
+
+    if path.exists() and path.is_file():
+        return path
+
+    return None
+
+
+def s3_proxy_url_for_key(s3_key):
+    s3_key = clean_s3_segment(s3_key)
+    return f"/inspection-images-s3/{s3_key}"
+
+
+def upload_local_image_to_s3(record_id, image_url):
+    """
+    Uploads one local image referenced by /inspection-images/... to S3.
+
+    Returns:
+      /inspection-images-s3/<s3_key>
+    or original image_url if upload is unavailable/fails.
+    """
+    image_url = clean_text(image_url or "")
+
+    if not image_url:
+        return ""
+
+    if image_url.startswith("/inspection-images-s3/"):
+        return image_url
+
+    if image_url.startswith("http://") or image_url.startswith("https://"):
+        return image_url
+
+    if not s3_images_enabled():
+        return image_url
+
+    local_path = local_image_path_from_url(image_url)
+
+    if not local_path:
+        print("S3 IMAGE WARNING: local image file not found for", image_url)
+        return image_url
+
+    bucket = os.getenv("S3_INSPECTION_BUCKET", "").strip()
+    prefix = clean_s3_segment(os.getenv("S3_IMAGE_PREFIX", "inspection-images"))
+    safe_record_id = clean_s3_segment(record_id or "unassigned-record")
+    filename = local_path.name
+
+    s3_key = f"{prefix}/{safe_record_id}/{filename}"
+
+    content_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
+
+    try:
+        client = get_s3_client()
+
+        client.upload_file(
+            str(local_path),
+            bucket,
+            s3_key,
+            ExtraArgs={
+                "ContentType": content_type,
+                "CacheControl": "public, max-age=31536000",
+            },
+        )
+
+        return s3_proxy_url_for_key(s3_key)
+
+    except Exception as e:
+        print("S3 IMAGE UPLOAD WARNING:", image_url, str(e))
+        return image_url
+
+
+def upload_issue_images_to_s3(record_id, finding):
+    """
+    Uploads image_url, verified_image_url, and candidate_image_urls for one finding.
+    Rewrites URLs to FastAPI S3 proxy URLs.
+    """
+    if not isinstance(finding, dict):
+        return finding
+
+    updated = dict(finding)
+
+    updated["image_url"] = upload_local_image_to_s3(
+        record_id,
+        updated.get("image_url") or "",
+    )
+
+    if updated.get("verified_image_url"):
+        updated["verified_image_url"] = upload_local_image_to_s3(
+            record_id,
+            updated.get("verified_image_url") or "",
+        )
+
+    candidates = updated.get("candidate_image_urls") or []
+
+    if isinstance(candidates, str):
+        try:
+            candidates = json.loads(candidates)
+        except Exception:
+            candidates = []
+
+    if isinstance(candidates, list):
+        uploaded_candidates = []
+        seen = set()
+
+        for candidate in candidates:
+            new_url = upload_local_image_to_s3(record_id, candidate)
+
+            if new_url and new_url not in seen:
+                uploaded_candidates.append(new_url)
+                seen.add(new_url)
+
+        updated["candidate_image_urls"] = uploaded_candidates
+
+    return updated
+
+
+def upload_findings_images_to_s3(record_id, findings):
+    """
+    Applies S3 image upload/rewrite to all findings before DB storage.
+    """
+    if not findings:
+        return findings
+
+    if not s3_images_enabled():
+        print("S3 IMAGE INFO: S3 image upload disabled. Missing boto3, AWS_REGION, or S3_INSPECTION_BUCKET.")
+        return findings
+
+    uploaded = []
+
+    for finding in findings:
+        uploaded.append(upload_issue_images_to_s3(record_id, finding))
+
+    return uploaded
+
+
+@app.get("/inspection-images-s3/{s3_key:path}")
+def serve_s3_inspection_image(s3_key: str):
+    """
+    Private S3 image proxy.
+
+    Dashboard can use:
+      https://lateef-fastapi-docker.onrender.com/inspection-images-s3/<key>
+
+    The S3 bucket can remain private.
+    """
+    if not s3_images_enabled():
+        raise HTTPException(status_code=503, detail="S3 image storage is not configured.")
+
+    s3_key = clean_s3_segment(s3_key)
+
+    if not s3_key:
+        raise HTTPException(status_code=400, detail="Missing S3 key.")
+
+    bucket = os.getenv("S3_INSPECTION_BUCKET", "").strip()
+
+    try:
+        client = get_s3_client()
+        obj = client.get_object(Bucket=bucket, Key=s3_key)
+
+        body = obj["Body"].read()
+        content_type = obj.get("ContentType") or mimetypes.guess_type(s3_key)[0] or "application/octet-stream"
+
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={
+                "Cache-Control": "public, max-age=31536000",
+            },
+        )
+
+    except ClientError as e:
+        code = ""
+        try:
+            code = e.response.get("Error", {}).get("Code", "")
+        except Exception:
+            pass
+
+        if code in {"NoSuchKey", "404", "NotFound"}:
+            raise HTTPException(status_code=404, detail="Image not found in S3.")
+
+        print("S3 IMAGE SERVE ERROR:", str(e))
+        raise HTTPException(status_code=500, detail="Could not load image from S3.")
+
+    except Exception as e:
+        print("S3 IMAGE SERVE ERROR:", str(e))
+        raise HTTPException(status_code=500, detail="Could not load image from S3.")
+
+
+# =========================
+# S3 DB IMAGE URL REWRITE PATCH
+# =========================
+#
+# Purpose:
+#   If /process-inspection uploaded images to S3 but older DB insert logic
+#   stored /inspection-images/... URLs, rewrite stored verified_issues image fields
+#   to /inspection-images-s3/... after row creation.
+
+def rewrite_single_image_url_to_s3_proxy(record_id, image_url):
+    image_url = clean_text(image_url or "")
+
+    if not image_url:
+        return ""
+
+    if image_url.startswith("/inspection-images-s3/"):
+        return image_url
+
+    if image_url.startswith("http://") or image_url.startswith("https://"):
+        return image_url
+
+    marker = "/inspection-images/"
+    if marker not in image_url:
+        return image_url
+
+    filename = image_url.split(marker, 1)[1].strip("/").split("/")[-1]
+
+    if not filename:
+        return image_url
+
+    prefix = clean_s3_segment(os.getenv("S3_IMAGE_PREFIX", "inspection-images"))
+    safe_record_id = clean_s3_segment(record_id or "unassigned-record")
+    s3_key = f"{prefix}/{safe_record_id}/{filename}"
+
+    return s3_proxy_url_for_key(s3_key)
+
+
+def rewrite_candidate_image_urls_to_s3_proxy(record_id, candidate_image_urls):
+    candidates = candidate_image_urls or []
+
+    if isinstance(candidates, str):
+        try:
+            candidates = json.loads(candidates)
+        except Exception:
+            return candidate_image_urls
+
+    if not isinstance(candidates, list):
+        return candidate_image_urls
+
+    rewritten = []
+    seen = set()
+
+    for candidate in candidates:
+        new_url = rewrite_single_image_url_to_s3_proxy(record_id, candidate)
+        if new_url and new_url not in seen:
+            rewritten.append(new_url)
+            seen.add(new_url)
+
+    return rewritten
+
+
+def rewrite_record_image_urls_to_s3_proxy(record_id):
+    """
+    Rewrites stored DB image_url, verified_image_url, and candidate_image_urls
+    for one record to FastAPI S3 proxy URLs.
+    """
+    if not record_id:
+        return 0
+
+    if not s3_images_enabled():
+        return 0
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    updated_count = 0
+
+    try:
+        cursor.execute(
+            """
+            SELECT id, image_url, verified_image_url, candidate_image_urls
+            FROM verified_issues
+            WHERE record_id = %s
+            """,
+            (record_id,),
+        )
+
+        rows = cursor.fetchall()
+
+        for row in rows:
+            issue_id = row.get("id")
+
+            next_image_url = rewrite_single_image_url_to_s3_proxy(
+                record_id,
+                row.get("image_url") or "",
+            )
+
+            next_verified_image_url = rewrite_single_image_url_to_s3_proxy(
+                record_id,
+                row.get("verified_image_url") or "",
+            )
+
+            next_candidates = rewrite_candidate_image_urls_to_s3_proxy(
+                record_id,
+                row.get("candidate_image_urls"),
+            )
+
+            next_candidates_json = json.dumps(next_candidates or [])
+
+            cursor.execute(
+                """
+                UPDATE verified_issues
+                SET
+                    image_url = %s,
+                    verified_image_url = %s,
+                    candidate_image_urls = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    next_image_url,
+                    next_verified_image_url,
+                    next_candidates_json,
+                    issue_id,
+                ),
+            )
+
+            updated_count += cursor.rowcount
+
+        conn.commit()
+        return updated_count
+
+    except Exception as e:
+        conn.rollback()
+        print("S3 DB IMAGE REWRITE WARNING:", e)
         return 0
 
     finally:

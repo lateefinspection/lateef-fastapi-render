@@ -316,6 +316,7 @@ class InspectionProcessRequest(BaseModel):
     property_id: Optional[str] = ""
     property_address: Optional[str] = ""
     inspection_id: Optional[str] = ""
+    skip_s3_upload: bool = False
     findings: List[Finding]
 
 
@@ -1824,7 +1825,12 @@ def process_inspection(data: InspectionProcessRequest):
             raise HTTPException(status_code=400, detail="record_id is required")
 
         findings = [model_to_dict(finding) for finding in (data.findings or [])]
-        findings = upload_findings_images_to_s3(record_id, findings)
+        skip_s3_upload = bool(getattr(data, "skip_s3_upload", False))
+
+        if skip_s3_upload:
+            print(f"S3 IMAGE INFO: skipping inline S3 upload for record_id={record_id}")
+        else:
+            findings = upload_findings_images_to_s3(record_id, findings)
 
         alerts_created = 0
         tasks_created = 0
@@ -2072,7 +2078,10 @@ def process_inspection(data: InspectionProcessRequest):
         tenant_metadata_rows_updated = apply_tenant_metadata_to_record(record_id, tenant_metadata)
         tenant_metadata_applied = tenant_metadata_rows_updated > 0
 
-        s3_image_urls_rewritten = rewrite_record_image_urls_to_s3_proxy(record_id)
+        if skip_s3_upload:
+            s3_image_urls_rewritten = 0
+        else:
+            s3_image_urls_rewritten = rewrite_record_image_urls_to_s3_proxy(record_id)
 
         return {
             "success": True,
@@ -6731,3 +6740,261 @@ def rewrite_record_image_urls_to_s3_proxy(record_id):
     finally:
         cursor.close()
         conn.close()
+
+
+# =========================
+# ASYNC S3 IMAGE FINALIZATION PASS 1
+# =========================
+#
+# Purpose:
+#   Allow /process-inspection to return fast with skip_s3_upload=true,
+#   then finalize S3 image upload and DB URL rewrite in a separate call.
+
+class S3FinalizeRequest(BaseModel):
+    force: bool = False
+
+
+def ensure_s3_finalization_schema():
+    ensure_core_tables()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "s3_finalization_status",
+            "s3_finalization_status VARCHAR(50) DEFAULT 'not_started'",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "s3_finalized_at",
+            "s3_finalized_at DATETIME NULL",
+        )
+        add_column_if_missing(
+            cursor,
+            "verified_issues",
+            "s3_finalization_note",
+            "s3_finalization_note TEXT NULL",
+        )
+
+        conn.commit()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_verified_issues_for_s3_finalization(record_id):
+    ensure_s3_finalization_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT *
+            FROM verified_issues
+            WHERE record_id = %s
+            ORDER BY id ASC
+            """,
+            (record_id,),
+        )
+
+        return cursor.fetchall()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def mark_s3_finalization_status(record_id, status, note=""):
+    ensure_s3_finalization_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        if status == "complete":
+            cursor.execute(
+                """
+                UPDATE verified_issues
+                SET
+                    s3_finalization_status = %s,
+                    s3_finalized_at = NOW(),
+                    s3_finalization_note = %s,
+                    updated_at = NOW()
+                WHERE record_id = %s
+                """,
+                (status, note, record_id),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE verified_issues
+                SET
+                    s3_finalization_status = %s,
+                    s3_finalization_note = %s,
+                    updated_at = NOW()
+                WHERE record_id = %s
+                """,
+                (status, note, record_id),
+            )
+
+        count = cursor.rowcount
+        conn.commit()
+        return count
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def stored_issue_row_to_finding_for_s3(row):
+    finding = dict(row)
+
+    candidates = finding.get("candidate_image_urls") or []
+
+    if isinstance(candidates, str):
+        try:
+            candidates = json.loads(candidates)
+        except Exception:
+            candidates = []
+
+    finding["candidate_image_urls"] = candidates
+
+    return finding
+
+
+def finalize_record_s3_images(record_id, force=False):
+    record_id = clean_text(record_id)
+
+    if not record_id:
+        raise HTTPException(status_code=400, detail="record_id is required")
+
+    if not s3_images_enabled():
+        raise HTTPException(status_code=503, detail="S3 image storage is not configured.")
+
+    rows = get_verified_issues_for_s3_finalization(record_id)
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No verified issues found for record_id.")
+
+    already_complete = all(
+        clean_text(row.get("s3_finalization_status") or "") == "complete"
+        for row in rows
+    )
+
+    if already_complete and not force:
+        return {
+            "success": True,
+            "record_id": record_id,
+            "already_complete": True,
+            "issues_count": len(rows),
+            "s3_image_urls_rewritten": 0,
+            "message": "S3 image finalization already complete.",
+        }
+
+    mark_s3_finalization_status(record_id, "running", "S3 finalization started.")
+
+    uploaded_count = 0
+
+    try:
+        for row in rows:
+            finding = stored_issue_row_to_finding_for_s3(row)
+
+            before_image = finding.get("image_url") or ""
+            before_candidates = finding.get("candidate_image_urls") or []
+
+            updated = upload_issue_images_to_s3(record_id, finding)
+
+            after_image = updated.get("image_url") or ""
+            after_candidates = updated.get("candidate_image_urls") or []
+
+            if after_image != before_image:
+                uploaded_count += 1
+
+            if after_candidates != before_candidates:
+                uploaded_count += 1
+
+        rewritten_count = rewrite_record_image_urls_to_s3_proxy(record_id)
+
+        mark_s3_finalization_status(
+            record_id,
+            "complete",
+            f"S3 finalization complete. rewritten={rewritten_count}, uploaded_changes={uploaded_count}",
+        )
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "already_complete": False,
+            "issues_count": len(rows),
+            "uploaded_changes": uploaded_count,
+            "s3_image_urls_rewritten": rewritten_count,
+            "message": "S3 image finalization complete.",
+        }
+
+    except HTTPException:
+        mark_s3_finalization_status(record_id, "failed", "S3 finalization failed with HTTPException.")
+        raise
+
+    except Exception as e:
+        mark_s3_finalization_status(record_id, "failed", str(e))
+        raise HTTPException(status_code=500, detail=f"S3 finalization failed: {str(e)}")
+
+
+@app.get("/records/{record_id}/s3-finalization-status")
+def get_record_s3_finalization_status(record_id: str):
+    ensure_s3_finalization_schema()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                record_id,
+                COUNT(*) AS issues_count,
+                MAX(s3_finalization_status) AS status,
+                MAX(s3_finalized_at) AS finalized_at,
+                MAX(s3_finalization_note) AS note,
+                SUM(CASE WHEN image_url LIKE '/inspection-images-s3/%%' THEN 1 ELSE 0 END) AS s3_image_count,
+                SUM(CASE WHEN image_url LIKE '/inspection-images/%%' THEN 1 ELSE 0 END) AS local_image_count
+            FROM verified_issues
+            WHERE record_id = %s
+            GROUP BY record_id
+            """,
+            (record_id,),
+        )
+
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="No verified issues found for record_id.")
+
+        if row.get("finalized_at"):
+            row["finalized_at"] = row["finalized_at"].isoformat()
+
+        return {
+            "success": True,
+            "record": row,
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/records/{record_id}/finalize-s3-images")
+def finalize_s3_images_route(record_id: str, request: S3FinalizeRequest = S3FinalizeRequest()):
+    result = finalize_record_s3_images(record_id, force=request.force)
+    return result

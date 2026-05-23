@@ -6998,3 +6998,1396 @@ def get_record_s3_finalization_status(record_id: str):
 def finalize_s3_images_route(record_id: str, request: S3FinalizeRequest = S3FinalizeRequest()):
     result = finalize_record_s3_images(record_id, force=request.force)
     return result
+
+
+# ============================================================
+# HomeFax Image Intelligence Pass 1B
+# Read-only image candidate cleanup / ranking preview endpoint
+# ============================================================
+
+import math as _hf_img_math
+import hashlib as _hf_img_hashlib
+from io import BytesIO as _hf_img_BytesIO
+from typing import Any as _hf_Any, Dict as _hf_Dict, List as _hf_List, Optional as _hf_Optional
+
+try:
+    import requests as _hf_requests
+except Exception:
+    _hf_requests = None
+
+try:
+    from PIL import Image as _hf_Image
+    from PIL import ImageFilter as _hf_ImageFilter
+    from PIL import ImageStat as _hf_ImageStat
+except Exception:
+    _hf_Image = None
+    _hf_ImageFilter = None
+    _hf_ImageStat = None
+
+
+def _hf_safe_text(value):
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _hf_public_base_url():
+    """
+    Used only when the endpoint needs to fetch images from this same API.
+    Prefer explicit env var in Render if available.
+    """
+    return (
+        os.getenv("HOMEFAX_PUBLIC_API_BASE_URL")
+        or os.getenv("PUBLIC_API_BASE_URL")
+        or os.getenv("RENDER_EXTERNAL_URL")
+        or "https://lateef-fastapi-docker.onrender.com"
+    ).rstrip("/")
+
+
+def _hf_join_public_url(path_or_url):
+    if not path_or_url:
+        return ""
+
+    value = str(path_or_url)
+
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+
+    if not value.startswith("/"):
+        value = "/" + value
+
+    return _hf_public_base_url() + value
+
+
+def _hf_issue_text(issue):
+    parts = [
+        issue.get("title"),
+        issue.get("issueTitle"),
+        issue.get("section"),
+        issue.get("system"),
+        issue.get("component"),
+        issue.get("location"),
+        issue.get("summary"),
+        issue.get("type"),
+    ]
+    return " ".join(_hf_safe_text(p) for p in parts).lower()
+
+
+def _hf_classify_issue_for_image_intelligence(issue):
+    text = _hf_issue_text(issue)
+
+    if any(
+        k in text
+        for k in [
+            "gfci",
+            "gfcis",
+            "afci",
+            "electrical",
+            "breaker",
+            "panel",
+            "panelboard",
+            "wiring",
+            "meter",
+            "disconnect",
+            "receptacle",
+            "outlet",
+            "electric",
+        ]
+    ):
+        return "electrical"
+
+    if any(
+        k in text
+        for k in [
+            "plumbing",
+            "leak",
+            "water",
+            "valve",
+            "supply",
+            "shut",
+            "pipe",
+            "drain",
+            "sink",
+            "hot water",
+            "water heater",
+        ]
+    ):
+        return "plumbing"
+
+    if any(k in text for k in ["roof", "shingle", "flashing", "gutter", "downspout"]):
+        return "roof"
+
+    if any(k in text for k in ["siding", "wall-covering", "exterior", "fascia", "soffit", "eaves"]):
+        return "exterior"
+
+    if any(k in text for k in ["hvac", "furnace", "heating", "cooling", "thermostat", "air conditioning"]):
+        return "hvac"
+
+    if any(k in text for k in ["deck", "porch", "railing", "handrail", "guardrail", "ledger"]):
+        return "structure"
+
+    return "general"
+
+
+def _hf_entropy_from_histogram(hist, total):
+    entropy = 0.0
+
+    if total <= 0:
+        return 0.0
+
+    for count in hist:
+        if count:
+            p = count / total
+            entropy -= p * _hf_img_math.log2(p)
+
+    return entropy
+
+
+def _hf_image_ahash(img, size=8):
+    gray = img.convert("L").resize((size, size))
+    pixels = list(gray.getdata())
+    avg = sum(pixels) / max(1, len(pixels))
+    bits = "".join("1" if p >= avg else "0" for p in pixels)
+    return f"{int(bits, 2):016x}"
+
+
+def _hf_hamming_hex(a, b):
+    try:
+        return bin(int(a, 16) ^ int(b, 16)).count("1")
+    except Exception:
+        return 64
+
+
+def _hf_fetch_image_bytes(path_or_url, timeout=20):
+    """
+    Fetch image bytes from either:
+    - /inspection-images-s3/... through local FastAPI proxy
+    - absolute URL
+    """
+    if _hf_requests is None:
+        raise RuntimeError("requests is not installed")
+
+    url = _hf_join_public_url(path_or_url)
+
+    res = _hf_requests.get(url, timeout=timeout)
+
+    if not res.ok:
+        raise RuntimeError(f"image_fetch_failed status={res.status_code}")
+
+    content_type = res.headers.get("content-type", "").lower()
+
+    if "image" not in content_type:
+        raise RuntimeError(f"not_image content_type={content_type}")
+
+    return res.content or b""
+
+
+def _hf_analyze_image_candidate(path_or_url):
+    """
+    Deterministic image quality analysis.
+    This does NOT decide semantic match yet.
+    It only removes junk/blank/tiny/duplicate/low-information candidates.
+    """
+    result = {
+        "ok": True,
+        "url": path_or_url,
+        "full_url": _hf_join_public_url(path_or_url),
+        "bytes_len": 0,
+        "width": 0,
+        "height": 0,
+        "aspect_ratio": 0,
+        "mean_brightness": 0,
+        "stddev_brightness": 0,
+        "entropy": 0,
+        "edge_mean": 0,
+        "black_white_ratio": 0,
+        "midtone_ratio": 0,
+        "ahash": "",
+        "sha1": "",
+        "quality_score": 100,
+        "reject_reasons": [],
+        "warning_reasons": [],
+        "error": "",
+    }
+
+    if _hf_Image is None or _hf_ImageFilter is None or _hf_ImageStat is None:
+        result["ok"] = False
+        result["quality_score"] = 0
+        result["reject_reasons"].append("pillow_not_installed")
+        return result
+
+    try:
+        data = _hf_fetch_image_bytes(path_or_url)
+        result["bytes_len"] = len(data)
+        result["sha1"] = _hf_img_hashlib.sha1(data).hexdigest()
+
+        img = _hf_Image.open(_hf_img_BytesIO(data))
+        img = img.convert("RGB")
+
+        width, height = img.size
+        result["width"] = width
+        result["height"] = height
+        result["aspect_ratio"] = round(width / height, 3) if height else 0
+
+        gray = img.convert("L")
+        stat = _hf_ImageStat.Stat(gray)
+        result["mean_brightness"] = round(stat.mean[0], 2)
+        result["stddev_brightness"] = round(stat.stddev[0], 2)
+
+        hist = gray.histogram()
+        total = width * height
+        result["entropy"] = round(_hf_entropy_from_histogram(hist, total), 3)
+
+        edges = gray.filter(_hf_ImageFilter.FIND_EDGES)
+        edge_stat = _hf_ImageStat.Stat(edges)
+        result["edge_mean"] = round(edge_stat.mean[0], 2)
+
+        small_gray = gray.resize((128, 128))
+        pixels = list(small_gray.getdata())
+        total_small = max(1, len(pixels))
+
+        black_white = sum(1 for p in pixels if p <= 25 or p >= 230)
+        midtone = sum(1 for p in pixels if 40 < p < 215)
+
+        result["black_white_ratio"] = round(black_white / total_small, 3)
+        result["midtone_ratio"] = round(midtone / total_small, 3)
+        result["ahash"] = _hf_image_ahash(img)
+
+        # Hard rejects
+        if result["bytes_len"] < 2500:
+            result["reject_reasons"].append("very_small_file")
+
+        if width < 140 or height < 100:
+            result["reject_reasons"].append("very_small_dimensions")
+
+        if result["stddev_brightness"] < 6:
+            result["reject_reasons"].append("near_blank_low_detail")
+
+        if result["entropy"] < 2.0:
+            result["reject_reasons"].append("low_entropy_low_information")
+
+        if result["black_white_ratio"] > 0.82 and result["midtone_ratio"] < 0.18:
+            result["reject_reasons"].append("black_white_placeholder_like")
+
+        if result["aspect_ratio"] > 5 or result["aspect_ratio"] < 0.2:
+            result["reject_reasons"].append("extreme_aspect_ratio")
+
+        # Soft warnings
+        if result["edge_mean"] < 4:
+            result["warning_reasons"].append("weak_edges_low_visual_detail")
+
+        if result["stddev_brightness"] < 15:
+            result["warning_reasons"].append("low_contrast")
+
+        if result["entropy"] < 4:
+            result["warning_reasons"].append("low_visual_information")
+
+        score = 100
+        score -= 35 * len(result["reject_reasons"])
+        score -= 10 * len(result["warning_reasons"])
+
+        if width >= 300 and height >= 200:
+            score += 5
+
+        if result["entropy"] >= 5 and result["edge_mean"] >= 8:
+            score += 8
+
+        result["quality_score"] = max(0, min(100, score))
+
+        if result["reject_reasons"]:
+            result["ok"] = False
+
+    except Exception as exc:
+        result["ok"] = False
+        result["quality_score"] = 0
+        result["error"] = str(exc)
+        result["reject_reasons"].append("download_or_analysis_failed")
+
+    return result
+
+
+def _hf_collect_issue_candidate_urls(issue, max_candidates=12):
+    urls = []
+
+    # Include current suggested image first.
+    if issue.get("image_url"):
+        urls.append(issue.get("image_url"))
+
+    # Then include candidate pool.
+    for url in issue.get("candidate_image_urls") or []:
+        if url and url not in urls:
+            urls.append(url)
+
+    # Include already verified image for transparency if present.
+    if issue.get("verified_image_url") and issue.get("verified_image_url") not in urls:
+        urls.insert(0, issue.get("verified_image_url"))
+
+    return urls[:max_candidates]
+
+
+def _hf_score_issue_image_candidates(issue, max_candidates=12, top_k=5):
+    raw_urls = _hf_collect_issue_candidate_urls(issue, max_candidates=max_candidates)
+    category = _hf_classify_issue_for_image_intelligence(issue)
+
+    analyzed = []
+    seen_sha1 = {}
+    seen_ahash = {}
+
+    for index, url in enumerate(raw_urls):
+        candidate = _hf_analyze_image_candidate(url)
+        candidate["candidate_index"] = index
+        candidate["issue_category"] = category
+        candidate["duplicate_of"] = None
+
+        sha1 = candidate.get("sha1")
+        ahash = candidate.get("ahash")
+
+        if sha1:
+            if sha1 in seen_sha1:
+                candidate["duplicate_of"] = seen_sha1[sha1]
+            else:
+                seen_sha1[sha1] = url
+
+        if ahash:
+            for existing_hash, existing_url in seen_ahash.items():
+                if _hf_hamming_hex(ahash, existing_hash) <= 4:
+                    candidate["duplicate_of"] = candidate["duplicate_of"] or existing_url
+                    break
+
+            seen_ahash.setdefault(ahash, url)
+
+        if candidate["duplicate_of"]:
+            candidate["ok"] = False
+            if "duplicate_or_near_duplicate" not in candidate["reject_reasons"]:
+                candidate["reject_reasons"].append("duplicate_or_near_duplicate")
+            candidate["quality_score"] = max(0, candidate.get("quality_score", 0) - 45)
+
+        analyzed.append(candidate)
+
+    ranked = sorted(
+        analyzed,
+        key=lambda c: (
+            1 if c.get("ok") else 0,
+            c.get("quality_score", 0),
+            -c.get("candidate_index", 999),
+        ),
+        reverse=True,
+    )
+
+    clean = [c for c in ranked if c.get("ok")]
+    rejected = [c for c in ranked if not c.get("ok")]
+
+    clean_top = clean[:top_k]
+    best = clean_top[0] if clean_top else None
+
+    return {
+        "issue_id": issue.get("id"),
+        "record_id": issue.get("record_id"),
+        "title": issue.get("title"),
+        "section": issue.get("section"),
+        "severity": issue.get("severity"),
+        "issue_category": category,
+        "current_image_url": issue.get("image_url"),
+        "verified_image_url": issue.get("verified_image_url"),
+        "best_image_url": best.get("url") if best else "",
+        "best_image_score": best.get("quality_score") if best else 0,
+        "clean_candidate_image_urls": [c.get("url") for c in clean_top],
+        "clean_candidate_count": len(clean),
+        "rejected_candidate_count": len(rejected),
+        "raw_candidate_count": len(raw_urls),
+        "candidates": ranked,
+        "status": "scored",
+        "note": "Deterministic cleanup only. Semantic AI vision ranking is not applied in this pass.",
+    }
+
+
+def _hf_get_verified_issues_for_record_internal(record_id):
+    """
+    Internal helper for image-intelligence endpoint.
+
+    It first tries the existing verified issues route handler if available.
+    If that fails because the route returns a Response object or has a different
+    name, use the HTTP endpoint as a safe fallback.
+    """
+    # Preferred: call local HTTP endpoint to preserve exact production payload shape.
+    # This is read-only and avoids making assumptions about database schema.
+    if _hf_requests is None:
+        raise RuntimeError("requests is not installed")
+
+    url = f"{_hf_public_base_url()}/verified-issues/{record_id}"
+    res = _hf_requests.get(url, timeout=60)
+
+    try:
+        data = res.json()
+    except Exception as exc:
+        raise RuntimeError(f"verified_issues_non_json status={res.status_code} preview={res.text[:250]!r}") from exc
+
+    if not res.ok:
+        raise RuntimeError(f"verified_issues_fetch_failed status={res.status_code} data={data}")
+
+    return data.get("issues") or []
+
+
+@app.get("/records/{record_id}/image-intelligence-preview")
+def image_intelligence_preview(
+    record_id: str,
+    max_candidates: int = 12,
+    top_k: int = 5,
+):
+    """
+    Read-only image intelligence preview.
+
+    This endpoint does NOT update verified issues.
+    It scores current image_url + candidate_image_urls and returns a cleaned set.
+
+    Use it before wiring dashboard or database mutations.
+    """
+    try:
+        max_candidates = max(1, min(int(max_candidates), 20))
+        top_k = max(1, min(int(top_k), 10))
+
+        issues = _hf_get_verified_issues_for_record_internal(record_id)
+
+        scored_issues = [
+            _hf_score_issue_image_candidates(
+                issue=issue,
+                max_candidates=max_candidates,
+                top_k=top_k,
+            )
+            for issue in issues
+        ]
+
+        total_raw = sum(i.get("raw_candidate_count", 0) for i in scored_issues)
+        total_clean = sum(i.get("clean_candidate_count", 0) for i in scored_issues)
+        total_rejected = sum(i.get("rejected_candidate_count", 0) for i in scored_issues)
+        issues_without_clean = sum(1 for i in scored_issues if not i.get("clean_candidate_image_urls"))
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "mode": "preview_read_only",
+            "base_url": _hf_public_base_url(),
+            "issues_count": len(scored_issues),
+            "summary": {
+                "total_candidates_analyzed": total_raw,
+                "total_clean_candidates": total_clean,
+                "total_rejected_candidates": total_rejected,
+                "issues_without_clean_candidates": issues_without_clean,
+            },
+            "issues": scored_issues,
+            "message": "Image intelligence preview complete. No database records were changed.",
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "record_id": record_id,
+                "error": str(exc),
+                "message": "Image intelligence preview failed.",
+            },
+        )
+
+
+@app.get("/records/{record_id}/image-intelligence-summary")
+def image_intelligence_summary(
+    record_id: str,
+    max_candidates: int = 12,
+    top_k: int = 5,
+):
+    """
+    Smaller read-only summary for quick terminal checks.
+    """
+    preview = image_intelligence_preview(
+        record_id=record_id,
+        max_candidates=max_candidates,
+        top_k=top_k,
+    )
+
+    compact_issues = []
+
+    for issue in preview.get("issues", []):
+      compact_issues.append({
+          "issue_id": issue.get("issue_id"),
+          "title": issue.get("title"),
+          "section": issue.get("section"),
+          "issue_category": issue.get("issue_category"),
+          "best_image_url": issue.get("best_image_url"),
+          "best_image_score": issue.get("best_image_score"),
+          "raw_candidate_count": issue.get("raw_candidate_count"),
+          "clean_candidate_count": issue.get("clean_candidate_count"),
+          "rejected_candidate_count": issue.get("rejected_candidate_count"),
+          "clean_candidate_image_urls": issue.get("clean_candidate_image_urls"),
+      })
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "mode": "summary_read_only",
+        "issues_count": preview.get("issues_count", 0),
+        "summary": preview.get("summary", {}),
+        "issues": compact_issues,
+    }
+
+
+
+# ============================================================
+# HomeFax Image Intelligence Pass 1B
+# Read-only image candidate cleanup / ranking preview endpoint
+# ============================================================
+
+import math as _hf_img_math
+import hashlib as _hf_img_hashlib
+from io import BytesIO as _hf_img_BytesIO
+from typing import Any as _hf_Any, Dict as _hf_Dict, List as _hf_List, Optional as _hf_Optional
+
+try:
+    import requests as _hf_requests
+except Exception:
+    _hf_requests = None
+
+try:
+    from PIL import Image as _hf_Image
+    from PIL import ImageFilter as _hf_ImageFilter
+    from PIL import ImageStat as _hf_ImageStat
+except Exception:
+    _hf_Image = None
+    _hf_ImageFilter = None
+    _hf_ImageStat = None
+
+
+def _hf_safe_text(value):
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _hf_public_base_url():
+    """
+    Used only when the endpoint needs to fetch images from this same API.
+    Prefer explicit env var in Render if available.
+    """
+    return (
+        os.getenv("HOMEFAX_PUBLIC_API_BASE_URL")
+        or os.getenv("PUBLIC_API_BASE_URL")
+        or os.getenv("RENDER_EXTERNAL_URL")
+        or "https://lateef-fastapi-docker.onrender.com"
+    ).rstrip("/")
+
+
+def _hf_join_public_url(path_or_url):
+    if not path_or_url:
+        return ""
+
+    value = str(path_or_url)
+
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+
+    if not value.startswith("/"):
+        value = "/" + value
+
+    return _hf_public_base_url() + value
+
+
+def _hf_issue_text(issue):
+    parts = [
+        issue.get("title"),
+        issue.get("issueTitle"),
+        issue.get("section"),
+        issue.get("system"),
+        issue.get("component"),
+        issue.get("location"),
+        issue.get("summary"),
+        issue.get("type"),
+    ]
+    return " ".join(_hf_safe_text(p) for p in parts).lower()
+
+
+def _hf_classify_issue_for_image_intelligence(issue):
+    text = _hf_issue_text(issue)
+
+    if any(
+        k in text
+        for k in [
+            "gfci",
+            "gfcis",
+            "afci",
+            "electrical",
+            "breaker",
+            "panel",
+            "panelboard",
+            "wiring",
+            "meter",
+            "disconnect",
+            "receptacle",
+            "outlet",
+            "electric",
+        ]
+    ):
+        return "electrical"
+
+    if any(
+        k in text
+        for k in [
+            "plumbing",
+            "leak",
+            "water",
+            "valve",
+            "supply",
+            "shut",
+            "pipe",
+            "drain",
+            "sink",
+            "hot water",
+            "water heater",
+        ]
+    ):
+        return "plumbing"
+
+    if any(k in text for k in ["roof", "shingle", "flashing", "gutter", "downspout"]):
+        return "roof"
+
+    if any(k in text for k in ["siding", "wall-covering", "exterior", "fascia", "soffit", "eaves"]):
+        return "exterior"
+
+    if any(k in text for k in ["hvac", "furnace", "heating", "cooling", "thermostat", "air conditioning"]):
+        return "hvac"
+
+    if any(k in text for k in ["deck", "porch", "railing", "handrail", "guardrail", "ledger"]):
+        return "structure"
+
+    return "general"
+
+
+def _hf_entropy_from_histogram(hist, total):
+    entropy = 0.0
+
+    if total <= 0:
+        return 0.0
+
+    for count in hist:
+        if count:
+            p = count / total
+            entropy -= p * _hf_img_math.log2(p)
+
+    return entropy
+
+
+def _hf_image_ahash(img, size=8):
+    gray = img.convert("L").resize((size, size))
+    pixels = list(gray.getdata())
+    avg = sum(pixels) / max(1, len(pixels))
+    bits = "".join("1" if p >= avg else "0" for p in pixels)
+    return f"{int(bits, 2):016x}"
+
+
+def _hf_hamming_hex(a, b):
+    try:
+        return bin(int(a, 16) ^ int(b, 16)).count("1")
+    except Exception:
+        return 64
+
+
+def _hf_fetch_image_bytes(path_or_url, timeout=20):
+    """
+    Fetch image bytes from either:
+    - /inspection-images-s3/... through local FastAPI proxy
+    - absolute URL
+    """
+    if _hf_requests is None:
+        raise RuntimeError("requests is not installed")
+
+    url = _hf_join_public_url(path_or_url)
+
+    res = _hf_requests.get(url, timeout=timeout)
+
+    if not res.ok:
+        raise RuntimeError(f"image_fetch_failed status={res.status_code}")
+
+    content_type = res.headers.get("content-type", "").lower()
+
+    if "image" not in content_type:
+        raise RuntimeError(f"not_image content_type={content_type}")
+
+    return res.content or b""
+
+
+def _hf_analyze_image_candidate(path_or_url):
+    """
+    Deterministic image quality analysis.
+    This does NOT decide semantic match yet.
+    It only removes junk/blank/tiny/duplicate/low-information candidates.
+    """
+    result = {
+        "ok": True,
+        "url": path_or_url,
+        "full_url": _hf_join_public_url(path_or_url),
+        "bytes_len": 0,
+        "width": 0,
+        "height": 0,
+        "aspect_ratio": 0,
+        "mean_brightness": 0,
+        "stddev_brightness": 0,
+        "entropy": 0,
+        "edge_mean": 0,
+        "black_white_ratio": 0,
+        "midtone_ratio": 0,
+        "ahash": "",
+        "sha1": "",
+        "quality_score": 100,
+        "reject_reasons": [],
+        "warning_reasons": [],
+        "error": "",
+    }
+
+    if _hf_Image is None or _hf_ImageFilter is None or _hf_ImageStat is None:
+        result["ok"] = False
+        result["quality_score"] = 0
+        result["reject_reasons"].append("pillow_not_installed")
+        return result
+
+    try:
+        data = _hf_fetch_image_bytes(path_or_url)
+        result["bytes_len"] = len(data)
+        result["sha1"] = _hf_img_hashlib.sha1(data).hexdigest()
+
+        img = _hf_Image.open(_hf_img_BytesIO(data))
+        img = img.convert("RGB")
+
+        width, height = img.size
+        result["width"] = width
+        result["height"] = height
+        result["aspect_ratio"] = round(width / height, 3) if height else 0
+
+        gray = img.convert("L")
+        stat = _hf_ImageStat.Stat(gray)
+        result["mean_brightness"] = round(stat.mean[0], 2)
+        result["stddev_brightness"] = round(stat.stddev[0], 2)
+
+        hist = gray.histogram()
+        total = width * height
+        result["entropy"] = round(_hf_entropy_from_histogram(hist, total), 3)
+
+        edges = gray.filter(_hf_ImageFilter.FIND_EDGES)
+        edge_stat = _hf_ImageStat.Stat(edges)
+        result["edge_mean"] = round(edge_stat.mean[0], 2)
+
+        small_gray = gray.resize((128, 128))
+        pixels = list(small_gray.getdata())
+        total_small = max(1, len(pixels))
+
+        black_white = sum(1 for p in pixels if p <= 25 or p >= 230)
+        midtone = sum(1 for p in pixels if 40 < p < 215)
+
+        result["black_white_ratio"] = round(black_white / total_small, 3)
+        result["midtone_ratio"] = round(midtone / total_small, 3)
+        result["ahash"] = _hf_image_ahash(img)
+
+        # Hard rejects
+        if result["bytes_len"] < 2500:
+            result["reject_reasons"].append("very_small_file")
+
+        if width < 140 or height < 100:
+            result["reject_reasons"].append("very_small_dimensions")
+
+        if result["stddev_brightness"] < 6:
+            result["reject_reasons"].append("near_blank_low_detail")
+
+        if result["entropy"] < 2.0:
+            result["reject_reasons"].append("low_entropy_low_information")
+
+        if result["black_white_ratio"] > 0.82 and result["midtone_ratio"] < 0.18:
+            result["reject_reasons"].append("black_white_placeholder_like")
+
+        if result["aspect_ratio"] > 5 or result["aspect_ratio"] < 0.2:
+            result["reject_reasons"].append("extreme_aspect_ratio")
+
+        # Soft warnings
+        if result["edge_mean"] < 4:
+            result["warning_reasons"].append("weak_edges_low_visual_detail")
+
+        if result["stddev_brightness"] < 15:
+            result["warning_reasons"].append("low_contrast")
+
+        if result["entropy"] < 4:
+            result["warning_reasons"].append("low_visual_information")
+
+        score = 100
+        score -= 35 * len(result["reject_reasons"])
+        score -= 10 * len(result["warning_reasons"])
+
+        if width >= 300 and height >= 200:
+            score += 5
+
+        if result["entropy"] >= 5 and result["edge_mean"] >= 8:
+            score += 8
+
+        result["quality_score"] = max(0, min(100, score))
+
+        if result["reject_reasons"]:
+            result["ok"] = False
+
+    except Exception as exc:
+        result["ok"] = False
+        result["quality_score"] = 0
+        result["error"] = str(exc)
+        result["reject_reasons"].append("download_or_analysis_failed")
+
+    return result
+
+
+def _hf_collect_issue_candidate_urls(issue, max_candidates=12):
+    urls = []
+
+    # Include current suggested image first.
+    if issue.get("image_url"):
+        urls.append(issue.get("image_url"))
+
+    # Then include candidate pool.
+    for url in issue.get("candidate_image_urls") or []:
+        if url and url not in urls:
+            urls.append(url)
+
+    # Include already verified image for transparency if present.
+    if issue.get("verified_image_url") and issue.get("verified_image_url") not in urls:
+        urls.insert(0, issue.get("verified_image_url"))
+
+    return urls[:max_candidates]
+
+
+def _hf_score_issue_image_candidates(issue, max_candidates=12, top_k=5):
+    raw_urls = _hf_collect_issue_candidate_urls(issue, max_candidates=max_candidates)
+    category = _hf_classify_issue_for_image_intelligence(issue)
+
+    analyzed = []
+    seen_sha1 = {}
+    seen_ahash = {}
+
+    for index, url in enumerate(raw_urls):
+        candidate = _hf_analyze_image_candidate(url)
+        candidate["candidate_index"] = index
+        candidate["issue_category"] = category
+        candidate["duplicate_of"] = None
+
+        sha1 = candidate.get("sha1")
+        ahash = candidate.get("ahash")
+
+        if sha1:
+            if sha1 in seen_sha1:
+                candidate["duplicate_of"] = seen_sha1[sha1]
+            else:
+                seen_sha1[sha1] = url
+
+        if ahash:
+            for existing_hash, existing_url in seen_ahash.items():
+                if _hf_hamming_hex(ahash, existing_hash) <= 4:
+                    candidate["duplicate_of"] = candidate["duplicate_of"] or existing_url
+                    break
+
+            seen_ahash.setdefault(ahash, url)
+
+        if candidate["duplicate_of"]:
+            candidate["ok"] = False
+            if "duplicate_or_near_duplicate" not in candidate["reject_reasons"]:
+                candidate["reject_reasons"].append("duplicate_or_near_duplicate")
+            candidate["quality_score"] = max(0, candidate.get("quality_score", 0) - 45)
+
+        analyzed.append(candidate)
+
+    ranked = sorted(
+        analyzed,
+        key=lambda c: (
+            1 if c.get("ok") else 0,
+            c.get("quality_score", 0),
+            -c.get("candidate_index", 999),
+        ),
+        reverse=True,
+    )
+
+    clean = [c for c in ranked if c.get("ok")]
+    rejected = [c for c in ranked if not c.get("ok")]
+
+    clean_top = clean[:top_k]
+    best = clean_top[0] if clean_top else None
+
+    return {
+        "issue_id": issue.get("id"),
+        "record_id": issue.get("record_id"),
+        "title": issue.get("title"),
+        "section": issue.get("section"),
+        "severity": issue.get("severity"),
+        "issue_category": category,
+        "current_image_url": issue.get("image_url"),
+        "verified_image_url": issue.get("verified_image_url"),
+        "best_image_url": best.get("url") if best else "",
+        "best_image_score": best.get("quality_score") if best else 0,
+        "clean_candidate_image_urls": [c.get("url") for c in clean_top],
+        "clean_candidate_count": len(clean),
+        "rejected_candidate_count": len(rejected),
+        "raw_candidate_count": len(raw_urls),
+        "candidates": ranked,
+        "status": "scored",
+        "note": "Deterministic cleanup only. Semantic AI vision ranking is not applied in this pass.",
+    }
+
+
+def _hf_get_verified_issues_for_record_internal(record_id):
+    """
+    Internal helper for image-intelligence endpoint.
+
+    It first tries the existing verified issues route handler if available.
+    If that fails because the route returns a Response object or has a different
+    name, use the HTTP endpoint as a safe fallback.
+    """
+    # Preferred: call local HTTP endpoint to preserve exact production payload shape.
+    # This is read-only and avoids making assumptions about database schema.
+    if _hf_requests is None:
+        raise RuntimeError("requests is not installed")
+
+    url = f"{_hf_public_base_url()}/verified-issues/{record_id}"
+    res = _hf_requests.get(url, timeout=60)
+
+    try:
+        data = res.json()
+    except Exception as exc:
+        raise RuntimeError(f"verified_issues_non_json status={res.status_code} preview={res.text[:250]!r}") from exc
+
+    if not res.ok:
+        raise RuntimeError(f"verified_issues_fetch_failed status={res.status_code} data={data}")
+
+    return data.get("issues") or []
+
+
+@app.get("/records/{record_id}/image-intelligence-preview")
+def image_intelligence_preview(
+    record_id: str,
+    max_candidates: int = 12,
+    top_k: int = 5,
+):
+    """
+    Read-only image intelligence preview.
+
+    This endpoint does NOT update verified issues.
+    It scores current image_url + candidate_image_urls and returns a cleaned set.
+
+    Use it before wiring dashboard or database mutations.
+    """
+    try:
+        max_candidates = max(1, min(int(max_candidates), 20))
+        top_k = max(1, min(int(top_k), 10))
+
+        issues = _hf_get_verified_issues_for_record_internal(record_id)
+
+        scored_issues = [
+            _hf_score_issue_image_candidates(
+                issue=issue,
+                max_candidates=max_candidates,
+                top_k=top_k,
+            )
+            for issue in issues
+        ]
+
+        total_raw = sum(i.get("raw_candidate_count", 0) for i in scored_issues)
+        total_clean = sum(i.get("clean_candidate_count", 0) for i in scored_issues)
+        total_rejected = sum(i.get("rejected_candidate_count", 0) for i in scored_issues)
+        issues_without_clean = sum(1 for i in scored_issues if not i.get("clean_candidate_image_urls"))
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "mode": "preview_read_only",
+            "base_url": _hf_public_base_url(),
+            "issues_count": len(scored_issues),
+            "summary": {
+                "total_candidates_analyzed": total_raw,
+                "total_clean_candidates": total_clean,
+                "total_rejected_candidates": total_rejected,
+                "issues_without_clean_candidates": issues_without_clean,
+            },
+            "issues": scored_issues,
+            "message": "Image intelligence preview complete. No database records were changed.",
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "record_id": record_id,
+                "error": str(exc),
+                "message": "Image intelligence preview failed.",
+            },
+        )
+
+
+@app.get("/records/{record_id}/image-intelligence-summary")
+def image_intelligence_summary(
+    record_id: str,
+    max_candidates: int = 12,
+    top_k: int = 5,
+):
+    """
+    Smaller read-only summary for quick terminal checks.
+    """
+    preview = image_intelligence_preview(
+        record_id=record_id,
+        max_candidates=max_candidates,
+        top_k=top_k,
+    )
+
+    compact_issues = []
+
+    for issue in preview.get("issues", []):
+      compact_issues.append({
+          "issue_id": issue.get("issue_id"),
+          "title": issue.get("title"),
+          "section": issue.get("section"),
+          "issue_category": issue.get("issue_category"),
+          "best_image_url": issue.get("best_image_url"),
+          "best_image_score": issue.get("best_image_score"),
+          "raw_candidate_count": issue.get("raw_candidate_count"),
+          "clean_candidate_count": issue.get("clean_candidate_count"),
+          "rejected_candidate_count": issue.get("rejected_candidate_count"),
+          "clean_candidate_image_urls": issue.get("clean_candidate_image_urls"),
+      })
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "mode": "summary_read_only",
+        "issues_count": preview.get("issues_count", 0),
+        "summary": preview.get("summary", {}),
+        "issues": compact_issues,
+    }
+
+
+
+# ============================================================
+# HomeFax Image Intelligence Pass 2
+# AI Vision Semantic Reranking Preview Endpoint
+# ============================================================
+#
+# Purpose:
+#   Read-only AI reranking of image candidates.
+#   This pass answers:
+#     "Does this image actually match this finding?"
+#
+# This endpoint does NOT update the database.
+# It is intentionally capped by max_issues/max_candidates for cost control.
+
+import json as _hf_ai_json
+import re as _hf_ai_re
+
+try:
+    from openai import OpenAI as _hf_OpenAI
+except Exception:
+    _hf_OpenAI = None
+
+
+def _hf_ai_model_name():
+    return (
+        os.getenv("HOMEFAX_VISION_MODEL")
+        or os.getenv("OPENAI_VISION_MODEL")
+        or "gpt-4.1-mini"
+    )
+
+
+def _hf_ai_available():
+    return bool(_hf_OpenAI and os.getenv("OPENAI_API_KEY"))
+
+
+def _hf_compact_finding_for_ai(issue):
+    return {
+        "issue_id": issue.get("issue_id") or issue.get("id"),
+        "title": issue.get("title") or "",
+        "section": issue.get("section") or "",
+        "severity": issue.get("severity") or "",
+        "issue_category": issue.get("issue_category") or "",
+        "current_image_url": issue.get("current_image_url") or issue.get("image_url") or "",
+        "verified_image_url": issue.get("verified_image_url") or "",
+    }
+
+
+def _hf_extract_json_object(text):
+    """
+    Extract a JSON object from the model response.
+    Keeps endpoint resilient if model wraps response in prose/code fence.
+    """
+    if not text:
+        return {}
+
+    text = text.strip()
+
+    # Remove simple fenced code wrappers.
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    try:
+        return _hf_ai_json.loads(text)
+    except Exception:
+        pass
+
+    match = _hf_ai_re.search(r"\{.*\}", text, flags=_hf_ai_re.DOTALL)
+
+    if not match:
+        return {}
+
+    try:
+        return _hf_ai_json.loads(match.group(0))
+    except Exception:
+        return {}
+
+
+def _hf_ai_prompt_for_candidate(issue, candidate):
+    finding = _hf_compact_finding_for_ai(issue)
+
+    return f"""
+You are HomeFax AI image verification support.
+
+Your job:
+Decide whether the provided inspection photo is a good visual match for the finding.
+
+You must judge only what is visible in the image.
+If the image is clean but does not clearly show the finding, score it low.
+Do not assume it matches only because it came from the same report page.
+
+Finding:
+{_hf_ai_json.dumps(finding, indent=2)}
+
+Candidate image metadata:
+{_hf_ai_json.dumps({
+    "url": candidate.get("url"),
+    "quality_score": candidate.get("quality_score"),
+    "issue_category": candidate.get("issue_category"),
+    "candidate_index": candidate.get("candidate_index"),
+}, indent=2)}
+
+Scoring guide:
+- 90-100: clearly shows the exact defect/component
+- 70-89: likely relevant, component visible, defect may be partly visible
+- 40-69: same general system/room, but defect not clear
+- 10-39: weak or questionable relevance
+- 0-9: wrong image, unrelated, placeholder, no useful evidence
+
+Return ONLY valid JSON with this exact shape:
+{{
+  "match_score": 0,
+  "is_relevant": false,
+  "defect_visible": false,
+  "component_visible": false,
+  "image_category": "unknown",
+  "reason": "short explanation",
+  "reject_reason": "short reason if score is under 40, otherwise empty"
+}}
+""".strip()
+
+
+def _hf_ai_score_single_candidate(issue, candidate):
+    if not _hf_ai_available():
+        return {
+            "match_score": 0,
+            "is_relevant": False,
+            "defect_visible": False,
+            "component_visible": False,
+            "image_category": "unknown",
+            "reason": "AI vision is not available. Check OPENAI_API_KEY and openai package.",
+            "reject_reason": "ai_unavailable",
+            "ai_error": "ai_unavailable",
+        }
+
+    client = _hf_OpenAI()
+    image_url = _hf_join_public_url(candidate.get("url") or "")
+
+    try:
+        response = client.responses.create(
+            model=_hf_ai_model_name(),
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": _hf_ai_prompt_for_candidate(issue, candidate),
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": "low",
+                        },
+                    ],
+                }
+            ],
+        )
+
+        raw_text = getattr(response, "output_text", "") or ""
+        parsed = _hf_extract_json_object(raw_text)
+
+        match_score = parsed.get("match_score", 0)
+
+        try:
+            match_score = int(match_score)
+        except Exception:
+            match_score = 0
+
+        match_score = max(0, min(100, match_score))
+
+        return {
+            "match_score": match_score,
+            "is_relevant": bool(parsed.get("is_relevant")),
+            "defect_visible": bool(parsed.get("defect_visible")),
+            "component_visible": bool(parsed.get("component_visible")),
+            "image_category": str(parsed.get("image_category") or "unknown"),
+            "reason": str(parsed.get("reason") or raw_text[:300]),
+            "reject_reason": str(parsed.get("reject_reason") or ""),
+            "ai_model": _hf_ai_model_name(),
+            "ai_error": "",
+        }
+
+    except Exception as exc:
+        return {
+            "match_score": 0,
+            "is_relevant": False,
+            "defect_visible": False,
+            "component_visible": False,
+            "image_category": "unknown",
+            "reason": "AI vision call failed.",
+            "reject_reason": "ai_call_failed",
+            "ai_model": _hf_ai_model_name(),
+            "ai_error": str(exc),
+        }
+
+
+def _hf_ai_rerank_issue(issue, max_candidates=5, top_k=3):
+    clean_candidates = issue.get("candidates") or []
+    clean_candidates = [c for c in clean_candidates if c.get("ok")]
+    clean_candidates = clean_candidates[:max_candidates]
+
+    scored = []
+
+    for candidate in clean_candidates:
+        ai_score = _hf_ai_score_single_candidate(issue, candidate)
+
+        combined_score = round(
+            (0.7 * ai_score.get("match_score", 0))
+            + (0.3 * candidate.get("quality_score", 0)),
+            2,
+        )
+
+        merged = {
+            **candidate,
+            "ai_match_score": ai_score.get("match_score", 0),
+            "ai_is_relevant": ai_score.get("is_relevant", False),
+            "ai_defect_visible": ai_score.get("defect_visible", False),
+            "ai_component_visible": ai_score.get("component_visible", False),
+            "ai_image_category": ai_score.get("image_category", "unknown"),
+            "ai_reason": ai_score.get("reason", ""),
+            "ai_reject_reason": ai_score.get("reject_reason", ""),
+            "ai_model": ai_score.get("ai_model", _hf_ai_model_name()),
+            "ai_error": ai_score.get("ai_error", ""),
+            "combined_score": combined_score,
+        }
+
+        scored.append(merged)
+
+    ranked = sorted(
+        scored,
+        key=lambda c: (
+            c.get("ai_match_score", 0),
+            c.get("combined_score", 0),
+            c.get("quality_score", 0),
+            -c.get("candidate_index", 999),
+        ),
+        reverse=True,
+    )
+
+    top = ranked[:top_k]
+    best = top[0] if top else None
+
+    return {
+        "issue_id": issue.get("issue_id"),
+        "record_id": issue.get("record_id"),
+        "title": issue.get("title"),
+        "section": issue.get("section"),
+        "severity": issue.get("severity"),
+        "issue_category": issue.get("issue_category"),
+        "best_image_url": best.get("url") if best else "",
+        "best_ai_match_score": best.get("ai_match_score") if best else 0,
+        "best_combined_score": best.get("combined_score") if best else 0,
+        "best_ai_reason": best.get("ai_reason") if best else "",
+        "ai_ranked_candidate_image_urls": [c.get("url") for c in top],
+        "ai_ranked_candidates": ranked,
+        "semantic_status": "ai_scored",
+        "note": "Read-only AI vision reranking. No database records were changed.",
+    }
+
+
+@app.get("/records/{record_id}/image-intelligence-ai-preview")
+def image_intelligence_ai_preview(
+    record_id: str,
+    max_candidates: int = 5,
+    top_k: int = 3,
+    max_issues: int = 3,
+):
+    """
+    Read-only AI Vision semantic reranking preview.
+
+    Cost control:
+    - max_issues defaults to 3.
+    - max_candidates defaults to 5.
+    - This endpoint should be tested on small batches first.
+    """
+    try:
+        max_candidates = max(1, min(int(max_candidates), 8))
+        top_k = max(1, min(int(top_k), 5))
+        max_issues = max(1, min(int(max_issues), 10))
+
+        deterministic_preview = image_intelligence_preview(
+            record_id=record_id,
+            max_candidates=max_candidates,
+            top_k=max_candidates,
+        )
+
+        base_issues = deterministic_preview.get("issues", [])[:max_issues]
+
+        ai_issues = [
+            _hf_ai_rerank_issue(
+                issue=issue,
+                max_candidates=max_candidates,
+                top_k=top_k,
+            )
+            for issue in base_issues
+        ]
+
+        total_ai_candidates_scored = sum(
+            len(issue.get("ai_ranked_candidates") or [])
+            for issue in ai_issues
+        )
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "mode": "ai_preview_read_only",
+            "ai_available": _hf_ai_available(),
+            "ai_model": _hf_ai_model_name(),
+            "issues_requested": max_issues,
+            "issues_scored": len(ai_issues),
+            "summary": {
+                "deterministic_summary": deterministic_preview.get("summary", {}),
+                "total_ai_candidates_scored": total_ai_candidates_scored,
+            },
+            "issues": ai_issues,
+            "message": "AI image intelligence preview complete. No database records were changed.",
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "record_id": record_id,
+                "error": str(exc),
+                "message": "AI image intelligence preview failed.",
+            },
+        )
+

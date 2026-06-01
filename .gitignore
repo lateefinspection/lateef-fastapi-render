@@ -67,3 +67,4 @@ htmlcov/
 # =========================
 *_backup*.py
 main_backup_*.py
+original_reports/

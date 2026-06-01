@@ -8328,6 +8328,7 @@ def image_intelligence_ai_preview(
     max_candidates: int = 5,
     top_k: int = 3,
     max_issues: int = 3,
+    start_index: int = 0,
 ):
     """
     Read-only AI Vision semantic reranking preview.
@@ -8341,6 +8342,7 @@ def image_intelligence_ai_preview(
         max_candidates = max(1, min(int(max_candidates), 8))
         top_k = max(1, min(int(top_k), 5))
         max_issues = max(1, min(int(max_issues), 10))
+        start_index = max(0, int(start_index))
 
         deterministic_preview = image_intelligence_preview(
             record_id=record_id,
@@ -8348,7 +8350,10 @@ def image_intelligence_ai_preview(
             top_k=max_candidates,
         )
 
-        base_issues = deterministic_preview.get("issues", [])[:max_issues]
+        all_preview_issues = deterministic_preview.get("issues", [])
+        total_preview_issues = len(all_preview_issues)
+        end_index = min(start_index + max_issues, total_preview_issues)
+        base_issues = all_preview_issues[start_index:end_index]
 
         ai_issues = [
             _hf_ai_rerank_issue(
@@ -8372,6 +8377,11 @@ def image_intelligence_ai_preview(
             "ai_model": _hf_ai_model_name(),
             "issues_requested": max_issues,
             "issues_scored": len(ai_issues),
+            "start_index": start_index,
+            "end_index": end_index,
+            "next_start_index": end_index if end_index < total_preview_issues else None,
+            "has_more": end_index < total_preview_issues,
+            "total_preview_issues": total_preview_issues,
             "summary": {
                 "deterministic_summary": deterministic_preview.get("summary", {}),
                 "total_ai_candidates_scored": total_ai_candidates_scored,
@@ -8390,4 +8400,787 @@ def image_intelligence_ai_preview(
                 "message": "AI image intelligence preview failed.",
             },
         )
+
+
+
+# ============================================================
+# HomeFax Original Report Storage + Source Page Endpoint Pass 1
+# Provides original PDF source access for report-backed findings.
+# ============================================================
+
+import os as _hf_report_os
+import re as _hf_report_re
+import json as _hf_report_json
+import shutil as _hf_report_shutil
+from pathlib import Path as _hf_report_Path
+from typing import Optional as _hf_report_Optional, Any as _hf_report_Any, Dict as _hf_report_Dict
+
+try:
+    from fastapi import HTTPException as _hf_report_HTTPException
+    from fastapi.responses import FileResponse as _hf_report_FileResponse, RedirectResponse as _hf_report_RedirectResponse
+except Exception:
+    _hf_report_HTTPException = None
+    _hf_report_FileResponse = None
+    _hf_report_RedirectResponse = None
+
+
+_HF_REPORT_STORAGE_DIR = _hf_report_Path(
+    _hf_report_os.getenv("HOMEFAX_ORIGINAL_REPORT_DIR", "original_reports")
+).resolve()
+
+_HF_REPORT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _hf_report_safe_record_id(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "unknown-record"
+
+    # Keep URLs/filesystem safe while preserving readable record IDs.
+    safe = _hf_report_re.sub(r"[^a-zA-Z0-9._-]+", "-", raw)
+    safe = safe.strip(".-_")
+    return safe or "unknown-record"
+
+
+def _hf_report_public_base_url() -> str:
+    # Optional. If set, returned URLs can be absolute.
+    return _hf_report_os.getenv("PUBLIC_API_BASE_URL", "").rstrip("/")
+
+
+def _hf_report_relative_pdf_url(record_id: str) -> str:
+    safe_id = _hf_report_safe_record_id(record_id)
+    return f"/inspection-report/{safe_id}"
+
+
+def _hf_report_page_url(record_id: str, source_page: _hf_report_Optional[int] = None) -> str:
+    base = _hf_report_relative_pdf_url(record_id)
+    if source_page:
+        return f"{base}#page={int(source_page)}"
+    return base
+
+
+def _hf_report_absolute_or_relative(url: str) -> str:
+    base = _hf_report_public_base_url()
+    if base and url.startswith("/"):
+        return f"{base}{url}"
+    return url
+
+
+def _hf_report_pdf_path(record_id: str) -> _hf_report_Path:
+    safe_id = _hf_report_safe_record_id(record_id)
+    return _HF_REPORT_STORAGE_DIR / f"{safe_id}.pdf"
+
+
+def _hf_report_find_existing_pdf(record_id: str) -> _hf_report_Optional[_hf_report_Path]:
+    safe_id = _hf_report_safe_record_id(record_id)
+    expected = _hf_report_pdf_path(safe_id)
+
+    if expected.exists() and expected.is_file():
+        return expected
+
+    # Helpful fallback search for manually copied files.
+    candidates = [
+        _HF_REPORT_STORAGE_DIR / f"{safe_id}.PDF",
+        _HF_REPORT_STORAGE_DIR / f"{safe_id}_original.pdf",
+        _HF_REPORT_STORAGE_DIR / f"{safe_id}-original.pdf",
+        _hf_report_Path("uploads") / f"{safe_id}.pdf",
+        _hf_report_Path("uploaded_reports") / f"{safe_id}.pdf",
+    ]
+
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    return None
+
+
+def _hf_report_save_original_pdf(record_id: str, source_path: str) -> _hf_report_Dict[str, _hf_report_Any]:
+    if not source_path:
+        raise ValueError("source_path is required")
+
+    src = _hf_report_Path(source_path).expanduser().resolve()
+
+    if not src.exists() or not src.is_file():
+        raise FileNotFoundError(f"Original PDF not found: {src}")
+
+    if src.suffix.lower() != ".pdf":
+        raise ValueError(f"Original report must be a PDF: {src}")
+
+    dest = _hf_report_pdf_path(record_id)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if src != dest:
+        _hf_report_shutil.copyfile(src, dest)
+
+    size_bytes = dest.stat().st_size
+
+    return {
+        "record_id": _hf_report_safe_record_id(record_id),
+        "stored": True,
+        "path": str(dest),
+        "size_bytes": size_bytes,
+        "report_pdf_url": _hf_report_absolute_or_relative(_hf_report_relative_pdf_url(record_id)),
+    }
+
+
+def _hf_report_db_connection():
+    # Reuse whichever DB helper exists in main.py.
+    for name in ("get_db_connection", "get_connection", "db_connection"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No DB connection helper found. Expected get_db_connection(), get_connection(), or db_connection().")
+
+
+def _hf_report_add_column_if_missing(cursor, table_name: str, column_name: str, column_sql: str):
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+          AND column_name = %s
+        """,
+        (table_name, column_name),
+    )
+
+    exists = cursor.fetchone()
+    if isinstance(exists, dict):
+        count = int(exists.get("COUNT(*)", 0) or list(exists.values())[0] or 0)
+    else:
+        count = int(exists[0] or 0)
+
+    if count == 0:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+        return True
+
+    return False
+
+
+def _hf_report_ensure_schema() -> _hf_report_Dict[str, _hf_report_Any]:
+    added = []
+
+    conn = _hf_report_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            schema_items = [
+                ("verified_issues", "report_pdf_url", "TEXT NULL"),
+                ("verified_issues", "report_page_url", "TEXT NULL"),
+                ("verified_issues", "source_page", "INT NULL"),
+                ("verified_issues", "original_report_path", "TEXT NULL"),
+                ("verified_issues", "homeowner_selected_image_url", "TEXT NULL"),
+            ]
+
+            for table_name, column_name, column_sql in schema_items:
+                try:
+                    did_add = _hf_report_add_column_if_missing(cursor, table_name, column_name, column_sql)
+                    if did_add:
+                        added.append(f"{table_name}.{column_name}")
+                except Exception as column_error:
+                    print("[HomeFax Report Source] schema column warning:", table_name, column_name, column_error)
+
+        conn.commit()
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "storage_dir": str(_HF_REPORT_STORAGE_DIR),
+        "added_columns": added,
+    }
+
+
+def _hf_report_fetch_issue(issue_id: int) -> _hf_report_Optional[dict]:
+    conn = _hf_report_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return None
+
+            if isinstance(row, dict):
+                return row
+
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_report_fetch_record_first_issue(record_id: str) -> _hf_report_Optional[dict]:
+    conn = _hf_report_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM verified_issues
+                WHERE record_id = %s
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (record_id,),
+            )
+            row = cursor.fetchone()
+
+            if not row:
+                return None
+
+            if isinstance(row, dict):
+                return row
+
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_report_issue_source_payload(issue: dict) -> dict:
+    issue = issue or {}
+    record_id = issue.get("record_id") or ""
+
+    source_page = (
+        issue.get("source_page")
+        or issue.get("detail_page")
+        or issue.get("page")
+        or issue.get("summary_page")
+    )
+
+    try:
+        source_page = int(source_page) if source_page not in (None, "", "not linked yet") else None
+    except Exception:
+        source_page = None
+
+    source_number = (
+        issue.get("source_number")
+        or issue.get("sourceNumber")
+        or issue.get("report_item")
+        or issue.get("reportItem")
+        or ""
+    )
+
+    report_pdf_url = issue.get("report_pdf_url") or _hf_report_relative_pdf_url(record_id)
+    report_page_url = issue.get("report_page_url") or _hf_report_page_url(record_id, source_page)
+
+    exists = _hf_report_find_existing_pdf(record_id) is not None
+
+    return {
+        "success": True,
+        "issue_id": issue.get("id"),
+        "record_id": record_id,
+        "source_number": source_number,
+        "source_page": source_page,
+        "report_pdf_url": _hf_report_absolute_or_relative(report_pdf_url),
+        "report_page_url": _hf_report_absolute_or_relative(report_page_url),
+        "original_report_available": exists,
+        "source_status": "linked" if exists else "report_not_uploaded_to_source_storage",
+        "message": (
+            "Original report is available."
+            if exists
+            else "Original report has not been registered in original report storage yet."
+        ),
+    }
+
+
+def _hf_report_update_record_source_urls(record_id: str) -> dict:
+    pdf_url = _hf_report_relative_pdf_url(record_id)
+
+    conn = _hf_report_db_connection()
+    updated = 0
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, source_page, detail_page, page, summary_page
+                FROM verified_issues
+                WHERE record_id = %s
+                """,
+                (record_id,),
+            )
+
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                columns = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(columns, row)) for row in rows]
+
+            for row in rows:
+                issue_id = row.get("id")
+                source_page = (
+                    row.get("source_page")
+                    or row.get("detail_page")
+                    or row.get("page")
+                    or row.get("summary_page")
+                )
+
+                try:
+                    source_page_int = int(source_page) if source_page else None
+                except Exception:
+                    source_page_int = None
+
+                page_url = _hf_report_page_url(record_id, source_page_int)
+
+                cursor.execute(
+                    """
+                    UPDATE verified_issues
+                    SET report_pdf_url = %s,
+                        report_page_url = %s,
+                        source_page = COALESCE(source_page, %s),
+                        original_report_path = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        pdf_url,
+                        page_url,
+                        source_page_int,
+                        str(_hf_report_pdf_path(record_id)),
+                        issue_id,
+                    ),
+                )
+                updated += 1
+
+        conn.commit()
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "updated_issues": updated,
+        "report_pdf_url": _hf_report_absolute_or_relative(pdf_url),
+    }
+
+
+@app.get("/original-report-source-health")
+def original_report_source_health():
+    schema = _hf_report_ensure_schema()
+
+    return {
+        "success": True,
+        "storage_dir": str(_HF_REPORT_STORAGE_DIR),
+        "storage_exists": _HF_REPORT_STORAGE_DIR.exists(),
+        "schema": schema,
+        "endpoints": [
+            "GET /inspection-report/{record_id}",
+            "GET /records/{record_id}/report-source",
+            "GET /verified-issue/{issue_id}/report-source",
+            "POST /records/{record_id}/register-original-report",
+            "POST /records/{record_id}/refresh-report-source-urls",
+        ],
+    }
+
+
+@app.get("/inspection-report/{record_id}")
+def get_original_inspection_report(record_id: str):
+    pdf_path = _hf_report_find_existing_pdf(record_id)
+
+    if not pdf_path:
+        raise _hf_report_HTTPException(
+            status_code=404,
+            detail={
+                "success": False,
+                "record_id": record_id,
+                "message": "Original inspection PDF has not been registered yet.",
+                "expected_path": str(_hf_report_pdf_path(record_id)),
+            },
+        )
+
+    return _hf_report_FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=f"{_hf_report_safe_record_id(record_id)}.pdf",
+    )
+
+
+@app.get("/records/{record_id}/report-source")
+def get_record_report_source(record_id: str):
+    _hf_report_ensure_schema()
+
+    first_issue = _hf_report_fetch_record_first_issue(record_id) or {"record_id": record_id}
+    source = _hf_report_issue_source_payload(first_issue)
+
+    source.update(
+        {
+            "record_id": record_id,
+            "report_pdf_url": _hf_report_absolute_or_relative(_hf_report_relative_pdf_url(record_id)),
+            "report_page_url": _hf_report_absolute_or_relative(_hf_report_page_url(record_id, source.get("source_page"))),
+        }
+    )
+
+    return source
+
+
+@app.get("/verified-issue/{issue_id}/report-source")
+def get_verified_issue_report_source(issue_id: int):
+    _hf_report_ensure_schema()
+
+    issue = _hf_report_fetch_issue(issue_id)
+
+    if not issue:
+        raise _hf_report_HTTPException(
+            status_code=404,
+            detail={
+                "success": False,
+                "issue_id": issue_id,
+                "message": "Verified issue not found.",
+            },
+        )
+
+    return _hf_report_issue_source_payload(issue)
+
+
+@app.post("/records/{record_id}/register-original-report")
+def register_original_report(record_id: str, payload: dict):
+    """
+    Register an existing local PDF path for a record.
+
+    Body:
+    {
+      "source_path": "/home/maestrodagod/Downloads/report.pdf"
+    }
+
+    This is for Pass 1/local testing. Later n8n/upload flow should save this automatically.
+    """
+    _hf_report_ensure_schema()
+
+    source_path = (payload or {}).get("source_path", "")
+
+    try:
+        stored = _hf_report_save_original_pdf(record_id, source_path)
+        updated = _hf_report_update_record_source_urls(record_id)
+    except Exception as error:
+        raise _hf_report_HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "record_id": record_id,
+                "error": str(error),
+            },
+        )
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "stored": stored,
+        "updated": updated,
+    }
+
+
+@app.post("/records/{record_id}/refresh-report-source-urls")
+def refresh_report_source_urls(record_id: str):
+    _hf_report_ensure_schema()
+    updated = _hf_report_update_record_source_urls(record_id)
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "updated": updated,
+    }
+
+
+
+# ============================================================
+# HomeFax Original Report Source Compatibility Patch 1
+# Fixes source URL refresh on schemas without detail_page/page/summary_page.
+# Also improves source_number detection from available columns.
+# ============================================================
+
+def _hf_report_table_columns(table_name: str = "verified_issues") -> set:
+    conn = _hf_report_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = DATABASE()
+                  AND table_name = %s
+                """,
+                (table_name,),
+            )
+            rows = cursor.fetchall() or []
+
+            columns = set()
+            for row in rows:
+                if isinstance(row, dict):
+                    columns.add(str(row.get("column_name") or row.get("COLUMN_NAME") or "").strip())
+                else:
+                    columns.add(str(row[0]).strip())
+
+            return {c for c in columns if c}
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_report_first_existing_column(columns: set, names: list) -> str:
+    for name in names:
+        if name in columns:
+            return name
+    return ""
+
+
+def _hf_report_get_first_value(row: dict, keys: list):
+    for key in keys:
+        if key in row and row.get(key) not in (None, "", "not linked yet"):
+            return row.get(key)
+    return None
+
+
+def _hf_report_extract_source_number(issue: dict) -> str:
+    issue = issue or {}
+
+    candidates = [
+        "source_number",
+        "sourceNumber",
+        "report_item",
+        "reportItem",
+        "item_number",
+        "itemNumber",
+        "inspection_item",
+        "inspectionItem",
+        "finding_number",
+        "findingNumber",
+        "issue_code",
+        "issueCode",
+        "code",
+    ]
+
+    value = _hf_report_get_first_value(issue, candidates)
+
+    if value:
+        return str(value).strip()
+
+    # Fallback: extract a report item pattern like 9.8.1 from title/summary/section.
+    text = " ".join(
+        str(issue.get(k) or "")
+        for k in [
+            "title",
+            "issueTitle",
+            "original_title",
+            "section",
+            "summary",
+            "description",
+            "original_report_wording",
+        ]
+    )
+
+    m = _hf_report_re.search(r"\b\d{1,2}\.\d{1,2}(?:\.\d{1,2})?\b", text)
+    return m.group(0) if m else ""
+
+
+def _hf_report_extract_source_page(issue: dict):
+    issue = issue or {}
+
+    value = _hf_report_get_first_value(
+        issue,
+        [
+            "source_page",
+            "detail_page",
+            "page",
+            "summary_page",
+            "page_number",
+            "pageNumber",
+            "report_page",
+            "reportPage",
+        ],
+    )
+
+    try:
+        return int(value) if value not in (None, "", "not linked yet") else None
+    except Exception:
+        return None
+
+
+# Override previous implementation safely.
+def _hf_report_issue_source_payload(issue: dict) -> dict:
+    issue = issue or {}
+    record_id = issue.get("record_id") or ""
+
+    source_page = _hf_report_extract_source_page(issue)
+    source_number = _hf_report_extract_source_number(issue)
+
+    report_pdf_url = issue.get("report_pdf_url") or _hf_report_relative_pdf_url(record_id)
+    report_page_url = issue.get("report_page_url") or _hf_report_page_url(record_id, source_page)
+
+    exists = _hf_report_find_existing_pdf(record_id) is not None
+
+    return {
+        "success": True,
+        "issue_id": issue.get("id"),
+        "record_id": record_id,
+        "source_number": source_number,
+        "source_page": source_page,
+        "report_pdf_url": _hf_report_absolute_or_relative(report_pdf_url),
+        "report_page_url": _hf_report_absolute_or_relative(report_page_url),
+        "original_report_available": exists,
+        "source_status": "linked" if exists else "report_not_uploaded_to_source_storage",
+        "message": (
+            "Original report is available."
+            if exists
+            else "Original report has not been registered in original report storage yet."
+        ),
+    }
+
+
+# Override previous implementation safely.
+def _hf_report_update_record_source_urls(record_id: str) -> dict:
+    columns = _hf_report_table_columns("verified_issues")
+
+    pdf_url = _hf_report_relative_pdf_url(record_id)
+
+    page_columns = [
+        c
+        for c in [
+            "source_page",
+            "detail_page",
+            "page",
+            "summary_page",
+            "page_number",
+            "report_page",
+        ]
+        if c in columns
+    ]
+
+    select_cols = ["id"]
+    for col in page_columns:
+        if col not in select_cols:
+            select_cols.append(col)
+
+    # Keep this select schema-safe. Do not select columns that do not exist.
+    select_sql = f"""
+        SELECT {", ".join(select_cols)}
+        FROM verified_issues
+        WHERE record_id = %s
+    """
+
+    conn = _hf_report_db_connection()
+    updated = 0
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(select_sql, (record_id,))
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                result_columns = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(result_columns, row)) for row in rows]
+
+            for row in rows:
+                issue_id = row.get("id")
+
+                source_page_int = None
+                for col in page_columns:
+                    val = row.get(col)
+                    if val not in (None, "", "not linked yet"):
+                        try:
+                            source_page_int = int(val)
+                            break
+                        except Exception:
+                            pass
+
+                page_url = _hf_report_page_url(record_id, source_page_int)
+
+                update_fields = []
+                update_values = []
+
+                if "report_pdf_url" in columns:
+                    update_fields.append("report_pdf_url = %s")
+                    update_values.append(pdf_url)
+
+                if "report_page_url" in columns:
+                    update_fields.append("report_page_url = %s")
+                    update_values.append(page_url)
+
+                if "source_page" in columns and source_page_int:
+                    update_fields.append("source_page = COALESCE(source_page, %s)")
+                    update_values.append(source_page_int)
+
+                if "original_report_path" in columns:
+                    update_fields.append("original_report_path = %s")
+                    update_values.append(str(_hf_report_pdf_path(record_id)))
+
+                if not update_fields:
+                    continue
+
+                update_values.append(issue_id)
+
+                cursor.execute(
+                    f"""
+                    UPDATE verified_issues
+                    SET {", ".join(update_fields)}
+                    WHERE id = %s
+                    """,
+                    tuple(update_values),
+                )
+
+                updated += 1
+
+        conn.commit()
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "updated_issues": updated,
+        "available_page_columns": page_columns,
+        "report_pdf_url": _hf_report_absolute_or_relative(pdf_url),
+    }
+
+
+
+# ============================================================
+# HomeFax Original Report Source HEAD Support Patch
+# Allows curl -I /inspection-report/{record_id}.
+# ============================================================
+
+@app.head("/inspection-report/{record_id}")
+def head_original_inspection_report(record_id: str):
+    pdf_path = _hf_report_find_existing_pdf(record_id)
+
+    if not pdf_path:
+        raise _hf_report_HTTPException(
+            status_code=404,
+            detail={
+                "success": False,
+                "record_id": record_id,
+                "message": "Original inspection PDF has not been registered yet.",
+                "expected_path": str(_hf_report_pdf_path(record_id)),
+            },
+        )
+
+    return _hf_report_FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=f"{_hf_report_safe_record_id(record_id)}.pdf",
+    )
 

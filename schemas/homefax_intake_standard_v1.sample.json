@@ -1,0 +1,88 @@
+{
+  "homefax_intake_standard_version": "1.0",
+  "record_id": "pdf-6039-s-carpenter-st-inspection-report-by-big-ben-inspections-by-1f8a26dc",
+  "tenant_id": "lateef-home-inspection",
+  "source": {
+    "source_system": "fastapi",
+    "source_workflow": "standard_dashboard_review",
+    "received_at": "2026-06-25T00:00:00Z"
+  },
+  "property": {
+    "property_id": "",
+    "address_full": "6039 S Carpenter St",
+    "city": "Chicago",
+    "state": "IL",
+    "country": "US"
+  },
+  "homeowner": {
+    "homeowner_user_id": "",
+    "name": "Vasintino Johnson",
+    "email": "",
+    "phone": ""
+  },
+  "inspection": {
+    "inspection_id": "",
+    "inspection_company": "Big Ben Inspections",
+    "detected_adapter": "bigben_internachi"
+  },
+  "original_report": {
+    "file_name": "6039 S Carpenter St Inspection Report by Big Ben Inspections.pdf",
+    "page_count": 65,
+    "storage_status": "stored"
+  },
+  "processing": {
+    "pipeline_stage": "review_ready",
+    "parser_status": "complete",
+    "image_processing_status": "complete",
+    "standardization_status": "complete",
+    "issues_count": 44,
+    "candidate_images_count": 261,
+    "errors": []
+  },
+  "standard_findings": [
+    {
+      "finding_id": "3.9.1",
+      "source": {
+        "source_item_number": "3.9.1",
+        "source_report_section": "Railings, Guards, and Handrails",
+        "source_finding_title": "Handrail Not Graspable",
+        "source_finding_text": "I observed a handrail that is not grippable or graspable.",
+        "source_page": 20
+      },
+      "homefax": {
+        "standard_schema_version": "1.0",
+        "category": "Exterior",
+        "system": "Railings / Guards / Handrails",
+        "component": "Handrail",
+        "severity": "safety"
+      },
+      "evidence": {
+        "image_url": "",
+        "verified_image_url": "",
+        "candidate_image_urls": [],
+        "image_match_status": "suggested",
+        "needs_image_review": true
+      },
+      "review_state": {
+        "homeowner_decision": "unreviewed",
+        "current_status": "open"
+      },
+      "admin_state": {
+        "admin_review_status": "pending",
+        "final_approval_status": "not_approved",
+        "baseline_locked": false
+      },
+      "monitoring": {
+        "monitoring_enabled": false,
+        "alert_status": "none"
+      }
+    }
+  ],
+  "audit": {
+    "created_at": "2026-06-25T00:00:00Z",
+    "updated_at": "2026-06-25T00:00:00Z",
+    "created_by": "fastapi",
+    "updated_by": "fastapi",
+    "source_trace": []
+  }
+}

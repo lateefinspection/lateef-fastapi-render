@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://homefax.ai/schemas/homefax_intake_standard_v1.schema.json",
+  "title": "HomeFax Intake Standard Contract v1",
+  "type": "object",
+  "required": [
+    "homefax_intake_standard_version",
+    "record_id",
+    "tenant_id",
+    "source",
+    "property",
+    "homeowner",
+    "inspection",
+    "original_report",
+    "processing",
+    "standard_findings",
+    "audit"
+  ],
+  "properties": {
+    "homefax_intake_standard_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "record_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "type": "object"
+    },
+    "property": {
+      "type": "object"
+    },
+    "homeowner": {
+      "type": "object"
+    },
+    "inspection": {
+      "type": "object"
+    },
+    "original_report": {
+      "type": "object"
+    },
+    "processing": {
+      "type": "object"
+    },
+    "standard_findings": {
+      "type": "array"
+    },
+    "audit": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

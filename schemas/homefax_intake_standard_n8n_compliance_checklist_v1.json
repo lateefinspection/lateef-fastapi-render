@@ -1,0 +1,150 @@
+{
+  "checklist_version": "1.0",
+  "name": "HomeFax Intake Standard n8n Compliance Checklist v1",
+  "purpose": "Define what n8n must preserve and validate before treating an inspection payload as HomeFax-ready.",
+  "n8n_role": {
+    "allowed": [
+      "receive_upload_metadata",
+      "coordinate_fastapi_calls",
+      "call_analyze_report",
+      "call_process_inspection",
+      "call_intake_standard_preview",
+      "call_validate_payload",
+      "return_dashboard_url",
+      "trigger_async_s3_finalization",
+      "store_workflow_status",
+      "retry_failed_processing"
+    ],
+    "not_allowed": [
+      "final_approve_issues",
+      "baseline_lock_issues",
+      "set_verified_image_url_for_suggested_images",
+      "erase_candidate_image_urls",
+      "overwrite_homeowner_decisions",
+      "overwrite_admin_decisions",
+      "delete_source_finding_text",
+      "replace_source_item_numbers"
+    ]
+  },
+  "required_top_level_fields": [
+    "homefax_intake_standard_version",
+    "record_id",
+    "tenant_id",
+    "source",
+    "property",
+    "homeowner",
+    "inspection",
+    "original_report",
+    "processing",
+    "standard_findings",
+    "audit"
+  ],
+  "required_real_intake_fields": [
+    "record_id",
+    "tenant_id",
+    "source.source_system",
+    "property.address_full",
+    "homeowner.email",
+    "original_report.file_name",
+    "processing.pipeline_stage",
+    "standard_findings"
+  ],
+  "required_finding_fields": [
+    "source.source_item_number",
+    "source.source_finding_title",
+    "source.source_finding_text",
+    "source.source_page",
+    "homefax.category",
+    "homefax.system",
+    "homefax.component",
+    "evidence.candidate_image_urls",
+    "evidence.image_match_status",
+    "review_state.homeowner_decision",
+    "admin_state.final_approval_status",
+    "admin_state.baseline_locked",
+    "monitoring.alert_status"
+  ],
+  "preserve_fields": [
+    "candidate_image_urls",
+    "source_finding_text",
+    "source_item_number",
+    "source_page",
+    "source_pdf_page_url",
+    "homefax",
+    "review_state",
+    "admin_state",
+    "monitoring"
+  ],
+  "image_rules": {
+    "image_url": "suggested evidence image",
+    "primary_image_url": "suggested primary evidence image",
+    "candidate_image_urls": "array of possible supporting evidence images",
+    "verified_image_url": "blank until admin approval",
+    "image_match_status_default": "suggested",
+    "n8n_must_not": [
+      "convert_candidate_image_urls_to_string",
+      "remove_candidate_images",
+      "set_verified_image_url_for_suggested_images",
+      "change_image_match_status_to_verified",
+      "mark_needs_image_review_false_without_admin_verification"
+    ]
+  },
+  "baseline_rules": {
+    "default_final_approval_status": "not_approved",
+    "default_baseline_locked": false,
+    "n8n_must_not": [
+      "set_final_approval_status_approved",
+      "set_baseline_locked_true",
+      "set_baseline_locked_at",
+      "final_approve_findings"
+    ],
+    "only_final_approval_workflow_can_set": [
+      "admin_state.final_approval_status",
+      "admin_state.baseline_locked",
+      "admin_state.baseline_locked_at"
+    ]
+  },
+  "validation_endpoint": {
+    "method": "POST",
+    "path": "/homefax-intake-standard/validate-payload",
+    "expected_success": {
+      "success": true,
+      "payload_valid": true,
+      "errors_count": 0
+    }
+  },
+  "recommended_flow": [
+    "webhook_intake",
+    "normalize_upload_metadata",
+    "ensure_record_id",
+    "call_fastapi_analyze_report",
+    "call_fastapi_process_inspection",
+    "call_fastapi_intake_standard_preview",
+    "extract_payload",
+    "post_payload_to_validate_payload",
+    "if_valid_return_dashboard_url",
+    "if_invalid_mark_failed_return_errors",
+    "trigger_async_s3_finalization"
+  ],
+  "pass_conditions": [
+    "record_id_present",
+    "tenant_id_present",
+    "property_address_full_present",
+    "homeowner_email_present_for_real_intake",
+    "original_report_file_name_present",
+    "standard_findings_is_array",
+    "each_finding_has_source_title",
+    "each_finding_candidate_image_urls_is_array",
+    "no_suggested_image_has_verified_image_url",
+    "no_non_approved_finding_has_baseline_locked_true",
+    "validation_endpoint_returns_payload_valid_true"
+  ],
+  "fail_conditions": [
+    "standard_findings_missing_or_not_array",
+    "candidate_image_urls_is_string",
+    "verified_image_url_set_when_image_status_not_verified",
+    "baseline_locked_true_when_final_approval_not_approved",
+    "required_source_or_homefax_fields_missing",
+    "validation_endpoint_returns_errors"
+  ]
+}

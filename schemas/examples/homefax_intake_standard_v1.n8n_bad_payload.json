@@ -1,0 +1,159 @@
+{
+  "homefax_intake_standard_version": "1.0",
+  "record_id": "n8n-test-payload-001",
+  "tenant_id": "lateef-home-inspection",
+  "source": {
+    "source_system": "n8n",
+    "source_workflow": "homefax_intake_standard_test_payload",
+    "source_record_id": "n8n-test-payload-001",
+    "source_submission_id": "test-submission-001",
+    "received_at": "2026-06-26T19:29:43Z"
+  },
+  "property": {
+    "property_id": "property-test-001",
+    "address_full": "6039 S Carpenter St, Chicago, IL",
+    "street": "6039 S Carpenter St",
+    "city": "Chicago",
+    "state": "IL",
+    "postal_code": "",
+    "country": "US",
+    "property_type": "single_family",
+    "year_built": null,
+    "square_feet": null
+  },
+  "homeowner": {
+    "homeowner_user_id": "homeowner-test-001",
+    "name": "Test Homeowner",
+    "email": "test-homeowner@example.com",
+    "phone": ""
+  },
+  "inspection": {
+    "inspection_id": "inspection-test-001",
+    "inspection_date": "2026-06-26",
+    "inspection_company": "Big Ben Inspections",
+    "inspector_name": "",
+    "report_family": "internachi",
+    "detected_adapter": "bigben_internachi",
+    "services": {
+      "general_home_inspection": true,
+      "radon": false,
+      "termite": false,
+      "sewer_scope": false,
+      "drone": false
+    }
+  },
+  "original_report": {
+    "file_name": "n8n-test-inspection-report.pdf",
+    "file_url": "https://example.com/n8n-test-inspection-report.pdf",
+    "stored_pdf_url": "",
+    "page_count": 65,
+    "sha256": "",
+    "storage_status": "pending"
+  },
+  "processing": {
+    "pipeline_stage": "review_ready",
+    "parser_status": "complete",
+    "image_processing_status": "complete",
+    "standardization_status": "complete",
+    "issues_count": 1,
+    "candidate_images_count": 2,
+    "errors": []
+  },
+  "standard_findings": [
+    {
+      "finding_id": "2.1.1",
+      "source": {
+        "source_item_number": "2.1.1",
+        "source_report_section": "Roof - Roof Covering",
+        "source_finding_title": "Missing Roof-Covering Material",
+        "source_finding_text": "I observed missing roof-covering material. It could be leaking right now or during the next rain.",
+        "source_recommendation": "Correction and further evaluation by a professional roofer is recommended.",
+        "source_page": 13,
+        "source_pdf_url": "https://example.com/n8n-test-inspection-report.pdf",
+        "source_pdf_page_url": "https://example.com/n8n-test-inspection-report.pdf#page=13"
+      },
+      "homefax": {
+        "standard_schema_version": "1.0",
+        "category": "Roofing",
+        "system": "Roof Covering",
+        "component": "Roof covering or roof component",
+        "defect_type": "Missing",
+        "location_area": "Roof - Roof Covering",
+        "severity": "moderate",
+        "risk_reasons": [
+          "water intrusion",
+          "moisture damage",
+          "roof system deterioration"
+        ],
+        "plain_summary": "The inspection report notes missing roof-covering material that may allow water intrusion.",
+        "recommended_trade": "Qualified roofing contractor",
+        "recommended_action": "Have a qualified roofing contractor review this item and repair as recommended.",
+        "monitoring_plan": "Monitor for leaks, moisture staining, or completed repairs."
+      },
+      "evidence": {
+        "image_url": "/inspection-images-s3/test/page_13_img_1.jpeg",
+        "primary_image_url": "/inspection-images-s3/test/page_13_img_1.jpeg",
+        "verified_image_url": "/bad/verified-before-admin.jpg",
+        "candidate_image_urls": "/bad/string/not/array.jpg",
+        "candidate_image_count": 2,
+        "image_match_status": "suggested",
+        "image_match_confidence": "detail_page_candidate",
+        "needs_image_review": true
+      },
+      "review_state": {
+        "homeowner_decision": "unreviewed",
+        "homeowner_note": "",
+        "homeowner_reviewed_at": null,
+        "current_status": "open",
+        "hidden_from_review_queue": false
+      },
+      "admin_state": {
+        "admin_review_status": "pending",
+        "admin_image_decision": "pending",
+        "admin_note": "",
+        "admin_reviewed_at": null,
+        "final_approval_status": "not_approved",
+        "final_approved_by": "",
+        "final_approved_at": null,
+        "baseline_locked": true,
+        "baseline_locked_at": null
+      },
+      "monitoring": {
+        "monitoring_enabled": false,
+        "monitoring_category": "roofing",
+        "recurrence_group_key": "roofing|roof_covering|missing|6039_s_carpenter_st",
+        "recurrence_count": 0,
+        "alert_status": "none",
+        "next_check_due_at": null,
+        "resolved_at": null,
+        "resolved_by_event_id": ""
+      },
+      "audit": {
+        "created_at": "2026-06-26T19:29:43Z",
+        "updated_at": "2026-06-26T19:29:43Z",
+        "created_by": "n8n_test_payload",
+        "updated_by": "n8n_test_payload",
+        "source_trace": [
+          {
+            "system": "n8n",
+            "event": "test_payload_created",
+            "created_at": "2026-06-26T19:29:43Z"
+          }
+        ]
+      }
+    }
+  ],
+  "audit": {
+    "created_at": "2026-06-26T19:29:43Z",
+    "updated_at": "2026-06-26T19:29:43Z",
+    "created_by": "n8n_test_payload",
+    "updated_by": "n8n_test_payload",
+    "source_trace": [
+      {
+        "system": "n8n",
+        "event": "homefax_intake_standard_test_payload_created",
+        "created_at": "2026-06-26T19:29:43Z"
+      }
+    ]
+  }
+}

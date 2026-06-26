@@ -9184,3 +9184,4734 @@ def head_original_inspection_report(record_id: str):
         filename=f"{_hf_report_safe_record_id(record_id)}.pdf",
     )
 
+
+
+# ============================================================
+# HomeFax Standard Finding Schema Pass 1
+# Adds normalized HomeFax finding fields for monitoring.
+#
+# Purpose:
+# - Preserve original inspector/report evidence.
+# - Normalize diverse inspection reports into a standard HomeFax model.
+# - Give dashboard/monitoring a consistent structure.
+# ============================================================
+
+import json as _hf_std_json
+import re as _hf_std_re
+from datetime import datetime as _hf_std_datetime
+
+
+_HF_STANDARD_SCHEMA_VERSION = "homefax_standard_finding_v1"
+
+
+def _hf_std_safe_text(value) -> str:
+    return _hf_std_re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _hf_std_lower_blob(issue: dict) -> str:
+    issue = issue or {}
+    parts = [
+        issue.get("title"),
+        issue.get("summary"),
+        issue.get("section"),
+        issue.get("severity"),
+        issue.get("risk_level"),
+        issue.get("current_status"),
+        issue.get("status"),
+    ]
+    return _hf_std_safe_text(" ".join(str(p or "") for p in parts)).lower()
+
+
+def _hf_std_extract_report_item(issue: dict) -> str:
+    issue = issue or {}
+
+    for key in [
+        "source_number",
+        "report_item",
+        "item_number",
+        "issue_code",
+        "source_item_number",
+        "standard_source_item_number",
+    ]:
+        value = _hf_std_safe_text(issue.get(key))
+        if value:
+            return value
+
+    blob = _hf_std_safe_text(
+        " ".join(
+            str(issue.get(k) or "")
+            for k in ["summary", "title", "section"]
+        )
+    )
+
+    match = _hf_std_re.search(r"\b(?:report\s+item\s+)?(\d{1,2}\.\d{1,2}(?:\.\d{1,2})?)\b", blob, flags=_hf_std_re.I)
+    return match.group(1) if match else ""
+
+
+def _hf_std_title_case(value: str) -> str:
+    text = _hf_std_safe_text(value)
+    if not text:
+        return ""
+
+    replacements = {
+        "Gfci": "GFCI",
+        "Afci": "AFCI",
+        "Hvac": "HVAC",
+        "Pvc": "PVC",
+        "A/c": "A/C",
+        "Shut-Oì": "Shut-Off",
+        "Shut-oì": "Shut-off",
+        "Soïts": "Soffits",
+    }
+
+    titled = text.title()
+
+    for old, new in replacements.items():
+        titled = titled.replace(old, new)
+
+    return titled
+
+
+def _hf_std_normalize_title(issue: dict) -> str:
+    title = _hf_std_safe_text(issue.get("title"))
+    if not title:
+        title = _hf_std_safe_text(issue.get("summary"))
+
+    # Remove parser/report prefix noise when possible.
+    title = _hf_std_re.sub(r"^Report item\s+\d{1,2}\.\d{1,2}(?:\.\d{1,2})?\s+[—-]\s*", "", title, flags=_hf_std_re.I)
+    title = title.split("—")[0].strip() if "—" in title else title
+
+    return _hf_std_title_case(title)
+
+
+def _hf_std_normalize_section(issue: dict) -> str:
+    section = _hf_std_safe_text(issue.get("section"))
+    section = section.replace("Shut-Oì", "Shut-Off").replace("Soïts", "Soffits")
+    return section
+
+
+def _hf_std_category(issue: dict) -> str:
+    blob = _hf_std_lower_blob(issue)
+
+    if any(x in blob for x in ["gfci", "afci", "electric", "electrical", "wiring", "breaker", "panel", "meter", "disconnect", "receptacle", "outlet"]):
+        return "Electrical"
+
+    if any(x in blob for x in ["plumbing", "water", "leak", "pipe", "drain", "valve", "shut-off", "shut off", "heater", "hot water"]):
+        return "Plumbing"
+
+    if any(x in blob for x in ["roof", "flashing", "gutter", "downspout", "shingle", "penetration"]):
+        return "Roofing"
+
+    if any(x in blob for x in ["exterior", "siding", "wall-covering", "wall covering", "eaves", "soffit", "fascia", "window", "door", "deck", "porch", "patio", "handrail", "railing", "grading", "vegetation"]):
+        return "Exterior"
+
+    if any(x in blob for x in ["heating", "cooling", "hvac", "thermostat", "furnace", "air conditioner"]):
+        return "HVAC"
+
+    if any(x in blob for x in ["kitchen", "bathroom", "interior", "floor", "ceiling", "wall", "range", "appliance"]):
+        return "Interior"
+
+    return "General"
+
+
+def _hf_std_system(issue: dict, category: str) -> str:
+    blob = _hf_std_lower_blob(issue)
+    section = _hf_std_normalize_section(issue)
+
+    if "gfci" in blob:
+        return "GFCI Protection"
+    if "afci" in blob:
+        return "AFCI Protection"
+    if "meter" in blob:
+        return "Electrical Service"
+    if "disconnect" in blob:
+        return "Main Service Disconnect"
+    if "panel" in blob or "breaker" in blob or "knockout" in blob:
+        return "Panelboards & Breakers"
+    if "wiring" in blob:
+        return "Electrical Wiring"
+
+    if "water heater" in blob or "hot water" in blob:
+        return "Water Heater / Hot Water Source"
+    if "shut-off" in blob or "shut off" in blob or "valve" in blob:
+        return "Water Shut-Off Valve"
+    if "water supply" in blob:
+        return "Water Supply"
+    if "drain" in blob or "pipe" in blob:
+        return "Drain / Waste / Vent"
+
+    if "gutter" in blob or "downspout" in blob:
+        return "Gutters & Downspouts"
+    if "flashing" in blob:
+        return "Roof Flashing"
+    if "roof" in blob:
+        return "Roof Covering"
+
+    if "window" in blob:
+        return "Windows"
+    if "door" in blob:
+        return "Doors"
+    if "deck" in blob or "porch" in blob or "patio" in blob:
+        return "Deck / Porch / Patio"
+    if "handrail" in blob or "railing" in blob:
+        return "Railings / Guards / Handrails"
+    if "soffit" in blob or "fascia" in blob or "eaves" in blob:
+        return "Eaves / Soffits / Fascia"
+
+    if "thermostat" in blob:
+        return "Thermostat"
+    if "heating" in blob:
+        return "Heating System"
+    if "cooling" in blob:
+        return "Cooling System"
+
+    return section or category or "General"
+
+
+def _hf_std_component(issue: dict, system: str) -> str:
+    blob = _hf_std_lower_blob(issue)
+
+    if "gfci" in blob:
+        return "GFCI outlet or circuit"
+    if "afci" in blob:
+        return "AFCI circuit protection"
+    if "meter base" in blob:
+        return "Electric meter / meter base"
+    if "meter" in blob:
+        return "Electric meter"
+    if "disconnect" in blob:
+        return "Main service disconnect"
+    if "breaker" in blob:
+        return "Breaker / electrical panel"
+    if "panel" in blob:
+        return "Electrical panel"
+    if "wiring" in blob:
+        return "Electrical wiring"
+
+    if "valve" in blob or "shut-off" in blob or "shut off" in blob:
+        return "Water shut-off valve"
+    if "water heater" in blob:
+        return "Water heater"
+    if "pipe" in blob:
+        return "Pipe / support"
+    if "drain" in blob:
+        return "Drain line"
+
+    if "gutter" in blob:
+        return "Gutter"
+    if "downspout" in blob:
+        return "Downspout"
+    if "flashing" in blob:
+        return "Flashing"
+    if "roof" in blob:
+        return "Roof covering or roof component"
+
+    if "window" in blob:
+        return "Window"
+    if "door" in blob:
+        return "Door"
+    if "deck" in blob:
+        return "Deck component"
+    if "handrail" in blob:
+        return "Handrail"
+    if "railing" in blob:
+        return "Railing"
+
+    return system or "Component to confirm"
+
+
+def _hf_std_defect_type(issue: dict) -> str:
+    blob = _hf_std_lower_blob(issue)
+
+    checks = [
+        ("missing", "Missing"),
+        ("not gfci", "Missing protection"),
+        ("gfci", "Electrical protection defect"),
+        ("afci", "Electrical protection defect"),
+        ("improper", "Improper installation"),
+        ("faulty", "Not functioning properly"),
+        ("wouldn't reset", "Not functioning properly"),
+        ("wont reset", "Not functioning properly"),
+        ("leak", "Leak"),
+        ("corrosion", "Corrosion"),
+        ("rust", "Corrosion"),
+        ("damaged", "Damaged"),
+        ("damage", "Damaged"),
+        ("loose", "Loose"),
+        ("cracked", "Cracked"),
+        ("rot", "Deterioration / rot"),
+        ("older", "Aging / older system noted"),
+        ("inadequate", "Inadequate support or installation"),
+        ("major defect", "Major defect"),
+        ("material defect", "Material defect"),
+        ("defect", "Defect"),
+    ]
+
+    for token, label in checks:
+        if token in blob:
+            return label
+
+    return "Needs review"
+
+
+def _hf_std_severity(issue: dict) -> str:
+    value = _hf_std_safe_text(issue.get("severity") or issue.get("priority") or issue.get("risk_level"))
+
+    if value:
+        lower = value.lower()
+        if lower in ["critical", "urgent"]:
+            return "Critical"
+        if lower in ["high", "major"]:
+            return "High"
+        if lower in ["medium", "moderate"]:
+            return "Medium"
+        if lower in ["low", "minor"]:
+            return "Low"
+
+    blob = _hf_std_lower_blob(issue)
+
+    if any(x in blob for x in ["major defect", "active water leak", "improper wiring", "missing gfci", "gfci", "afci", "panel", "breaker", "meter", "disconnect"]):
+        return "High"
+
+    if any(x in blob for x in ["damaged", "leak", "corrosion", "roof", "flashing", "gutter"]):
+        return "Medium"
+
+    return "Medium"
+
+
+def _hf_std_risk_reasons(issue: dict, category: str, defect_type: str) -> list:
+    blob = _hf_std_lower_blob(issue)
+
+    if category == "Electrical":
+        if "gfci" in blob:
+            return ["shock risk", "wet-area electrical safety", "code/safety review"]
+        if "afci" in blob:
+            return ["electrical fire risk", "arc-fault protection", "code/safety review"]
+        return ["shock risk", "fire risk", "electrical service reliability"]
+
+    if category == "Plumbing":
+        if "leak" in blob:
+            return ["water damage", "mold risk", "hidden deterioration"]
+        return ["water service reliability", "water damage risk", "maintenance concern"]
+
+    if category == "Roofing":
+        return ["water intrusion", "moisture damage", "roof system deterioration"]
+
+    if category == "Exterior":
+        return ["moisture intrusion", "deterioration", "safety or maintenance concern"]
+
+    if category == "HVAC":
+        return ["comfort issue", "system reliability", "efficiency or safety concern"]
+
+    return ["maintenance tracking", "repair planning", "future monitoring"]
+
+
+def _hf_std_trade(category: str, issue: dict) -> str:
+    blob = _hf_std_lower_blob(issue)
+
+    if category == "Electrical":
+        return "Licensed electrician"
+    if category == "Plumbing":
+        return "Licensed plumber"
+    if category == "Roofing":
+        return "Qualified roofing contractor"
+    if category == "HVAC":
+        return "Qualified HVAC technician"
+
+    if "window" in blob or "door" in blob or "deck" in blob or "handrail" in blob:
+        return "Qualified contractor"
+
+    return "Qualified contractor"
+
+
+def _hf_std_plain_summary(issue: dict, category: str, system: str, component: str, defect_type: str) -> str:
+    title = _hf_std_normalize_title(issue)
+    location = _hf_std_normalize_section(issue)
+
+    if category == "Electrical" and "GFCI" in system:
+        return f"The inspection report notes possible missing or defective GFCI protection at {location or component}."
+
+    if category == "Electrical" and "AFCI" in system:
+        return f"The inspection report notes possible missing or defective AFCI protection at {location or component}."
+
+    if category == "Electrical":
+        return f"The inspection report notes an electrical concern involving {component or system}."
+
+    if category == "Plumbing" and "Leak" in defect_type:
+        return f"The inspection report notes an active or suspected water leak at {location or component}."
+
+    if category == "Plumbing":
+        return f"The inspection report notes a plumbing concern involving {component or system}."
+
+    if category == "Roofing":
+        return f"The inspection report notes a roof or drainage concern involving {component or system}."
+
+    if category == "Exterior":
+        return f"The inspection report notes an exterior concern involving {component or system}."
+
+    if category == "HVAC":
+        return f"The inspection report notes an HVAC concern involving {component or system}."
+
+    if title:
+        return f"The inspection report notes: {title}."
+
+    return "The inspection report notes a finding that should be reviewed."
+
+
+def _hf_std_recommended_action(issue: dict, trade: str, category: str) -> str:
+    if category == "Electrical":
+        return "Have a licensed electrician inspect this item and make the recommended corrections."
+    if category == "Plumbing":
+        return "Have a licensed plumber inspect this item and repair or monitor it as recommended."
+    if category == "Roofing":
+        return "Have a qualified roofing contractor review this item and repair or monitor it as recommended."
+    if category == "HVAC":
+        return "Have a qualified HVAC technician inspect this item and make the recommended corrections."
+
+    return f"Have a {trade.lower()} review this item and make the recommended corrections."
+
+
+def _hf_std_monitoring_plan(issue: dict, category: str, severity: str) -> str:
+    if severity in ["Critical", "High"]:
+        return "Track as an active priority item until repaired, professionally cleared, or admin-verified."
+    if category in ["Roofing", "Plumbing", "Exterior"]:
+        return "Monitor for worsening conditions, moisture issues, or completed repairs."
+    return "Track until homeowner/admin decision confirms repair, monitoring, dismissal, or baseline lock."
+
+
+def _hf_std_build_standard_json(issue: dict) -> dict:
+    report_item = _hf_std_extract_report_item(issue)
+    inspector_title = _hf_std_normalize_title(issue)
+    source_section = _hf_std_normalize_section(issue)
+
+    category = _hf_std_category(issue)
+    system = _hf_std_system(issue, category)
+    component = _hf_std_component(issue, system)
+    defect_type = _hf_std_defect_type(issue)
+    severity = _hf_std_severity(issue)
+    risk_reasons = _hf_std_risk_reasons(issue, category, defect_type)
+    trade = _hf_std_trade(category, issue)
+    plain_summary = _hf_std_plain_summary(issue, category, system, component, defect_type)
+    recommended_action = _hf_std_recommended_action(issue, trade, category)
+    monitoring_plan = _hf_std_monitoring_plan(issue, category, severity)
+
+    source = {
+        "report_item": report_item,
+        "report_page": issue.get("source_page") or issue.get("page") or None,
+        "report_section": source_section,
+        "inspector_title": inspector_title,
+        "inspector_finding_text": _hf_std_safe_text(issue.get("inspector_finding_text") or issue.get("source_finding_text") or ""),
+        "inspector_recommendation": _hf_std_safe_text(issue.get("inspector_recommendation") or issue.get("source_recommendation") or ""),
+        "report_pdf_url": issue.get("report_pdf_url") or "",
+        "report_page_url": issue.get("report_page_url") or "",
+    }
+
+    homefax = {
+        "category": category,
+        "system": system,
+        "component": component,
+        "location_area": source_section,
+        "defect_type": defect_type,
+        "severity": severity,
+        "risk_level": severity,
+        "risk_reasons": risk_reasons,
+        "plain_summary": plain_summary,
+        "recommended_trade": trade,
+        "recommended_action": recommended_action,
+        "monitoring_plan": monitoring_plan,
+    }
+
+    evidence = {
+        "primary_image_url": issue.get("image_url") or "",
+        "candidate_image_urls": issue.get("candidate_image_urls") or [],
+        "homeowner_selected_image_url": issue.get("homeowner_selected_image_url") or "",
+        "verified_image_url": issue.get("verified_image_url") or "",
+        "image_status": issue.get("image_match_status") or "needs_review",
+    }
+
+    workflow = {
+        "homeowner_decision": issue.get("homeowner_decision") or "unreviewed",
+        "homeowner_image_decision": issue.get("homeowner_image_decision") or "unreviewed",
+        "admin_review_status": issue.get("admin_review_status") or "pending",
+        "baseline_locked": bool(issue.get("baseline_locked")),
+        "current_status": issue.get("current_status") or issue.get("status") or "active",
+    }
+
+    return {
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "source": source,
+        "homefax": homefax,
+        "evidence": evidence,
+        "workflow": workflow,
+        "generated_at": _hf_std_datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def _hf_std_column_exists(cursor, table_name: str, column_name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+          AND column_name = %s
+        """,
+        (table_name, column_name),
+    )
+    row = cursor.fetchone()
+    if isinstance(row, dict):
+        return int(list(row.values())[0] or 0) > 0
+    return int(row[0] or 0) > 0
+
+
+def _hf_std_add_column(cursor, table_name: str, column_name: str, column_sql: str) -> bool:
+    if _hf_std_column_exists(cursor, table_name, column_name):
+        return False
+
+    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+    return True
+
+
+def _hf_std_ensure_schema() -> dict:
+    conn = _hf_report_db_connection() if "_hf_report_db_connection" in globals() else None
+    if conn is None:
+        # Fall back to common DB helper names.
+        for name in ("get_db_connection", "get_connection", "db_connection"):
+            fn = globals().get(name)
+            if callable(fn):
+                conn = fn()
+                break
+
+    if conn is None:
+        raise RuntimeError("No database connection helper found.")
+
+    added = []
+
+    try:
+        with conn.cursor() as cursor:
+            columns = [
+                ("homefax_standard_schema_version", "VARCHAR(80) NULL"),
+                ("homefax_standard_json", "JSON NULL"),
+
+                ("source_item_number", "VARCHAR(80) NULL"),
+                ("source_report_section", "TEXT NULL"),
+                ("source_finding_title", "TEXT NULL"),
+                ("source_finding_text", "TEXT NULL"),
+                ("source_recommendation", "TEXT NULL"),
+
+                ("standard_category", "VARCHAR(120) NULL"),
+                ("standard_system", "VARCHAR(180) NULL"),
+                ("standard_component", "VARCHAR(180) NULL"),
+                ("standard_defect_type", "VARCHAR(180) NULL"),
+                ("standard_location_area", "TEXT NULL"),
+                ("standard_severity", "VARCHAR(80) NULL"),
+                ("standard_risk_reasons", "JSON NULL"),
+                ("standard_plain_summary", "TEXT NULL"),
+                ("standard_recommended_trade", "VARCHAR(180) NULL"),
+                ("standard_recommended_action", "TEXT NULL"),
+                ("standard_monitoring_plan", "TEXT NULL"),
+            ]
+
+            for column_name, column_sql in columns:
+                try:
+                    if _hf_std_add_column(cursor, "verified_issues", column_name, column_sql):
+                        added.append(column_name)
+                except Exception as error:
+                    print("[HomeFax Standard Schema] column warning:", column_name, error)
+
+        conn.commit()
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "added_columns": added,
+    }
+
+
+def _hf_std_fetch_issues(record_id: str) -> list:
+    conn = _hf_report_db_connection() if "_hf_report_db_connection" in globals() else None
+    if conn is None:
+        for name in ("get_db_connection", "get_connection", "db_connection"):
+            fn = globals().get(name)
+            if callable(fn):
+                conn = fn()
+                break
+
+    if conn is None:
+        raise RuntimeError("No database connection helper found.")
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM verified_issues WHERE record_id = %s ORDER BY id ASC", (record_id,))
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                cols = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(cols, row)) for row in rows]
+
+            return rows
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_std_backfill_record(record_id: str) -> dict:
+    _hf_std_ensure_schema()
+
+    issues = _hf_std_fetch_issues(record_id)
+    updated = 0
+    samples = []
+
+    conn = _hf_report_db_connection() if "_hf_report_db_connection" in globals() else None
+    if conn is None:
+        for name in ("get_db_connection", "get_connection", "db_connection"):
+            fn = globals().get(name)
+            if callable(fn):
+                conn = fn()
+                break
+
+    if conn is None:
+        raise RuntimeError("No database connection helper found.")
+
+    try:
+        with conn.cursor() as cursor:
+            for issue in issues:
+                standard = _hf_std_build_standard_json(issue)
+                source = standard["source"]
+                homefax = standard["homefax"]
+
+                cursor.execute(
+                    """
+                    UPDATE verified_issues
+                    SET
+                        homefax_standard_schema_version = %s,
+                        homefax_standard_json = %s,
+
+                        source_item_number = %s,
+                        source_report_section = %s,
+                        source_finding_title = %s,
+                        source_finding_text = %s,
+                        source_recommendation = %s,
+
+                        standard_category = %s,
+                        standard_system = %s,
+                        standard_component = %s,
+                        standard_defect_type = %s,
+                        standard_location_area = %s,
+                        standard_severity = %s,
+                        standard_risk_reasons = %s,
+                        standard_plain_summary = %s,
+                        standard_recommended_trade = %s,
+                        standard_recommended_action = %s,
+                        standard_monitoring_plan = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        _HF_STANDARD_SCHEMA_VERSION,
+                        _hf_std_json.dumps(standard, default=str),
+
+                        source.get("report_item"),
+                        source.get("report_section"),
+                        source.get("inspector_title"),
+                        source.get("inspector_finding_text"),
+                        source.get("inspector_recommendation"),
+
+                        homefax.get("category"),
+                        homefax.get("system"),
+                        homefax.get("component"),
+                        homefax.get("defect_type"),
+                        homefax.get("location_area"),
+                        homefax.get("severity"),
+                        _hf_std_json.dumps(homefax.get("risk_reasons") or []),
+                        homefax.get("plain_summary"),
+                        homefax.get("recommended_trade"),
+                        homefax.get("recommended_action"),
+                        homefax.get("monitoring_plan"),
+
+                        issue.get("id"),
+                    ),
+                )
+
+                updated += 1
+
+                if len(samples) < 5:
+                    samples.append(
+                        {
+                            "id": issue.get("id"),
+                            "source_item_number": source.get("report_item"),
+                            "source_finding_title": source.get("inspector_title"),
+                            "standard_category": homefax.get("category"),
+                            "standard_system": homefax.get("system"),
+                            "standard_component": homefax.get("component"),
+                            "standard_defect_type": homefax.get("defect_type"),
+                            "standard_plain_summary": homefax.get("plain_summary"),
+                            "standard_recommended_trade": homefax.get("recommended_trade"),
+                            "standard_monitoring_plan": homefax.get("monitoring_plan"),
+                        }
+                    )
+
+        conn.commit()
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "issues_found": len(issues),
+        "issues_updated": updated,
+        "samples": samples,
+    }
+
+
+@app.get("/homefax-standard-schema-health")
+def homefax_standard_schema_health():
+    schema = _hf_std_ensure_schema()
+
+    return {
+        "success": True,
+        "schema": schema,
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "endpoints": [
+            "GET /homefax-standard-schema-health",
+            "POST /records/{record_id}/homefax-standard-schema/backfill",
+            "GET /records/{record_id}/homefax-standard-report-preview",
+        ],
+    }
+
+
+@app.post("/records/{record_id}/homefax-standard-schema/backfill")
+def homefax_standard_schema_backfill(record_id: str):
+    return _hf_std_backfill_record(record_id)
+
+
+@app.get("/records/{record_id}/homefax-standard-report-preview")
+def homefax_standard_report_preview(record_id: str, limit: int = 10):
+    _hf_std_ensure_schema()
+    issues = _hf_std_fetch_issues(record_id)
+
+    preview = []
+
+    for issue in issues[: max(1, min(int(limit or 10), 50))]:
+        standard = _hf_std_build_standard_json(issue)
+
+        preview.append(
+            {
+                "id": issue.get("id"),
+                "title": issue.get("title"),
+                "source_item_number": standard["source"].get("report_item"),
+                "source_finding_title": standard["source"].get("inspector_title"),
+                "source_finding_text": standard["source"].get("inspector_finding_text"),
+                "source_recommendation": standard["source"].get("inspector_recommendation"),
+                "category": standard["homefax"].get("category"),
+                "system": standard["homefax"].get("system"),
+                "component": standard["homefax"].get("component"),
+                "defect_type": standard["homefax"].get("defect_type"),
+                "plain_summary": standard["homefax"].get("plain_summary"),
+                "recommended_trade": standard["homefax"].get("recommended_trade"),
+                "recommended_action": standard["homefax"].get("recommended_action"),
+                "monitoring_plan": standard["homefax"].get("monitoring_plan"),
+                "primary_image_url": standard["evidence"].get("primary_image_url"),
+                "candidate_image_count": len(standard["evidence"].get("candidate_image_urls") or []),
+            }
+        )
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "issues_previewed": len(preview),
+        "issues_total": len(issues),
+        "issues": preview,
+    }
+
+
+
+# ============================================================
+# HomeFax Standard Schema Hardening Patch 1
+# Fixes:
+# - candidate_image_urls string/list normalization
+# - downspout drainage classification
+# - better exterior drainage summaries
+# - standard finding payload helpers
+# ============================================================
+
+import json as _hf_harden_json
+import re as _hf_harden_re
+
+
+def _hf_harden_safe_text(value) -> str:
+    return _hf_harden_re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _hf_harden_parse_candidate_urls(value):
+    """
+    Normalize candidate_image_urls into a real list.
+
+    Handles:
+    - Python list
+    - JSON string list
+    - comma-separated string
+    - single URL string
+    - None
+    """
+    if not value:
+        return []
+
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v or "").strip()]
+
+    if isinstance(value, tuple):
+        return [str(v).strip() for v in value if str(v or "").strip()]
+
+    if isinstance(value, str):
+        raw = value.strip()
+
+        if not raw:
+            return []
+
+        # JSON list string
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                parsed = _hf_harden_json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(v).strip() for v in parsed if str(v or "").strip()]
+            except Exception:
+                pass
+
+        # Sometimes Python repr list sneaks in with single quotes.
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                normalized = raw.replace("'", '"')
+                parsed = _hf_harden_json.loads(normalized)
+                if isinstance(parsed, list):
+                    return [str(v).strip() for v in parsed if str(v or "").strip()]
+            except Exception:
+                pass
+
+        if "," in raw:
+            return [part.strip() for part in raw.split(",") if part.strip()]
+
+        return [raw]
+
+    return []
+
+
+def _hf_harden_unique_urls(urls):
+    seen = set()
+    clean = []
+
+    for url in urls or []:
+        item = str(url or "").strip()
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        clean.append(item)
+
+    return clean
+
+
+def _hf_harden_candidate_urls_from_issue(issue: dict) -> list:
+    issue = issue or {}
+    return _hf_harden_unique_urls(_hf_harden_parse_candidate_urls(issue.get("candidate_image_urls")))
+
+
+def _hf_harden_candidate_count(issue: dict) -> int:
+    return len(_hf_harden_candidate_urls_from_issue(issue))
+
+
+def _hf_harden_blob(issue: dict) -> str:
+    issue = issue or {}
+    parts = [
+        issue.get("title"),
+        issue.get("summary"),
+        issue.get("section"),
+        issue.get("source_report_section"),
+        issue.get("source_finding_title"),
+        issue.get("standard_category"),
+        issue.get("standard_system"),
+        issue.get("standard_component"),
+        issue.get("standard_defect_type"),
+    ]
+    return _hf_harden_safe_text(" ".join(str(p or "") for p in parts)).lower()
+
+
+def _hf_harden_is_downspout_drainage(issue: dict) -> bool:
+    blob = _hf_harden_blob(issue)
+
+    return (
+        "downspout" in blob
+        or "gutter" in blob
+        or "gutters" in blob
+    ) and (
+        "drain near" in blob
+        or "drainage" in blob
+        or "near house" in blob
+        or "near foundation" in blob
+        or "discharge" in blob
+        or "extension" in blob
+        or "splash block" in blob
+    )
+
+
+# Override prior standard category logic with hardened exterior drainage handling.
+def _hf_std_category(issue: dict) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_harden_blob(issue)
+
+    if _hf_harden_is_downspout_drainage(issue):
+        return "Roofing"
+
+    if any(x in blob for x in ["gfci", "afci", "electric", "electrical", "wiring", "breaker", "panel", "meter", "disconnect", "receptacle", "outlet"]):
+        return "Electrical"
+
+    # Downspout/gutter must be evaluated before general plumbing drain terms.
+    if any(x in blob for x in ["roof", "flashing", "gutter", "gutters", "downspout", "shingle", "penetration"]):
+        return "Roofing"
+
+    if any(x in blob for x in ["plumbing", "water", "leak", "pipe", "drain", "valve", "shut-off", "shut off", "heater", "hot water"]):
+        return "Plumbing"
+
+    if any(x in blob for x in ["exterior", "siding", "wall-covering", "wall covering", "eaves", "soffit", "fascia", "window", "door", "deck", "porch", "patio", "handrail", "railing", "grading", "vegetation"]):
+        return "Exterior"
+
+    if any(x in blob for x in ["heating", "cooling", "hvac", "thermostat", "furnace", "air conditioner"]):
+        return "HVAC"
+
+    if any(x in blob for x in ["kitchen", "bathroom", "interior", "floor", "ceiling", "wall", "range", "appliance"]):
+        return "Interior"
+
+    return "General"
+
+
+# Override prior standard system logic with hardened gutter/downspout handling.
+def _hf_std_system(issue: dict, category: str) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_harden_blob(issue)
+    section = _hf_std_normalize_section(issue) if "_hf_std_normalize_section" in globals() else _hf_harden_safe_text(issue.get("section"))
+
+    if _hf_harden_is_downspout_drainage(issue):
+        return "Gutters & Downspouts"
+
+    if "gfci" in blob:
+        return "GFCI Protection"
+    if "afci" in blob:
+        return "AFCI Protection"
+    if "meter" in blob:
+        return "Electrical Service"
+    if "disconnect" in blob:
+        return "Main Service Disconnect"
+    if "panel" in blob or "breaker" in blob or "knockout" in blob:
+        return "Panelboards & Breakers"
+    if "wiring" in blob:
+        return "Electrical Wiring"
+
+    if "water heater" in blob or "hot water" in blob:
+        return "Water Heater / Hot Water Source"
+    if "shut-off" in blob or "shut off" in blob or "valve" in blob:
+        return "Water Shut-Off Valve"
+    if "water supply" in blob:
+        return "Water Supply"
+    if "drain" in blob or "pipe" in blob:
+        return "Drain / Waste / Vent"
+
+    if "gutter" in blob or "gutters" in blob or "downspout" in blob:
+        return "Gutters & Downspouts"
+    if "flashing" in blob:
+        return "Roof Flashing"
+    if "roof" in blob:
+        return "Roof Covering"
+
+    if "window" in blob:
+        return "Windows"
+    if "door" in blob:
+        return "Doors"
+    if "deck" in blob or "porch" in blob or "patio" in blob:
+        return "Deck / Porch / Patio"
+    if "handrail" in blob or "railing" in blob:
+        return "Railings / Guards / Handrails"
+    if "soffit" in blob or "fascia" in blob or "eaves" in blob:
+        return "Eaves / Soffits / Fascia"
+
+    if "thermostat" in blob:
+        return "Thermostat"
+    if "heating" in blob:
+        return "Heating System"
+    if "cooling" in blob:
+        return "Cooling System"
+
+    return section or category or "General"
+
+
+# Override prior component logic with downspout handling.
+def _hf_std_component(issue: dict, system: str) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_harden_blob(issue)
+
+    if _hf_harden_is_downspout_drainage(issue):
+        return "Downspout discharge / drainage termination"
+
+    if "downspout" in blob:
+        return "Downspout"
+    if "gutter" in blob or "gutters" in blob:
+        return "Gutter"
+
+    if "gfci" in blob:
+        return "GFCI outlet or circuit"
+    if "afci" in blob:
+        return "AFCI circuit protection"
+    if "meter base" in blob:
+        return "Electric meter / meter base"
+    if "meter" in blob:
+        return "Electric meter"
+    if "disconnect" in blob:
+        return "Main service disconnect"
+    if "breaker" in blob:
+        return "Breaker / electrical panel"
+    if "panel" in blob:
+        return "Electrical panel"
+    if "wiring" in blob:
+        return "Electrical wiring"
+
+    if "valve" in blob or "shut-off" in blob or "shut off" in blob:
+        return "Water shut-off valve"
+    if "water heater" in blob:
+        return "Water heater"
+    if "pipe" in blob:
+        return "Pipe / support"
+    if "drain" in blob:
+        return "Drain line"
+
+    if "flashing" in blob:
+        return "Flashing"
+    if "roof" in blob:
+        return "Roof covering or roof component"
+
+    if "window" in blob:
+        return "Window"
+    if "door" in blob:
+        return "Door"
+    if "deck" in blob:
+        return "Deck component"
+    if "handrail" in blob:
+        return "Handrail"
+    if "railing" in blob:
+        return "Railing"
+
+    return system or "Component to confirm"
+
+
+# Override defect type for drainage terms.
+def _hf_std_defect_type(issue: dict) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_harden_blob(issue)
+
+    if _hf_harden_is_downspout_drainage(issue):
+        return "Drainage too close to house"
+# Override plain summary to make gutter/downspout findings clearer.
+def _hf_std_plain_summary(issue: dict, category: str, system: str, component: str, defect_type: str) -> str:
+    title = _hf_std_normalize_title(issue) if "_hf_std_normalize_title" in globals() else _hf_harden_safe_text(issue.get("title"))
+    location = _hf_std_normalize_section(issue) if "_hf_std_normalize_section" in globals() else _hf_harden_safe_text(issue.get("section"))
+
+    if _hf_harden_is_downspout_drainage(issue):
+        return "The inspection report notes that downspouts may be discharging too close to the house. This can move roof water toward the foundation instead of away from it."
+
+    if category == "Roofing" and ("Gutter" in system or "Downspout" in system):
+        return f"The inspection report notes a gutter or downspout concern involving {component or system}."
+
+    if category == "Electrical" and "GFCI" in system:
+        return f"The inspection report notes possible missing or defective GFCI protection at {location or component}."
+
+    if category == "Electrical" and "AFCI" in system:
+        return f"The inspection report notes possible missing or defective AFCI protection at {location or component}."
+
+    if category == "Electrical":
+        return f"The inspection report notes an electrical concern involving {component or system}."
+
+    if category == "Plumbing" and "Leak" in defect_type:
+        return f"The inspection report notes an active or suspected water leak at {location or component}."
+
+    if category == "Plumbing":
+        return f"The inspection report notes a plumbing concern involving {component or system}."
+
+    if category == "Roofing":
+        return f"The inspection report notes a roof or drainage concern involving {component or system}."
+
+    if category == "Exterior":
+        return f"The inspection report notes an exterior concern involving {component or system}."
+
+    if category == "HVAC":
+        return f"The inspection report notes an HVAC concern involving {component or system}."
+
+    if title:
+        return f"The inspection report notes: {title}."
+
+    return "The inspection report notes a finding that should be reviewed."
+
+
+# Override risk reasons to handle downspout drainage.
+def _hf_std_risk_reasons(issue: dict, category: str, defect_type: str) -> list:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_harden_blob(issue)
+
+    if _hf_harden_is_downspout_drainage(issue):
+        return ["foundation moisture risk", "basement or crawlspace water risk", "poor roof drainage"]
+
+    if category == "Electrical":
+        if "gfci" in blob:
+            return ["shock risk", "wet-area electrical safety", "code/safety review"]
+        if "afci" in blob:
+            return ["electrical fire risk", "arc-fault protection", "code/safety review"]
+        return ["shock risk", "fire risk", "electrical service reliability"]
+
+    if category == "Plumbing":
+        if "leak" in blob:
+            return ["water damage", "mold risk", "hidden deterioration"]
+        return ["water service reliability", "water damage risk", "maintenance concern"]
+
+    if category == "Roofing":
+        return ["water intrusion", "moisture damage", "roof system deterioration"]
+
+    if category == "Exterior":
+        return ["moisture intrusion", "deterioration", "safety or maintenance concern"]
+
+    if category == "HVAC":
+        return ["comfort issue", "system reliability", "efficiency or safety concern"]
+
+    return ["maintenance tracking", "repair planning", "future monitoring"]
+
+
+# Override standard JSON builder only for evidence normalization.
+def _hf_std_build_standard_json(issue: dict) -> dict:
+    report_item = _hf_std_extract_report_item(issue)
+    inspector_title = _hf_std_normalize_title(issue)
+    source_section = _hf_std_normalize_section(issue)
+
+    category = _hf_std_category(issue)
+    system = _hf_std_system(issue, category)
+    component = _hf_std_component(issue, system)
+    defect_type = _hf_std_defect_type(issue)
+    severity = _hf_std_severity(issue)
+    risk_reasons = _hf_std_risk_reasons(issue, category, defect_type)
+    trade = _hf_std_trade(category, issue)
+    plain_summary = _hf_std_plain_summary(issue, category, system, component, defect_type)
+    recommended_action = _hf_std_recommended_action(issue, trade, category)
+    monitoring_plan = _hf_std_monitoring_plan(issue, category, severity)
+
+    candidate_urls = _hf_harden_candidate_urls_from_issue(issue)
+
+    source = {
+        "report_item": report_item,
+        "report_page": issue.get("source_page") or issue.get("page") or None,
+        "report_section": source_section,
+        "inspector_title": inspector_title,
+        "inspector_finding_text": _hf_std_safe_text(issue.get("inspector_finding_text") or issue.get("source_finding_text") or ""),
+        "inspector_recommendation": _hf_std_safe_text(issue.get("inspector_recommendation") or issue.get("source_recommendation") or ""),
+        "report_pdf_url": issue.get("report_pdf_url") or "",
+        "report_page_url": issue.get("report_page_url") or "",
+    }
+
+    homefax = {
+        "category": category,
+        "system": system,
+        "component": component,
+        "location_area": source_section,
+        "defect_type": defect_type,
+        "severity": severity,
+        "risk_level": severity,
+        "risk_reasons": risk_reasons,
+        "plain_summary": plain_summary,
+        "recommended_trade": trade,
+        "recommended_action": recommended_action,
+        "monitoring_plan": monitoring_plan,
+    }
+
+    evidence = {
+        "primary_image_url": issue.get("image_url") or "",
+        "candidate_image_urls": candidate_urls,
+        "candidate_image_count": len(candidate_urls),
+        "homeowner_selected_image_url": issue.get("homeowner_selected_image_url") or "",
+        "verified_image_url": issue.get("verified_image_url") or "",
+        "image_status": issue.get("image_match_status") or "needs_review",
+    }
+
+    workflow = {
+        "homeowner_decision": issue.get("homeowner_decision") or "unreviewed",
+        "homeowner_image_decision": issue.get("homeowner_image_decision") or "unreviewed",
+        "admin_review_status": issue.get("admin_review_status") or "pending",
+        "baseline_locked": bool(issue.get("baseline_locked")),
+        "current_status": issue.get("current_status") or issue.get("status") or "active",
+    }
+
+    return {
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "source": source,
+        "homefax": homefax,
+        "evidence": evidence,
+        "workflow": workflow,
+        "generated_at": _hf_std_datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.get("/records/{record_id}/homefax-standard-report-preview-v2")
+def homefax_standard_report_preview_v2(record_id: str, limit: int = 10):
+    _hf_std_ensure_schema()
+    issues = _hf_std_fetch_issues(record_id)
+
+    preview = []
+
+    for issue in issues[: max(1, min(int(limit or 10), 50))]:
+        standard = _hf_std_build_standard_json(issue)
+
+        preview.append(
+            {
+                "id": issue.get("id"),
+                "title": issue.get("title"),
+                "source_item_number": standard["source"].get("report_item"),
+                "source_finding_title": standard["source"].get("inspector_title"),
+                "source_finding_text": standard["source"].get("inspector_finding_text"),
+                "source_recommendation": standard["source"].get("inspector_recommendation"),
+                "category": standard["homefax"].get("category"),
+                "system": standard["homefax"].get("system"),
+                "component": standard["homefax"].get("component"),
+                "defect_type": standard["homefax"].get("defect_type"),
+                "plain_summary": standard["homefax"].get("plain_summary"),
+                "recommended_trade": standard["homefax"].get("recommended_trade"),
+                "recommended_action": standard["homefax"].get("recommended_action"),
+                "monitoring_plan": standard["homefax"].get("monitoring_plan"),
+                "risk_reasons": standard["homefax"].get("risk_reasons"),
+                "primary_image_url": standard["evidence"].get("primary_image_url"),
+                "candidate_image_count": standard["evidence"].get("candidate_image_count", 0),
+                "candidate_image_urls": standard["evidence"].get("candidate_image_urls", [])[:10],
+            }
+        )
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "issues_previewed": len(preview),
+        "issues_total": len(issues),
+        "issues": preview,
+    }
+
+
+@app.post("/records/{record_id}/homefax-standard-schema/backfill-v2")
+def homefax_standard_schema_backfill_v2(record_id: str):
+    return _hf_std_backfill_record(record_id)
+
+
+
+# ============================================================
+# HomeFax Standard Schema Hardening Patch 1B
+# Fixes None defect_type crash in preview-v2/backfill-v2.
+# Also makes defect_type fallback safer for standard report output.
+# ============================================================
+
+def _hf_std_defect_type(issue: dict) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_harden_blob(issue)
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return "Drainage too close to house"
+
+    checks = [
+        ("missing", "Missing"),
+        ("not gfci", "Missing protection"),
+        ("gfci", "Electrical protection defect"),
+        ("afci", "Electrical protection defect"),
+        ("improper", "Improper installation"),
+        ("installation defect", "Installation defect"),
+        ("fastening defect", "Fastening defect"),
+        ("faulty", "Not functioning properly"),
+        ("wouldn't reset", "Not functioning properly"),
+        ("wont reset", "Not functioning properly"),
+        ("leak", "Leak"),
+        ("corrosion", "Corrosion"),
+        ("rust", "Corrosion"),
+        ("damaged", "Damaged"),
+        ("damage", "Damaged"),
+        ("loose", "Loose"),
+        ("cracked", "Cracked"),
+        ("rot", "Deterioration / rot"),
+        ("older", "Aging / older system noted"),
+        ("inadequate", "Inadequate support or installation"),
+        ("major defect", "Major defect"),
+        ("material defect", "Material defect"),
+        ("defect", "Defect"),
+    ]
+
+    for token, label in checks:
+        if token in blob:
+            return label
+
+    return "Needs review"
+
+
+def _hf_std_plain_summary(issue: dict, category: str, system: str, component: str, defect_type: str) -> str:
+    title = _hf_std_normalize_title(issue) if "_hf_std_normalize_title" in globals() else _hf_harden_safe_text(issue.get("title"))
+    location = _hf_std_normalize_section(issue) if "_hf_std_normalize_section" in globals() else _hf_harden_safe_text(issue.get("section"))
+
+    category = _hf_harden_safe_text(category) or "General"
+    system = _hf_harden_safe_text(system) or category
+    component = _hf_harden_safe_text(component) or system
+    defect_type = _hf_harden_safe_text(defect_type) or "Needs review"
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return "The inspection report notes that downspouts may be discharging too close to the house. This can move roof water toward the foundation instead of away from it."
+
+    if category == "Roofing" and ("Gutter" in system or "Downspout" in system):
+        return f"The inspection report notes a gutter or downspout concern involving {component or system}."
+
+    if category == "Electrical" and "GFCI" in system:
+        return f"The inspection report notes possible missing or defective GFCI protection at {location or component}."
+
+    if category == "Electrical" and "AFCI" in system:
+        return f"The inspection report notes possible missing or defective AFCI protection at {location or component}."
+
+    if category == "Electrical":
+        return f"The inspection report notes an electrical concern involving {component or system}."
+
+    if category == "Plumbing" and "Leak" in defect_type:
+        return f"The inspection report notes an active or suspected water leak at {location or component}."
+
+    if category == "Plumbing":
+        return f"The inspection report notes a plumbing concern involving {component or system}."
+
+    if category == "Roofing":
+        return f"The inspection report notes a roof or drainage concern involving {component or system}."
+
+    if category == "Exterior":
+        return f"The inspection report notes an exterior concern involving {component or system}."
+
+    if category == "HVAC":
+        return f"The inspection report notes an HVAC concern involving {component or system}."
+
+    if title:
+        return f"The inspection report notes: {title}."
+
+    return "The inspection report notes a finding that should be reviewed."
+
+
+def _hf_std_build_standard_json(issue: dict) -> dict:
+    report_item = _hf_std_extract_report_item(issue)
+    inspector_title = _hf_std_normalize_title(issue)
+    source_section = _hf_std_normalize_section(issue)
+
+    category = _hf_std_category(issue) or "General"
+    system = _hf_std_system(issue, category) or category
+    component = _hf_std_component(issue, system) or system
+    defect_type = _hf_std_defect_type(issue) or "Needs review"
+    severity = _hf_std_severity(issue) or "Medium"
+    risk_reasons = _hf_std_risk_reasons(issue, category, defect_type) or []
+    trade = _hf_std_trade(category, issue) or "Qualified contractor"
+    plain_summary = _hf_std_plain_summary(issue, category, system, component, defect_type)
+    recommended_action = _hf_std_recommended_action(issue, trade, category)
+    monitoring_plan = _hf_std_monitoring_plan(issue, category, severity)
+
+    candidate_urls = _hf_harden_candidate_urls_from_issue(issue) if "_hf_harden_candidate_urls_from_issue" in globals() else []
+
+    source = {
+        "report_item": report_item,
+        "report_page": issue.get("source_page") or issue.get("page") or None,
+        "report_section": source_section,
+        "inspector_title": inspector_title,
+        "inspector_finding_text": _hf_std_safe_text(issue.get("inspector_finding_text") or issue.get("source_finding_text") or ""),
+        "inspector_recommendation": _hf_std_safe_text(issue.get("inspector_recommendation") or issue.get("source_recommendation") or ""),
+        "report_pdf_url": issue.get("report_pdf_url") or "",
+        "report_page_url": issue.get("report_page_url") or "",
+    }
+
+    homefax = {
+        "category": category,
+        "system": system,
+        "component": component,
+        "location_area": source_section,
+        "defect_type": defect_type,
+        "severity": severity,
+        "risk_level": severity,
+        "risk_reasons": risk_reasons,
+        "plain_summary": plain_summary,
+        "recommended_trade": trade,
+        "recommended_action": recommended_action,
+        "monitoring_plan": monitoring_plan,
+    }
+
+    evidence = {
+        "primary_image_url": issue.get("image_url") or "",
+        "candidate_image_urls": candidate_urls,
+        "candidate_image_count": len(candidate_urls),
+        "homeowner_selected_image_url": issue.get("homeowner_selected_image_url") or "",
+        "verified_image_url": issue.get("verified_image_url") or "",
+        "image_status": issue.get("image_match_status") or "needs_review",
+    }
+
+    workflow = {
+        "homeowner_decision": issue.get("homeowner_decision") or "unreviewed",
+        "homeowner_image_decision": issue.get("homeowner_image_decision") or "unreviewed",
+        "admin_review_status": issue.get("admin_review_status") or "pending",
+        "baseline_locked": bool(issue.get("baseline_locked")),
+        "current_status": issue.get("current_status") or issue.get("status") or "active",
+    }
+
+    return {
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "source": source,
+        "homefax": homefax,
+        "evidence": evidence,
+        "workflow": workflow,
+        "generated_at": _hf_std_datetime.utcnow().isoformat() + "Z",
+    }
+
+
+
+# ============================================================
+# HomeFax Standard Schema Hardening Patch 1B
+# Fixes None defect_type crash in preview-v2/backfill-v2.
+# Also makes defect_type fallback safer for standard report output.
+# ============================================================
+
+def _hf_std_defect_type(issue: dict) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_harden_blob(issue)
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return "Drainage too close to house"
+
+    checks = [
+        ("missing", "Missing"),
+        ("not gfci", "Missing protection"),
+        ("gfci", "Electrical protection defect"),
+        ("afci", "Electrical protection defect"),
+        ("improper", "Improper installation"),
+        ("installation defect", "Installation defect"),
+        ("fastening defect", "Fastening defect"),
+        ("faulty", "Not functioning properly"),
+        ("wouldn't reset", "Not functioning properly"),
+        ("wont reset", "Not functioning properly"),
+        ("leak", "Leak"),
+        ("corrosion", "Corrosion"),
+        ("rust", "Corrosion"),
+        ("damaged", "Damaged"),
+        ("damage", "Damaged"),
+        ("loose", "Loose"),
+        ("cracked", "Cracked"),
+        ("rot", "Deterioration / rot"),
+        ("older", "Aging / older system noted"),
+        ("inadequate", "Inadequate support or installation"),
+        ("major defect", "Major defect"),
+        ("material defect", "Material defect"),
+        ("defect", "Defect"),
+    ]
+
+    for token, label in checks:
+        if token in blob:
+            return label
+
+    return "Needs review"
+
+
+def _hf_std_plain_summary(issue: dict, category: str, system: str, component: str, defect_type: str) -> str:
+    title = _hf_std_normalize_title(issue) if "_hf_std_normalize_title" in globals() else _hf_harden_safe_text(issue.get("title"))
+    location = _hf_std_normalize_section(issue) if "_hf_std_normalize_section" in globals() else _hf_harden_safe_text(issue.get("section"))
+
+    category = _hf_harden_safe_text(category) or "General"
+    system = _hf_harden_safe_text(system) or category
+    component = _hf_harden_safe_text(component) or system
+    defect_type = _hf_harden_safe_text(defect_type) or "Needs review"
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return "The inspection report notes that downspouts may be discharging too close to the house. This can move roof water toward the foundation instead of away from it."
+
+    if category == "Roofing" and ("Gutter" in system or "Downspout" in system):
+        return f"The inspection report notes a gutter or downspout concern involving {component or system}."
+
+    if category == "Electrical" and "GFCI" in system:
+        return f"The inspection report notes possible missing or defective GFCI protection at {location or component}."
+
+    if category == "Electrical" and "AFCI" in system:
+        return f"The inspection report notes possible missing or defective AFCI protection at {location or component}."
+
+    if category == "Electrical":
+        return f"The inspection report notes an electrical concern involving {component or system}."
+
+    if category == "Plumbing" and "Leak" in defect_type:
+        return f"The inspection report notes an active or suspected water leak at {location or component}."
+
+    if category == "Plumbing":
+        return f"The inspection report notes a plumbing concern involving {component or system}."
+
+    if category == "Roofing":
+        return f"The inspection report notes a roof or drainage concern involving {component or system}."
+
+    if category == "Exterior":
+        return f"The inspection report notes an exterior concern involving {component or system}."
+
+    if category == "HVAC":
+        return f"The inspection report notes an HVAC concern involving {component or system}."
+
+    if title:
+        return f"The inspection report notes: {title}."
+
+    return "The inspection report notes a finding that should be reviewed."
+
+
+def _hf_std_build_standard_json(issue: dict) -> dict:
+    report_item = _hf_std_extract_report_item(issue)
+    inspector_title = _hf_std_normalize_title(issue)
+    source_section = _hf_std_normalize_section(issue)
+
+    category = _hf_std_category(issue) or "General"
+    system = _hf_std_system(issue, category) or category
+    component = _hf_std_component(issue, system) or system
+    defect_type = _hf_std_defect_type(issue) or "Needs review"
+    severity = _hf_std_severity(issue) or "Medium"
+    risk_reasons = _hf_std_risk_reasons(issue, category, defect_type) or []
+    trade = _hf_std_trade(category, issue) or "Qualified contractor"
+    plain_summary = _hf_std_plain_summary(issue, category, system, component, defect_type)
+    recommended_action = _hf_std_recommended_action(issue, trade, category)
+    monitoring_plan = _hf_std_monitoring_plan(issue, category, severity)
+
+    candidate_urls = _hf_harden_candidate_urls_from_issue(issue) if "_hf_harden_candidate_urls_from_issue" in globals() else []
+
+    source = {
+        "report_item": report_item,
+        "report_page": issue.get("source_page") or issue.get("page") or None,
+        "report_section": source_section,
+        "inspector_title": inspector_title,
+        "inspector_finding_text": _hf_std_safe_text(issue.get("inspector_finding_text") or issue.get("source_finding_text") or ""),
+        "inspector_recommendation": _hf_std_safe_text(issue.get("inspector_recommendation") or issue.get("source_recommendation") or ""),
+        "report_pdf_url": issue.get("report_pdf_url") or "",
+        "report_page_url": issue.get("report_page_url") or "",
+    }
+
+    homefax = {
+        "category": category,
+        "system": system,
+        "component": component,
+        "location_area": source_section,
+        "defect_type": defect_type,
+        "severity": severity,
+        "risk_level": severity,
+        "risk_reasons": risk_reasons,
+        "plain_summary": plain_summary,
+        "recommended_trade": trade,
+        "recommended_action": recommended_action,
+        "monitoring_plan": monitoring_plan,
+    }
+
+    evidence = {
+        "primary_image_url": issue.get("image_url") or "",
+        "candidate_image_urls": candidate_urls,
+        "candidate_image_count": len(candidate_urls),
+        "homeowner_selected_image_url": issue.get("homeowner_selected_image_url") or "",
+        "verified_image_url": issue.get("verified_image_url") or "",
+        "image_status": issue.get("image_match_status") or "needs_review",
+    }
+
+    workflow = {
+        "homeowner_decision": issue.get("homeowner_decision") or "unreviewed",
+        "homeowner_image_decision": issue.get("homeowner_image_decision") or "unreviewed",
+        "admin_review_status": issue.get("admin_review_status") or "pending",
+        "baseline_locked": bool(issue.get("baseline_locked")),
+        "current_status": issue.get("current_status") or issue.get("status") or "active",
+    }
+
+    return {
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "source": source,
+        "homefax": homefax,
+        "evidence": evidence,
+        "workflow": workflow,
+        "generated_at": _hf_std_datetime.utcnow().isoformat() + "Z",
+    }
+
+
+
+# ============================================================
+# HomeFax Standard Preview Route Cleanup Patch 1
+# Fixes:
+# - old /homefax-standard-report-preview route now uses v2 logic
+# - fence defects classify as Exterior / Fence
+# ============================================================
+
+
+def _hf_cleanup_blob(issue: dict) -> str:
+    if "_hf_harden_blob" in globals():
+        return _hf_harden_blob(issue)
+
+    parts = [
+        issue.get("title") if issue else "",
+        issue.get("summary") if issue else "",
+        issue.get("section") if issue else "",
+        issue.get("source_report_section") if issue else "",
+        issue.get("source_finding_title") if issue else "",
+    ]
+
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _hf_cleanup_is_fence_issue(issue: dict) -> bool:
+    blob = _hf_cleanup_blob(issue)
+    return "fence" in blob
+
+
+def _hf_std_category(issue: dict) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_cleanup_blob(issue)
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return "Roofing"
+
+    if _hf_cleanup_is_fence_issue(issue):
+        return "Exterior"
+
+    if any(x in blob for x in ["gfci", "afci", "electric", "electrical", "wiring", "breaker", "panel", "meter", "disconnect", "receptacle", "outlet"]):
+        return "Electrical"
+
+    if any(x in blob for x in ["roof", "flashing", "gutter", "gutters", "downspout", "shingle", "penetration"]):
+        return "Roofing"
+
+    if any(x in blob for x in ["plumbing", "water", "leak", "pipe", "drain", "valve", "shut-off", "shut off", "heater", "hot water"]):
+        return "Plumbing"
+
+    if any(x in blob for x in ["exterior", "siding", "wall-covering", "wall covering", "eaves", "soffit", "fascia", "window", "door", "deck", "porch", "patio", "handrail", "railing", "grading", "vegetation", "fence"]):
+        return "Exterior"
+
+    if any(x in blob for x in ["heating", "cooling", "hvac", "thermostat", "furnace", "air conditioner"]):
+        return "HVAC"
+
+    if any(x in blob for x in ["kitchen", "bathroom", "interior", "floor", "ceiling", "wall", "range", "appliance"]):
+        return "Interior"
+
+    return "General"
+
+
+def _hf_std_system(issue: dict, category: str) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_cleanup_blob(issue)
+    section = _hf_std_normalize_section(issue) if "_hf_std_normalize_section" in globals() else str((issue or {}).get("section") or "").strip()
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return "Gutters & Downspouts"
+
+    if _hf_cleanup_is_fence_issue(issue):
+        return "Fence / Site Exterior"
+
+    if "gfci" in blob:
+        return "GFCI Protection"
+    if "afci" in blob:
+        return "AFCI Protection"
+    if "meter" in blob:
+        return "Electrical Service"
+    if "disconnect" in blob:
+        return "Main Service Disconnect"
+    if "panel" in blob or "breaker" in blob or "knockout" in blob:
+        return "Panelboards & Breakers"
+    if "wiring" in blob:
+        return "Electrical Wiring"
+
+    if "water heater" in blob or "hot water" in blob:
+        return "Water Heater / Hot Water Source"
+    if "shut-off" in blob or "shut off" in blob or "valve" in blob:
+        return "Water Shut-Off Valve"
+    if "water supply" in blob:
+        return "Water Supply"
+    if "drain" in blob or "pipe" in blob:
+        return "Drain / Waste / Vent"
+
+    if "gutter" in blob or "gutters" in blob or "downspout" in blob:
+        return "Gutters & Downspouts"
+    if "flashing" in blob:
+        return "Roof Flashing"
+    if "roof" in blob:
+        return "Roof Covering"
+
+    if "window" in blob:
+        return "Windows"
+    if "door" in blob:
+        return "Doors"
+    if "deck" in blob or "porch" in blob or "patio" in blob:
+        return "Deck / Porch / Patio"
+    if "handrail" in blob or "railing" in blob:
+        return "Railings / Guards / Handrails"
+    if "soffit" in blob or "fascia" in blob or "eaves" in blob:
+        return "Eaves / Soffits / Fascia"
+
+    if "thermostat" in blob:
+        return "Thermostat"
+    if "heating" in blob:
+        return "Heating System"
+    if "cooling" in blob:
+        return "Cooling System"
+
+    return section or category or "General"
+
+
+def _hf_std_component(issue: dict, system: str) -> str:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_cleanup_blob(issue)
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return "Downspout discharge / drainage termination"
+
+    if _hf_cleanup_is_fence_issue(issue):
+        return "Fence"
+
+    if "downspout" in blob:
+        return "Downspout"
+    if "gutter" in blob or "gutters" in blob:
+        return "Gutter"
+
+    if "gfci" in blob:
+        return "GFCI outlet or circuit"
+    if "afci" in blob:
+        return "AFCI circuit protection"
+    if "meter base" in blob:
+        return "Electric meter / meter base"
+    if "meter" in blob:
+        return "Electric meter"
+    if "disconnect" in blob:
+        return "Main service disconnect"
+    if "breaker" in blob:
+        return "Breaker / electrical panel"
+    if "panel" in blob:
+        return "Electrical panel"
+    if "wiring" in blob:
+        return "Electrical wiring"
+
+    if "valve" in blob or "shut-off" in blob or "shut off" in blob:
+        return "Water shut-off valve"
+    if "water heater" in blob:
+        return "Water heater"
+    if "pipe" in blob:
+        return "Pipe / support"
+    if "drain" in blob:
+        return "Drain line"
+
+    if "flashing" in blob:
+        return "Flashing"
+    if "roof" in blob:
+        return "Roof covering or roof component"
+
+    if "window" in blob:
+        return "Window"
+    if "door" in blob:
+        return "Door"
+    if "deck" in blob:
+        return "Deck component"
+    if "handrail" in blob:
+        return "Handrail"
+    if "railing" in blob:
+        return "Railing"
+
+    return system or "Component to confirm"
+
+
+def _hf_std_plain_summary(issue: dict, category: str, system: str, component: str, defect_type: str) -> str:
+    title = _hf_std_normalize_title(issue) if "_hf_std_normalize_title" in globals() else str((issue or {}).get("title") or "").strip()
+    location = _hf_std_normalize_section(issue) if "_hf_std_normalize_section" in globals() else str((issue or {}).get("section") or "").strip()
+
+    category = str(category or "General").strip()
+    system = str(system or category).strip()
+    component = str(component or system).strip()
+    defect_type = str(defect_type or "Needs review").strip()
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return "The inspection report notes that downspouts may be discharging too close to the house. This can move roof water toward the foundation instead of away from it."
+
+    if _hf_cleanup_is_fence_issue(issue):
+        return "The inspection report notes a fence or site-exterior concern that should be reviewed for repair, safety, or maintenance."
+
+    if category == "Roofing" and ("Gutter" in system or "Downspout" in system):
+        return f"The inspection report notes a gutter or downspout concern involving {component or system}."
+
+    if category == "Electrical" and "GFCI" in system:
+        return f"The inspection report notes possible missing or defective GFCI protection at {location or component}."
+
+    if category == "Electrical" and "AFCI" in system:
+        return f"The inspection report notes possible missing or defective AFCI protection at {location or component}."
+
+    if category == "Electrical":
+        return f"The inspection report notes an electrical concern involving {component or system}."
+
+    if category == "Plumbing" and "Leak" in defect_type:
+        return f"The inspection report notes an active or suspected water leak at {location or component}."
+
+    if category == "Plumbing":
+        return f"The inspection report notes a plumbing concern involving {component or system}."
+
+    if category == "Roofing":
+        return f"The inspection report notes a roof or drainage concern involving {component or system}."
+
+    if category == "Exterior":
+        return f"The inspection report notes an exterior concern involving {component or system}."
+
+    if category == "HVAC":
+        return f"The inspection report notes an HVAC concern involving {component or system}."
+
+    if title:
+        return f"The inspection report notes: {title}."
+
+    return "The inspection report notes a finding that should be reviewed."
+
+
+def _hf_std_trade(category: str, issue: dict) -> str:
+    if _hf_cleanup_is_fence_issue(issue):
+        return "Qualified contractor"
+
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_cleanup_blob(issue)
+
+    if category == "Electrical":
+        return "Licensed electrician"
+    if category == "Plumbing":
+        return "Licensed plumber"
+    if category == "Roofing":
+        return "Qualified roofing contractor"
+    if category == "HVAC":
+        return "Qualified HVAC technician"
+
+    if "window" in blob or "door" in blob or "deck" in blob or "handrail" in blob or "fence" in blob:
+        return "Qualified contractor"
+
+    return "Qualified contractor"
+
+
+def _hf_std_risk_reasons(issue: dict, category: str, defect_type: str) -> list:
+    blob = _hf_std_lower_blob(issue) if "_hf_std_lower_blob" in globals() else _hf_cleanup_blob(issue)
+
+    if "_hf_harden_is_downspout_drainage" in globals() and _hf_harden_is_downspout_drainage(issue):
+        return ["foundation moisture risk", "basement or crawlspace water risk", "poor roof drainage"]
+
+    if _hf_cleanup_is_fence_issue(issue):
+        return ["site safety", "property boundary maintenance", "exterior deterioration"]
+
+    if category == "Electrical":
+        if "gfci" in blob:
+            return ["shock risk", "wet-area electrical safety", "code/safety review"]
+        if "afci" in blob:
+            return ["electrical fire risk", "arc-fault protection", "code/safety review"]
+        return ["shock risk", "fire risk", "electrical service reliability"]
+
+    if category == "Plumbing":
+        if "leak" in blob:
+            return ["water damage", "mold risk", "hidden deterioration"]
+        return ["water service reliability", "water damage risk", "maintenance concern"]
+
+    if category == "Roofing":
+        return ["water intrusion", "moisture damage", "roof system deterioration"]
+
+    if category == "Exterior":
+        return ["moisture intrusion", "deterioration", "safety or maintenance concern"]
+
+    if category == "HVAC":
+        return ["comfort issue", "system reliability", "efficiency or safety concern"]
+
+    return ["maintenance tracking", "repair planning", "future monitoring"]
+
+
+def _hf_standard_preview_payload(record_id: str, limit: int = 10) -> dict:
+    _hf_std_ensure_schema()
+    issues = _hf_std_fetch_issues(record_id)
+
+    preview = []
+
+    for issue in issues[: max(1, min(int(limit or 10), 50))]:
+        standard = _hf_std_build_standard_json(issue)
+
+        preview.append(
+            {
+                "id": issue.get("id"),
+                "title": issue.get("title"),
+                "source_item_number": standard["source"].get("report_item"),
+                "source_finding_title": standard["source"].get("inspector_title"),
+                "source_finding_text": standard["source"].get("inspector_finding_text"),
+                "source_recommendation": standard["source"].get("inspector_recommendation"),
+                "category": standard["homefax"].get("category"),
+                "system": standard["homefax"].get("system"),
+                "component": standard["homefax"].get("component"),
+                "defect_type": standard["homefax"].get("defect_type"),
+                "plain_summary": standard["homefax"].get("plain_summary"),
+                "recommended_trade": standard["homefax"].get("recommended_trade"),
+                "recommended_action": standard["homefax"].get("recommended_action"),
+                "monitoring_plan": standard["homefax"].get("monitoring_plan"),
+                "risk_reasons": standard["homefax"].get("risk_reasons"),
+                "primary_image_url": standard["evidence"].get("primary_image_url"),
+                "candidate_image_count": standard["evidence"].get("candidate_image_count", 0),
+                "candidate_image_urls": standard["evidence"].get("candidate_image_urls", [])[:10],
+            }
+        )
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "schema_version": _HF_STANDARD_SCHEMA_VERSION,
+        "preview_version": "v2",
+        "issues_previewed": len(preview),
+        "issues_total": len(issues),
+        "issues": preview,
+    }
+
+
+# NOTE:
+# FastAPI keeps the first registered route when duplicate path+method handlers exist.
+# So instead of redefining /homefax-standard-report-preview here, we provide a canonical
+# cleanup endpoint and will test against it. In a later file refactor, remove the old
+# earlier preview function and point the original route to this payload helper.
+@app.get("/records/{record_id}/homefax-standard-report-preview-clean")
+def homefax_standard_report_preview_clean(record_id: str, limit: int = 10):
+    return _hf_standard_preview_payload(record_id, limit)
+
+
+@app.get("/records/{record_id}/homefax-standard-report-preview-v3")
+def homefax_standard_report_preview_v3(record_id: str, limit: int = 10):
+    return _hf_standard_preview_payload(record_id, limit)
+
+
+@app.post("/records/{record_id}/homefax-standard-schema/backfill-v3")
+def homefax_standard_schema_backfill_v3(record_id: str):
+    return _hf_std_backfill_record(record_id)
+
+
+
+# ============================================================
+# Original Inspector Finding Mapping Pass 1
+#
+# Purpose:
+# - Fill standard source fields from ai_adapter_learning_runs.raw_result.
+# - This is not full PDF paragraph extraction yet.
+# - It maps structured parser source data into verified_issues:
+#   source_finding_text, source_recommendation, source_page,
+#   source_report_section.
+# ============================================================
+
+import json as _hf_map_json
+import re as _hf_map_re
+
+
+def _hf_map_safe_text(value) -> str:
+    return _hf_map_re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _hf_map_parse_json(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (dict, list)):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return _hf_map_json.loads(text)
+    except Exception:
+        return None
+
+
+def _hf_map_get_connection():
+    if "_hf_report_db_connection" in globals():
+        return _hf_report_db_connection()
+
+    for name in ("get_db_connection", "get_connection", "db_connection"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No database connection helper found.")
+
+
+def _hf_map_extract_findings_from_raw_result(raw_result):
+    parsed = _hf_map_parse_json(raw_result)
+
+    if not isinstance(parsed, dict):
+        return []
+
+    findings = parsed.get("findings") or parsed.get("issues") or parsed.get("extractedIssues") or []
+
+    if not isinstance(findings, list):
+        return []
+
+    clean = []
+
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+
+        source_number = _hf_map_safe_text(
+            finding.get("source_number")
+            or finding.get("source_item_number")
+            or finding.get("report_item")
+            or finding.get("item_number")
+        )
+
+        title = _hf_map_safe_text(
+            finding.get("title")
+            or finding.get("issueTitle")
+            or finding.get("issue_title")
+        )
+
+        notes = _hf_map_safe_text(
+            finding.get("notes")
+            or finding.get("finding_text")
+            or finding.get("summary")
+            or finding.get("description")
+        )
+
+        recommendation = _hf_map_safe_text(
+            finding.get("recommendation")
+            or finding.get("recommended_action")
+            or finding.get("action")
+        )
+
+        system = _hf_map_safe_text(finding.get("system"))
+        location = _hf_map_safe_text(finding.get("location"))
+        component = _hf_map_safe_text(finding.get("component"))
+
+        source_report_section = location or system or component
+
+        source_page = (
+            finding.get("detail_page")
+            or finding.get("source_page")
+            or finding.get("page")
+            or finding.get("summary_page")
+        )
+
+        try:
+            source_page = int(source_page) if source_page is not None and str(source_page).strip() else None
+        except Exception:
+            source_page = None
+
+        if not source_number:
+            continue
+
+        clean.append(
+            {
+                "source_number": source_number,
+                "title": title,
+                "notes": notes,
+                "recommendation": recommendation,
+                "system": system,
+                "location": location,
+                "component": component,
+                "source_report_section": source_report_section,
+                "source_page": source_page,
+                "raw": finding,
+            }
+        )
+
+    return clean
+
+
+def _hf_map_latest_learning_run_candidates(limit: int = 10):
+    conn = _hf_map_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, record_id, filename, issue_count, raw_result, extracted_schema, created_at
+                FROM ai_adapter_learning_runs
+                WHERE raw_result IS NOT NULL
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                cols = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(cols, row)) for row in rows]
+
+            return rows
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_map_fetch_verified_issues_for_record(record_id: str):
+    conn = _hf_map_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, record_id, title, section, summary,
+                       source_item_number, source_finding_title,
+                       source_finding_text, source_recommendation,
+                       source_page, source_report_section
+                FROM verified_issues
+                WHERE record_id = %s
+                ORDER BY id ASC
+                """,
+                (record_id,),
+            )
+
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                cols = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(cols, row)) for row in rows]
+
+            return rows
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_map_choose_best_learning_run(record_id: str):
+    verified = _hf_map_fetch_verified_issues_for_record(record_id)
+    source_numbers = {
+        _hf_map_safe_text(row.get("source_item_number"))
+        for row in verified
+        if _hf_map_safe_text(row.get("source_item_number"))
+    }
+
+    best = None
+    best_score = -1
+
+    candidates = _hf_map_latest_learning_run_candidates(limit=10)
+
+    for run in candidates:
+        findings = _hf_map_extract_findings_from_raw_result(run.get("raw_result"))
+        finding_numbers = {f["source_number"] for f in findings}
+
+        overlap = len(source_numbers.intersection(finding_numbers))
+
+        score = overlap
+
+        # Bonus if issue counts look close.
+        try:
+            if int(run.get("issue_count") or 0) == len(verified):
+                score += 5
+        except Exception:
+            pass
+
+        # Bonus if same record id.
+        if _hf_map_safe_text(run.get("record_id")) == _hf_map_safe_text(record_id):
+            score += 20
+
+        if score > best_score:
+            best_score = score
+            best = {
+                "run": run,
+                "findings": findings,
+                "overlap": overlap,
+                "score": score,
+                "verified_count": len(verified),
+                "source_numbers_count": len(source_numbers),
+            }
+
+    return best
+
+
+def _hf_map_update_verified_issues_from_learning_run(record_id: str, dry_run: bool = False):
+    best = _hf_map_choose_best_learning_run(record_id)
+
+    if not best:
+        return {
+            "success": False,
+            "record_id": record_id,
+            "error": "No ai_adapter_learning_runs.raw_result candidate found.",
+        }
+
+    findings_by_source = {
+        f["source_number"]: f
+        for f in best["findings"]
+        if f.get("source_number")
+    }
+
+    verified = _hf_map_fetch_verified_issues_for_record(record_id)
+
+    updates = []
+    unmatched = []
+
+    for issue in verified:
+        source_item = _hf_map_safe_text(issue.get("source_item_number"))
+
+        match = findings_by_source.get(source_item)
+
+        if not match:
+            unmatched.append(
+                {
+                    "id": issue.get("id"),
+                    "source_item_number": source_item,
+                    "title": issue.get("title"),
+                }
+            )
+            continue
+
+        source_finding_text = match.get("notes") or issue.get("source_finding_text") or ""
+        source_recommendation = match.get("recommendation") or issue.get("source_recommendation") or ""
+        source_page = match.get("source_page") or issue.get("source_page")
+        source_report_section = match.get("source_report_section") or issue.get("source_report_section") or issue.get("section") or ""
+
+        updates.append(
+            {
+                "id": issue.get("id"),
+                "source_item_number": source_item,
+                "source_finding_title": issue.get("source_finding_title") or match.get("title"),
+                "source_finding_text": source_finding_text,
+                "source_recommendation": source_recommendation,
+                "source_page": source_page,
+                "source_report_section": source_report_section,
+                "matched_title": match.get("title"),
+            }
+        )
+
+    if dry_run:
+        return {
+            "success": True,
+            "dry_run": True,
+            "record_id": record_id,
+            "learning_run": {
+                "id": best["run"].get("id"),
+                "record_id": best["run"].get("record_id"),
+                "filename": best["run"].get("filename"),
+                "issue_count": best["run"].get("issue_count"),
+                "overlap": best["overlap"],
+                "score": best["score"],
+            },
+            "verified_count": len(verified),
+            "updates_count": len(updates),
+            "unmatched_count": len(unmatched),
+            "sample_updates": updates[:10],
+            "sample_unmatched": unmatched[:10],
+        }
+
+    conn = _hf_map_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            for update in updates:
+                cursor.execute(
+                    """
+                    UPDATE verified_issues
+                    SET
+                        source_finding_text = %s,
+                        source_recommendation = %s,
+                        source_page = %s,
+                        source_report_section = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        update["source_finding_text"],
+                        update["source_recommendation"],
+                        update["source_page"],
+                        update["source_report_section"],
+                        update["id"],
+                    ),
+                )
+
+        conn.commit()
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # Re-run HomeFax standard backfill so homefax_standard_json reflects mapped source fields.
+    backfill_result = None
+    if "_hf_std_backfill_record" in globals():
+        try:
+            backfill_result = _hf_std_backfill_record(record_id)
+        except Exception as error:
+            backfill_result = {
+                "success": False,
+                "error": str(error),
+            }
+
+    return {
+        "success": True,
+        "dry_run": False,
+        "record_id": record_id,
+        "learning_run": {
+            "id": best["run"].get("id"),
+            "record_id": best["run"].get("record_id"),
+            "filename": best["run"].get("filename"),
+            "issue_count": best["run"].get("issue_count"),
+            "overlap": best["overlap"],
+            "score": best["score"],
+        },
+        "verified_count": len(verified),
+        "updates_count": len(updates),
+        "unmatched_count": len(unmatched),
+        "sample_updates": updates[:10],
+        "sample_unmatched": unmatched[:10],
+        "standard_backfill": backfill_result,
+    }
+
+
+@app.get("/records/{record_id}/original-finding-mapping-preview")
+def original_finding_mapping_preview(record_id: str):
+    return _hf_map_update_verified_issues_from_learning_run(record_id, dry_run=True)
+
+
+@app.post("/records/{record_id}/original-finding-mapping/backfill")
+def original_finding_mapping_backfill(record_id: str):
+    return _hf_map_update_verified_issues_from_learning_run(record_id, dry_run=False)
+
+
+
+# ============================================================
+# Original Inspector Finding PDF Extraction Pass 1
+#
+# Purpose:
+# - Extract actual nearby source text from the stored original PDF.
+# - Uses verified_issues.source_page, source_item_number, and title.
+# - This improves source_finding_text beyond parser-generated summaries.
+#
+# Notes:
+# - This is text-layer extraction only.
+# - If the PDF page is image-only, OCR will be a later pass.
+# ============================================================
+
+import os as _hf_pdf_os
+import re as _hf_pdf_re
+import json as _hf_pdf_json
+from pathlib import Path as _hf_pdf_Path
+
+
+def hf_pdf_safe_text(value) -> str:
+    return _hf_pdf_re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _hf_pdf_normalize_for_match(value) -> str:
+    text = str(value or "").lower()
+    text = text.replace("ﬁ", "fi").replace("ﬂ", "fl")
+    text = _hf_pdf_re.sub(r"[^a-z0-9]+", " ", text)
+    return _hf_pdf_re.sub(r"\s+", " ", text).strip()
+
+
+def _hf_pdf_get_connection():
+    if "_hf_report_db_connection" in globals():
+        return _hf_report_db_connection()
+
+    for name in ("get_db_connection", "get_connection", "db_connection"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No database connection helper found.")
+
+
+def _hf_pdf_fetch_verified_issues(record_id: str):
+    conn = _hf_pdf_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, record_id, title, section, summary,
+                       source_item_number, source_report_section,
+                       source_finding_title, source_finding_text,
+                       source_recommendation, source_page,
+                       report_pdf_url, original_report_path
+                FROM verified_issues
+                WHERE record_id = %s
+                ORDER BY id ASC
+                """,
+                (record_id,),
+            )
+
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                cols = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(cols, row)) for row in rows]
+
+            return rows
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_pdf_find_original_pdf_path(record_id: str):
+    """
+    Find the stored original report PDF.
+
+    Search order:
+    1. verified_issues.original_report_path
+    2. existing helper functions, if present
+    3. common local original_reports directory patterns
+    4. common repo/output locations
+    """
+
+    # 1. Try DB-stored original_report_path.
+    try:
+        issues = _hf_pdf_fetch_verified_issues(record_id)
+        for issue in issues:
+            raw_path = issue.get("original_report_path")
+            if raw_path:
+                candidate = _hf_pdf_Path(str(raw_path)).expanduser()
+                if candidate.exists() and candidate.is_file():
+                    return str(candidate)
+    except Exception:
+        pass
+
+    # 2. Try previous helpers if they exist.
+    for helper_name in [
+        "_hf_report_find_existing_pdf",
+        "_hf_report_pdf_path",
+        "_hf_original_report_path",
+        "find_original_report_path",
+    ]:
+        helper = globals().get(helper_name)
+        if callable(helper):
+            try:
+                candidate = helper(record_id)
+                if candidate:
+                    path = _hf_pdf_Path(str(candidate)).expanduser()
+                    if path.exists() and path.is_file():
+                        return str(path)
+            except Exception:
+                pass
+
+    base = _hf_pdf_Path(".").resolve()
+
+    candidates = [
+        base / "original_reports" / f"{record_id}.pdf",
+        base / "original_reports" / f"{record_id}.PDF",
+        base / "reports" / f"{record_id}.pdf",
+        base / "uploads" / f"{record_id}.pdf",
+        base / "output" / f"{record_id}.pdf",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+
+    # 3. Glob common places.
+    search_dirs = [
+        base / "original_reports",
+        base / "reports",
+        base / "uploads",
+        base / "output",
+        base,
+    ]
+
+    record_slug = _hf_pdf_normalize_for_match(record_id)
+
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+
+        try:
+            for candidate in search_dir.glob("*.pdf"):
+                candidate_slug = _hf_pdf_normalize_for_match(candidate.name)
+                if record_slug in candidate_slug or "6039" in candidate_slug or "carpenter" in candidate_slug:
+                    return str(candidate)
+        except Exception:
+            pass
+
+    return None
+
+
+def _hf_pdf_extract_text_pages(pdf_path: str):
+    """
+    Returns a list of:
+      {page: 1-based page number, text: raw text}
+
+    Uses PyMuPDF first, then pypdf fallback.
+    """
+
+    path = _hf_pdf_Path(pdf_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    # Preferred: PyMuPDF / fitz
+    try:
+        import fitz
+
+        doc = fitz.open(str(path))
+        pages = []
+
+        try:
+            for index in range(len(doc)):
+                page = doc[index]
+                text = page.get_text("text") or ""
+                pages.append(
+                    {
+                        "page": index + 1,
+                        "text": text,
+                    }
+                )
+        finally:
+            doc.close()
+
+        return pages
+
+    except Exception as fitz_error:
+        fitz_error_text = str(fitz_error)
+
+    # Fallback: pypdf
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        pages = []
+
+        for index, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+
+            pages.append(
+                {
+                    "page": index + 1,
+                    "text": text,
+                }
+            )
+
+        return pages
+
+    except Exception as pypdf_error:
+        raise RuntimeError(
+            "Could not extract PDF text with PyMuPDF or pypdf. "
+            f"PyMuPDF error: {fitz_error_text}; pypdf error: {pypdf_error}"
+        )
+
+
+def _hf_pdf_item_regex(item_number: str):
+    """
+    Create forgiving regex for item numbers like 2.4.5.
+    Handles spaces around dots.
+    """
+
+    item = _hf_pdf_safe_text(item_number)
+
+    if not item:
+        return None
+
+    parts = [_hf_pdf_re.escape(p) for p in item.split(".") if p]
+
+    if not parts:
+        return None
+
+    pattern = r"(?<!\d)" + r"\s*\.\s*".join(parts) + r"(?!\d)"
+    return _hf_pdf_re.compile(pattern, _hf_pdf_re.IGNORECASE)
+
+
+def _hf_pdf_next_item_regex():
+    return _hf_pdf_re.compile(r"(?<!\d)(\d{1,2}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2})(?!\d)")
+
+
+def _hf_pdf_clean_chunk(text: str) -> str:
+    if not text:
+        return ""
+
+    text = text.replace("\x00", " ")
+    text = text.replace("\r", "\n")
+    text = _hf_pdf_re.sub(r"[ \t]+", " ", text)
+    text = _hf_pdf_re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+
+    # Remove excessive page footer/header noise patterns without being destructive.
+    lines = []
+    for line in text.splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+
+        low = clean.lower()
+
+        if low in {"inspection report", "home inspection report"}:
+            continue
+
+        if "big ben inspections" in low and len(clean) < 80:
+            continue
+
+        if _hf_pdf_re.fullmatch(r"page\s+\d+(\s+of\s+\d+)?", low):
+            continue
+
+        lines.append(clean)
+
+    text = "\n".join(lines)
+    text = _hf_pdf_re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+def _hf_pdf_sentence_recommendation(chunk: str) -> str:
+    if not chunk:
+        return ""
+
+    # Split into rough sentences/lines.
+    pieces = _hf_pdf_re.split(r"(?<=[.!?])\s+|\n+", chunk)
+
+    keywords = [
+        "recommend",
+        "repair",
+        "replace",
+        "correct",
+        "evaluate",
+        "further evaluation",
+        "qualified",
+        "contractor",
+        "electrician",
+        "plumber",
+        "roofer",
+        "monitor",
+    ]
+
+    selected = []
+
+    for piece in pieces:
+        clean = _hf_pdf_safe_text(piece)
+        low = clean.lower()
+
+        if clean and any(keyword in low for keyword in keywords):
+            selected.append(clean)
+
+    # Keep it short.
+    if selected:
+        return " ".join(selected[:3])[:1200].strip()
+
+    return ""
+
+
+def _hf_pdf_find_chunk_for_issue(issue: dict, pages: list):
+    item_number = _hf_pdf_safe_text(issue.get("source_item_number"))
+    title = _hf_pdf_safe_text(issue.get("source_finding_title") or issue.get("title"))
+    source_page = issue.get("source_page")
+
+    page_map = {p["page"]: p.get("text") or "" for p in pages}
+
+    candidate_page_numbers = []
+
+    try:
+        source_page_int = int(source_page)
+    except Exception:
+        source_page_int = None
+
+    if source_page_int:
+        candidate_page_numbers.extend(
+            [
+                source_page_int,
+                source_page_int - 1,
+                source_page_int + 1,
+            ]
+        )
+
+    # Add all pages as fallback after preferred pages.
+    candidate_page_numbers.extend([p["page"] for p in pages])
+
+    # Dedupe while preserving order.
+    seen = set()
+    candidate_page_numbers = [
+        p for p in candidate_page_numbers
+        if p and p not in seen and not seen.add(p) and p in page_map
+    ]
+
+    item_re = _hf_pdf_item_regex(item_number)
+    title_norm = _hf_pdf_normalize_for_match(title)
+
+    best_result = None
+
+    for page_number in candidate_page_numbers:
+        text = page_map.get(page_number) or ""
+
+        if not text.strip():
+            continue
+
+        start = None
+        matched_by = None
+
+        # First try item number.
+        if item_re:
+            match = item_re.search(text)
+            if match:
+                start = match.start()
+                matched_by = "item_number"
+
+        # Then try title.
+        if start is None and title_norm:
+            norm_text = _hf_pdf_normalize_for_match(text)
+            idx_norm = norm_text.find(title_norm)
+
+            if idx_norm != -1:
+                # Approximate raw start by scanning title words.
+                title_words = [w for w in title.split() if len(w) >= 3]
+                for word in title_words[:3]:
+                    m = _hf_pdf_re.search(_hf_pdf_re.escape(word), text, _hf_pdf_re.IGNORECASE)
+                    if m:
+                        start = m.start()
+                        matched_by = "title"
+                        break
+
+        if start is None:
+            continue
+
+        # End at next item number after start, or at a reasonable character window.
+        after_start = text[start + 5 :]
+        next_match = _hf_pdf_next_item_regex().search(after_start)
+
+        if next_match:
+            end = start + 5 + next_match.start()
+        else:
+            end = min(len(text), start + 2500)
+
+        # Avoid tiny chunks.
+        if end <= start + 80:
+            end = min(len(text), start + 2500)
+
+        chunk = _hf_pdf_clean_chunk(text[start:end])
+
+        if not chunk:
+            continue
+
+        result = {
+            "matched": True,
+            "matched_by": matched_by,
+            "source_page": page_number,
+            "item_number": item_number,
+            "title": title,
+            "source_finding_text": chunk[:3000],
+            "source_recommendation": _hf_pdf_sentence_recommendation(chunk),
+            "text_length": len(chunk),
+        }
+
+        # Prefer exact source_page + item number.
+        if page_number == source_page_int and matched_by == "item_number":
+            return result
+
+        # Otherwise keep first usable result.
+        if not best_result:
+            best_result = result
+
+    if best_result:
+        return best_result
+
+    return {
+        "matched": False,
+        "matched_by": None,
+        "source_page": source_page_int,
+        "item_number": item_number,
+        "title": title,
+        "source_finding_text": "",
+        "source_recommendation": "",
+        "text_length": 0,
+    }
+
+
+def _hf_pdf_extraction_run(record_id: str, dry_run: bool = True, limit: int = 0):
+    pdf_path = _hf_pdf_find_original_pdf_path(record_id)
+
+    if not pdf_path:
+        return {
+            "success": False,
+            "record_id": record_id,
+            "error": "Original PDF file not found on local backend. Register or store the original report first.",
+            "searched_record_id": record_id,
+        }
+
+    issues = _hf_pdf_fetch_verified_issues(record_id)
+
+    if limit and int(limit) > 0:
+        issues = issues[: int(limit)]
+
+    pages = _hf_pdf_extract_text_pages(pdf_path)
+
+    page_text_count = sum(1 for p in pages if (p.get("text") or "").strip())
+
+    results = []
+    updates = []
+    unmatched = []
+
+    for issue in issues:
+        extracted = _hf_pdf_find_chunk_for_issue(issue, pages)
+
+        row = {
+            "id": issue.get("id"),
+            "source_item_number": issue.get("source_item_number"),
+            "title": issue.get("source_finding_title") or issue.get("title"),
+            "old_source_page": issue.get("source_page"),
+            "matched": extracted.get("matched"),
+            "matched_by": extracted.get("matched_by"),
+            "source_page": extracted.get("source_page") or issue.get("source_page"),
+            "source_finding_text": extracted.get("source_finding_text") or "",
+            "source_recommendation": extracted.get("source_recommendation") or "",
+            "text_length": extracted.get("text_length") or 0,
+        }
+
+        results.append(row)
+
+        if row["matched"] and row["source_finding_text"]:
+            updates.append(row)
+        else:
+            unmatched.append(row)
+
+    if not dry_run and updates:
+        conn = _hf_pdf_get_connection()
+
+        try:
+            with conn.cursor() as cursor:
+                for update in updates:
+                    # Only overwrite with PDF text when it is meaningfully longer than parser summary.
+                    cursor.execute(
+                        """
+                        UPDATE verified_issues
+                        SET
+                            source_finding_text = %s,
+                            source_recommendation = CASE
+                                WHEN %s != '' THEN %s
+                                ELSE source_recommendation
+                            END,
+                            source_page = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            update["source_finding_text"],
+                            update["source_recommendation"],
+                            update["source_recommendation"],
+                            update["source_page"],
+                            update["id"],
+                        ),
+                    )
+
+            conn.commit()
+
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    standard_backfill = None
+
+    if not dry_run and "_hf_std_backfill_record" in globals():
+        try:
+            standard_backfill = _hf_std_backfill_record(record_id)
+        except Exception as error:
+            standard_backfill = {
+                "success": False,
+                "error": str(error),
+            }
+
+    return {
+        "success": True,
+        "dry_run": dry_run,
+        "record_id": record_id,
+        "pdf_path": pdf_path,
+        "pages_total": len(pages),
+        "pages_with_text": page_text_count,
+        "issues_checked": len(issues),
+        "matched_count": len(updates),
+        "unmatched_count": len(unmatched),
+        "sample_results": results[:10],
+        "sample_unmatched": unmatched[:10],
+        "standard_backfill": standard_backfill,
+    }
+
+
+@app.get("/records/{record_id}/original-finding-pdf-extraction-preview")
+def original_finding_pdf_extraction_preview(record_id: str, limit: int = 10):
+    return _hf_pdf_extraction_run(record_id, dry_run=True, limit=limit)
+
+
+@app.post("/records/{record_id}/original-finding-pdf-extraction/backfill")
+def original_finding_pdf_extraction_backfill(record_id: str):
+    return _hf_pdf_extraction_run(record_id, dry_run=False, limit=0)
+
+
+
+# ============================================================
+# Original Inspector Finding PDF Extraction Hotfix 1
+#
+# Fix:
+# - Restores missing _hf_pdf_safe_text helper if the PDF extraction
+#   patch was partially appended or helper was not available at runtime.
+# ============================================================
+
+import re as _hf_pdf_re_hotfix
+
+
+def _hf_pdf_safe_text(value) -> str:
+    """
+    Safe string normalizer used by Original Inspector Finding PDF Extraction.
+    Defined here as a hotfix so existing PDF extraction functions can resolve it
+    at runtime.
+    """
+    return _hf_pdf_re_hotfix.sub(r"\s+", " ", str(value or "")).strip()
+
+
+# Defensive fallback in case another helper was skipped during append.
+def _hf_pdf_normalize_for_match(value) -> str:
+    text = str(value or "").lower()
+    text = text.replace("ﬁ", "fi").replace("ﬂ", "fl")
+    text = _hf_pdf_re_hotfix.sub(r"[^a-z0-9]+", " ", text)
+    return _hf_pdf_re_hotfix.sub(r"\s+", " ", text).strip()
+
+
+
+# ============================================================
+# PDF Extraction Cleanup Pass 2
+#
+# Purpose:
+# - Clean source_finding_text and source_recommendation after PDF extraction.
+# - Fix common PDF text encoding artifacts.
+# - Remove repeated footer/header noise.
+# - Improve recommendation extraction.
+# ============================================================
+
+import re as _hf_pdf_clean_re
+
+
+def _hf_pdf_clean2_safe_text(value) -> str:
+    return str(value or "").replace("\r", "\n").replace("\x00", " ").strip()
+
+
+def _hf_pdf_clean2_fix_encoding(text: str) -> str:
+    text = _hf_pdf_clean2_safe_text(text)
+
+    replacements = {
+        "\u00a0": " ",
+        "qualiíed": "qualified",
+        "Qualiíed": "Qualified",
+        "QUALIÍED": "QUALIFIED",
+        "rooíng": "roofing",
+        "Rooíng": "Roofing",
+        "ROOÍNG": "ROOFING",
+        "soíit": "soffit",
+        "Soíit": "Soffit",
+        "íxture": "fixture",
+        "Íxture": "Fixture",
+    }
+
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+
+    # Common PDF-ligature artifacts.
+    text = text.replace("ﬁ", "fi").replace("ﬂ", "fl")
+
+    # Normalize spacing but preserve line structure.
+    lines = []
+    for line in text.splitlines():
+        line = _hf_pdf_clean_re.sub(r"[ \t]+", " ", line).strip()
+        lines.append(line)
+
+    text = "\n".join(lines)
+    text = _hf_pdf_clean_re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    return text
+
+
+def _hf_pdf_clean2_is_noise_line(line: str) -> bool:
+    clean = _hf_pdf_clean_re.sub(r"\s+", " ", str(line or "")).strip()
+    low = clean.lower()
+
+    if not clean:
+        return True
+
+    footer_bits = [
+        "6039 s carpenter st",
+        "vasintino johnson",
+        "lateef home inspection services",
+        "big ben inspections",
+    ]
+
+    if any(bit in low for bit in footer_bits):
+        return True
+
+    if _hf_pdf_clean_re.fullmatch(r"page\s+\d+(\s+of\s+\d+)?", low):
+        return True
+
+    if _hf_pdf_clean_re.fullmatch(r"(major|minor|material|safety|maintenance)\s+defect", low):
+        return True
+
+    return False
+
+
+def _hf_pdf_clean2_clean_source_text(text: str) -> str:
+    text = _hf_pdf_clean2_fix_encoding(text)
+
+    cleaned_lines = []
+
+    for line in text.splitlines():
+        if _hf_pdf_clean2_is_noise_line(line):
+            continue
+
+        cleaned_lines.append(line.strip())
+
+    text = "\n".join(cleaned_lines)
+    text = _hf_pdf_clean_re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    return text
+
+
+def _hf_pdf_clean2_sentence_split(text: str):
+    text = _hf_pdf_clean2_fix_encoding(text)
+    flat = _hf_pdf_clean_re.sub(r"\s+", " ", text).strip()
+
+    if not flat:
+        return []
+
+    pieces = _hf_pdf_clean_re.split(r"(?<=[.!?])\s+", flat)
+
+    return [
+        piece.strip()
+        for piece in pieces
+        if piece and piece.strip()
+    ]
+
+
+def _hf_pdf_clean2_unique_join(parts):
+    seen = set()
+    clean_parts = []
+
+    for part in parts:
+        clean = _hf_pdf_clean_re.sub(r"\s+", " ", str(part or "")).strip()
+
+        if not clean:
+            continue
+
+        low = clean.lower()
+
+        if low == "recommendation":
+            continue
+
+        if _hf_pdf_clean2_is_noise_line(clean):
+            continue
+
+        if low in seen:
+            continue
+
+        seen.add(low)
+        clean_parts.append(clean)
+
+    return " ".join(clean_parts).strip()
+
+
+def _hf_pdf_clean2_extract_marker_recommendation(clean_source_text: str):
+    lines = [
+        line.strip()
+        for line in _hf_pdf_clean2_fix_encoding(clean_source_text).splitlines()
+        if line.strip()
+    ]
+
+    collected = []
+
+    for idx, line in enumerate(lines):
+        if line.strip().lower() == "recommendation":
+            for follow in lines[idx + 1 : idx + 5]:
+                follow_clean = follow.strip()
+                follow_low = follow_clean.lower()
+
+                if not follow_clean:
+                    continue
+
+                if _hf_pdf_clean2_is_noise_line(follow_clean):
+                    break
+
+                if _hf_pdf_clean_re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{1,2}.*", follow_clean):
+                    break
+
+                if follow_low in {"recommendation"}:
+                    continue
+
+                collected.append(follow_clean)
+
+            break
+
+    return _hf_pdf_clean2_unique_join(collected)
+
+
+def _hf_pdf_clean2_extract_body_recommendation(clean_source_text: str):
+    keywords = [
+        "recommend",
+        "recommended",
+        "correction",
+        "further evaluation",
+        "contact a qualified",
+        "qualified",
+        "repair",
+        "replace",
+        "evaluate",
+        "contractor",
+        "professional",
+        "roofer",
+        "plumber",
+        "electrician",
+        "diy project",
+    ]
+
+    selected = []
+
+    for sentence in _hf_pdf_clean2_sentence_split(clean_source_text):
+        low = sentence.lower()
+
+        if any(keyword in low for keyword in keywords):
+            selected.append(sentence)
+
+    return _hf_pdf_clean2_unique_join(selected[:3])
+
+
+def _hf_pdf_clean2_clean_recommendation(source_text: str, existing_recommendation: str = "") -> str:
+    source_text = _hf_pdf_clean2_clean_source_text(source_text)
+    existing_recommendation = _hf_pdf_clean2_fix_encoding(existing_recommendation)
+
+    marker_rec = _hf_pdf_clean2_extract_marker_recommendation(source_text)
+    body_rec = _hf_pdf_clean2_extract_body_recommendation(source_text)
+
+    parts = []
+
+    # Body recommendation often contains the actual reason/action.
+    if body_rec:
+        parts.append(body_rec)
+
+    # Marker recommendation often contains the trade or DIY instruction.
+    if marker_rec:
+        parts.append(marker_rec)
+
+    if not parts and existing_recommendation:
+        parts.append(existing_recommendation)
+
+    recommendation = _hf_pdf_clean2_unique_join(parts)
+
+    # Remove broken trailing fragments created by earlier extraction.
+    recommendation = recommendation.replace(" from Recommendation", "")
+    recommendation = recommendation.replace(" Recommendation", "")
+    recommendation = _hf_pdf_clean_re.sub(r"\s+", " ", recommendation).strip()
+
+    return recommendation[:1200]
+
+
+def _hf_pdf_clean2_get_connection():
+    if "_hf_report_db_connection" in globals():
+        return _hf_report_db_connection()
+
+    for name in ("get_db_connection", "get_connection", "db_connection"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No database connection helper found.")
+
+
+def _hf_pdf_clean2_fetch_issues(record_id: str):
+    conn = _hf_pdf_clean2_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, record_id, title, source_item_number,
+                       source_finding_title, source_finding_text,
+                       source_recommendation, source_page
+                FROM verified_issues
+                WHERE record_id = %s
+                ORDER BY id ASC
+                """,
+                (record_id,),
+            )
+
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                cols = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(cols, row)) for row in rows]
+
+            return rows
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_pdf_clean2_run(record_id: str, dry_run: bool = True, limit: int = 0):
+    issues = _hf_pdf_clean2_fetch_issues(record_id)
+
+    if limit and int(limit) > 0:
+        issues = issues[: int(limit)]
+
+    results = []
+    updates = []
+
+    for issue in issues:
+        old_text = issue.get("source_finding_text") or ""
+        old_rec = issue.get("source_recommendation") or ""
+
+        new_text = _hf_pdf_clean2_clean_source_text(old_text)
+        new_rec = _hf_pdf_clean2_clean_recommendation(new_text, old_rec)
+
+        changed = (new_text != old_text) or (new_rec != old_rec)
+
+        row = {
+            "id": issue.get("id"),
+            "source_item_number": issue.get("source_item_number"),
+            "title": issue.get("source_finding_title") or issue.get("title"),
+            "source_page": issue.get("source_page"),
+            "changed": changed,
+            "old_text_preview": old_text[:350],
+            "new_text_preview": new_text[:500],
+            "old_recommendation": old_rec,
+            "new_recommendation": new_rec,
+        }
+
+        results.append(row)
+
+        if changed:
+            updates.append(
+                {
+                    "id": issue.get("id"),
+                    "source_finding_text": new_text,
+                    "source_recommendation": new_rec,
+                }
+            )
+
+    if not dry_run and updates:
+        conn = _hf_pdf_clean2_get_connection()
+
+        try:
+            with conn.cursor() as cursor:
+                for update in updates:
+                    cursor.execute(
+                        """
+                        UPDATE verified_issues
+                        SET source_finding_text = %s,
+                            source_recommendation = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            update["source_finding_text"],
+                            update["source_recommendation"],
+                            update["id"],
+                        ),
+                    )
+
+            conn.commit()
+
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    standard_backfill = None
+
+    if not dry_run and "_hf_std_backfill_record" in globals():
+        try:
+            standard_backfill = _hf_std_backfill_record(record_id)
+        except Exception as error:
+            standard_backfill = {
+                "success": False,
+                "error": str(error),
+            }
+
+    return {
+        "success": True,
+        "dry_run": dry_run,
+        "record_id": record_id,
+        "issues_checked": len(issues),
+        "changed_count": len(updates),
+        "sample_results": results[:10],
+        "standard_backfill": standard_backfill,
+    }
+
+
+@app.get("/records/{record_id}/pdf-extraction-cleanup-preview")
+def pdf_extraction_cleanup_preview(record_id: str, limit: int = 10):
+    return _hf_pdf_clean2_run(record_id, dry_run=True, limit=limit)
+
+
+@app.post("/records/{record_id}/pdf-extraction-cleanup/backfill")
+def pdf_extraction_cleanup_backfill(record_id: str):
+    return _hf_pdf_clean2_run(record_id, dry_run=False, limit=0)
+
+
+
+# ============================================================
+# PDF Extraction Cleanup Pass 2B - Safe Cleanup Guard
+#
+# Purpose:
+# - Fix encoding artifacts safely.
+# - Improve recommendations.
+# - Never overwrite source_finding_text with blank/too-short cleanup.
+# - Preserve inspector source text if cleanup is too destructive.
+# ============================================================
+
+import re as _hf_pdf_clean2b_re
+
+
+def _hf_pdf_clean2b_text(value) -> str:
+    return str(value or "").replace("\r", "\n").replace("\x00", " ").strip()
+
+
+def _hf_pdf_clean2b_fix_encoding(text: str) -> str:
+    text = _hf_pdf_clean2b_text(text)
+
+    replacements = {
+        "\u00a0": " ",
+        "qualiíed": "qualified",
+        "Qualiíed": "Qualified",
+        "QUALIÍED": "QUALIFIED",
+        "rooíng": "roofing",
+        "Rooíng": "Roofing",
+        "ROOÍNG": "ROOFING",
+        "Shut-Oì": "Shut-Off",
+        "shut-oì": "shut-off",
+        "Oì": "Off",
+        "oì": "off",
+        "íxture": "fixture",
+        "Íxture": "Fixture",
+        "soíit": "soffit",
+        "Soíit": "Soffit",
+    }
+
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+
+    text = text.replace("ﬁ", "fi").replace("ﬂ", "fl")
+
+    lines = []
+    for line in text.splitlines():
+        line = _hf_pdf_clean2b_re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines).strip()
+
+
+def _hf_pdf_clean2b_is_footer_noise(line: str) -> bool:
+    clean = _hf_pdf_clean2b_re.sub(r"\s+", " ", str(line or "")).strip()
+    low = clean.lower()
+
+    if not clean:
+        return True
+
+    footer_bits = [
+        "6039 s carpenter st",
+        "vasintino johnson",
+        "lateef home inspection services",
+        "big ben inspections",
+    ]
+
+    if any(bit in low for bit in footer_bits):
+        return True
+
+    if _hf_pdf_clean2b_re.fullmatch(r"page\s+\d+(\s+of\s+\d+)?", low):
+        return True
+
+    return False
+
+
+def _hf_pdf_clean2b_clean_source_text(old_text: str) -> str:
+    """
+    Conservative cleanup:
+    - fixes encoding
+    - removes footer/address/name/company lines
+    - DOES NOT remove defect labels like Major Defect, because sometimes
+      those are the only remaining severity/source context.
+    - never returns blank if old text had meaningful content
+    """
+
+    fixed = _hf_pdf_clean2b_fix_encoding(old_text)
+
+    if not fixed:
+        return ""
+
+    kept = []
+
+    for line in fixed.splitlines():
+        if _hf_pdf_clean2b_is_footer_noise(line):
+            continue
+        kept.append(line.strip())
+
+    cleaned = "\n".join([line for line in kept if line]).strip()
+
+    # Safety guard: never wipe out text.
+    old_flat = _hf_pdf_clean2b_re.sub(r"\s+", " ", fixed).strip()
+    new_flat = _hf_pdf_clean2b_re.sub(r"\s+", " ", cleaned).strip()
+
+    if old_flat and (not new_flat or len(new_flat) < 40):
+        return fixed
+
+    # Safety guard: if cleanup removed too much, keep encoding-fixed original.
+    if old_flat and len(new_flat) < max(40, int(len(old_flat) * 0.35)):
+        return fixed
+
+    return cleaned
+
+
+def _hf_pdf_clean2b_lines(text: str):
+    return [
+        line.strip()
+        for line in _hf_pdf_clean2b_fix_encoding(text).splitlines()
+        if line.strip()
+    ]
+
+
+def _hf_pdf_clean2b_sentence_split(text: str):
+    flat = _hf_pdf_clean2b_re.sub(r"\s+", " ", _hf_pdf_clean2b_fix_encoding(text)).strip()
+    if not flat:
+        return []
+    return [
+        p.strip()
+        for p in _hf_pdf_clean2b_re.split(r"(?<=[.!?])\s+", flat)
+        if p.strip()
+    ]
+
+
+def _hf_pdf_clean2b_unique(parts):
+    seen = set()
+    out = []
+
+    for part in parts:
+        clean = _hf_pdf_clean2b_re.sub(r"\s+", " ", str(part or "")).strip()
+        if not clean:
+            continue
+
+        clean = clean.replace(" Recommendation", "").strip()
+        clean = clean.replace("Recommendation ", "").strip()
+
+        if _hf_pdf_clean2b_is_footer_noise(clean):
+            continue
+
+        # Remove trailing severity label from recommendation only.
+        clean = _hf_pdf_clean2b_re.sub(
+            r"\s+(Major|Material|Minor|Maintenance|Safety)\s+Defect\s*$",
+            "",
+            clean,
+            flags=_hf_pdf_clean2b_re.IGNORECASE,
+        ).strip()
+
+        low = clean.lower()
+        if not clean or low in seen:
+            continue
+
+        seen.add(low)
+        out.append(clean)
+
+    return " ".join(out).strip()
+
+
+def _hf_pdf_clean2b_marker_recommendation(source_text: str):
+    lines = _hf_pdf_clean2b_lines(source_text)
+
+    for idx, line in enumerate(lines):
+        if line.lower() == "recommendation":
+            found = []
+
+            for follow in lines[idx + 1 : idx + 5]:
+                low = follow.lower()
+
+                if _hf_pdf_clean2b_is_footer_noise(follow):
+                    break
+
+                if _hf_pdf_clean2b_re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{1,2}.*", follow):
+                    break
+
+                if low == "recommendation":
+                    continue
+
+                found.append(follow)
+
+            return _hf_pdf_clean2b_unique(found)
+
+    return ""
+
+
+def _hf_pdf_clean2b_body_recommendation(source_text: str):
+    selected = []
+
+    keywords = [
+        "recommend",
+        "recommended",
+        "correction",
+        "further evaluation",
+        "contact a qualified",
+        "qualified",
+        "repair",
+        "replace",
+        "contractor",
+        "professional",
+        "roofer",
+        "plumber",
+        "electrician",
+        "diy project",
+    ]
+
+    for sentence in _hf_pdf_clean2b_sentence_split(source_text):
+        low = sentence.lower()
+
+        if any(k in low for k in keywords):
+            selected.append(sentence)
+
+    return _hf_pdf_clean2b_unique(selected[:3])
+
+
+def _hf_pdf_clean2b_clean_recommendation(source_text: str, old_rec: str) -> str:
+    source_text = _hf_pdf_clean2b_clean_source_text(source_text)
+    old_rec = _hf_pdf_clean2b_fix_encoding(old_rec)
+
+    marker = _hf_pdf_clean2b_marker_recommendation(source_text)
+    body = _hf_pdf_clean2b_body_recommendation(source_text)
+
+    parts = []
+
+    if body:
+        parts.append(body)
+
+    if marker:
+        parts.append(marker)
+
+    if not parts and old_rec:
+        parts.append(old_rec)
+
+    rec = _hf_pdf_clean2b_unique(parts)
+
+    rec = rec.replace(" from Recommendation", "")
+    rec = rec.replace(" from the foundation. Recommended DIY Project", " from the foundation. Recommended DIY Project")
+    rec = _hf_pdf_clean2b_re.sub(r"\s+", " ", rec).strip()
+
+    # Safety guard: never replace a useful recommendation with blank.
+    if not rec and old_rec:
+        return old_rec
+
+    return rec[:1200]
+
+
+def _hf_pdf_clean2b_get_connection():
+    if "_hf_report_db_connection" in globals():
+        return _hf_report_db_connection()
+
+    for name in ("get_db_connection", "get_connection", "db_connection"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No database connection helper found.")
+
+
+def _hf_pdf_clean2b_fetch_issues(record_id: str):
+    conn = _hf_pdf_clean2b_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, record_id, title, source_item_number,
+                       source_finding_title, source_finding_text,
+                       source_recommendation, source_page
+                FROM verified_issues
+                WHERE record_id = %s
+                ORDER BY id ASC
+                """,
+                (record_id,),
+            )
+
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                cols = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(cols, row)) for row in rows]
+
+            return rows
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_pdf_clean2b_run(record_id: str, dry_run: bool = True, limit: int = 0):
+    issues = _hf_pdf_clean2b_fetch_issues(record_id)
+
+    if limit and int(limit) > 0:
+        issues = issues[: int(limit)]
+
+    results = []
+    updates = []
+
+    for issue in issues:
+        old_text = issue.get("source_finding_text") or ""
+        old_rec = issue.get("source_recommendation") or ""
+
+        new_text = _hf_pdf_clean2b_clean_source_text(old_text)
+        new_rec = _hf_pdf_clean2b_clean_recommendation(new_text, old_rec)
+
+        changed = (new_text != old_text) or (new_rec != old_rec)
+
+        row = {
+            "id": issue.get("id"),
+            "source_item_number": issue.get("source_item_number"),
+            "title": issue.get("source_finding_title") or issue.get("title"),
+            "source_page": issue.get("source_page"),
+            "changed": changed,
+            "old_text_preview": old_text[:350],
+            "new_text_preview": new_text[:600],
+            "old_recommendation": old_rec,
+            "new_recommendation": new_rec,
+            "old_text_length": len(old_text),
+            "new_text_length": len(new_text),
+        }
+
+        results.append(row)
+
+        if changed:
+            updates.append(
+                {
+                    "id": issue.get("id"),
+                    "source_finding_text": new_text,
+                    "source_recommendation": new_rec,
+                }
+            )
+
+    if not dry_run and updates:
+        conn = _hf_pdf_clean2b_get_connection()
+
+        try:
+            with conn.cursor() as cursor:
+                for update in updates:
+                    cursor.execute(
+                        """
+                        UPDATE verified_issues
+                        SET source_finding_text = %s,
+                            source_recommendation = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            update["source_finding_text"],
+                            update["source_recommendation"],
+                            update["id"],
+                        ),
+                    )
+
+            conn.commit()
+
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    standard_backfill = None
+
+    if not dry_run and "_hf_std_backfill_record" in globals():
+        try:
+            standard_backfill = _hf_std_backfill_record(record_id)
+        except Exception as error:
+            standard_backfill = {
+                "success": False,
+                "error": str(error),
+            }
+
+    return {
+        "success": True,
+        "dry_run": dry_run,
+        "record_id": record_id,
+        "issues_checked": len(issues),
+        "changed_count": len(updates),
+        "sample_results": results[:10],
+        "standard_backfill": standard_backfill,
+    }
+
+
+@app.get("/records/{record_id}/pdf-extraction-cleanup-preview-v2")
+def pdf_extraction_cleanup_preview_v2(record_id: str, limit: int = 10):
+    return _hf_pdf_clean2b_run(record_id, dry_run=True, limit=limit)
+
+
+@app.post("/records/{record_id}/pdf-extraction-cleanup/backfill-v2")
+def pdf_extraction_cleanup_backfill_v2(record_id: str):
+    return _hf_pdf_clean2b_run(record_id, dry_run=False, limit=0)
+
+
+
+# ============================================================
+# Clean Preview Endpoint Location Fields Patch 1
+#
+# Purpose:
+# - Add first-class source/location fields to standard report preview.
+# - Preserve existing standard finding fields.
+# - Make dashboard cards source/page/location ready.
+#
+# New endpoint:
+# GET /records/{record_id}/homefax-standard-report-preview-clean-v4
+# ============================================================
+
+import json as _hf_loc_json
+import re as _hf_loc_re
+
+
+def _hf_loc_safe_text(value) -> str:
+    return str(value or "").replace("\r", "\n").replace("\x00", " ").strip()
+
+
+def _hf_loc_one_line(value) -> str:
+    return _hf_loc_re.sub(r"\s+", " ", _hf_loc_safe_text(value)).strip()
+
+
+def _hf_loc_parse_json(value, fallback=None):
+    if fallback is None:
+        fallback = None
+
+    if value is None:
+        return fallback
+
+    if isinstance(value, (dict, list)):
+        return value
+
+    text = str(value).strip()
+
+    if not text:
+        return fallback
+
+    try:
+        return _hf_loc_json.loads(text)
+    except Exception:
+        return fallback
+
+
+def _hf_loc_get_connection():
+    if "_hf_report_db_connection" in globals():
+        return _hf_report_db_connection()
+
+    for name in ("get_db_connection", "get_connection", "db_connection"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No database connection helper found.")
+
+
+def _hf_loc_fix_encoding(text: str) -> str:
+    text = _hf_loc_safe_text(text)
+
+    replacements = {
+        "\u00a0": " ",
+        "qualiíed": "qualified",
+        "Qualiíed": "Qualified",
+        "rooíng": "roofing",
+        "Rooíng": "Roofing",
+        "îashing": "flashing",
+        "Îashing": "Flashing",
+        "Soïts": "Soffits",
+        "soïts": "soffits",
+        "eïcient": "efficient",
+        "ílled": "filled",
+        "íller": "filler",
+        "ínger": "finger",
+        "Shut-Oì": "Shut-Off",
+        "shut-oì": "shut-off",
+        "ﬁ": "fi",
+        "ﬂ": "fl",
+    }
+
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+
+    return _hf_loc_one_line(text)
+
+
+def _hf_loc_title_case(value: str) -> str:
+    text = _hf_loc_one_line(value)
+
+    if not text:
+        return ""
+
+    lower_words = {"of", "at", "the", "and", "in", "to", "for", "or"}
+
+    words = []
+    for idx, word in enumerate(text.split(" ")):
+        if not word:
+            continue
+
+        low = word.lower()
+
+        if idx > 0 and low in lower_words:
+            words.append(low)
+        else:
+            words.append(low[:1].upper() + low[1:])
+
+    return " ".join(words)
+
+
+def _hf_loc_extract_location_from_text(issue: dict) -> str:
+    """
+    Conservative location extraction from actual inspector source text.
+    This is only a fallback until source_report_section / location columns are populated.
+    """
+
+    source = _hf_loc_fix_encoding(issue.get("source_finding_text"))
+    title = _hf_loc_fix_encoding(issue.get("source_finding_title") or issue.get("title"))
+    text = f"{source} {title}".lower()
+
+    known_locations = [
+        "right side of the home",
+        "right side of home",
+        "left side of the home",
+        "left side of home",
+        "front porch",
+        "front of home",
+        "rear of home",
+        "back of home",
+        "basement",
+        "bathroom",
+        "kitchen",
+        "laundry room",
+        "electrical panel cover",
+        "electrical panel",
+        "main water shut-off valve",
+        "water heater",
+        "roof penetration",
+        "exterior door",
+        "bathroom door",
+        "kitchen sink",
+    ]
+
+    for location in known_locations:
+        if location in text:
+            return _hf_loc_title_case(location)
+
+    return ""
+
+
+def _hf_loc_section_from_source_text(issue: dict) -> str:
+    """
+    Extract likely report section from the beginning of source_finding_text.
+
+    Example:
+    '2.4.5 Gutters & Downspouts DOWNSPOUTS DRAIN NEAR HOUSE...'
+    -> 'Gutters & Downspouts'
+    """
+
+    item_number = _hf_loc_one_line(issue.get("source_item_number"))
+    source_text = _hf_loc_one_line(issue.get("source_finding_text"))
+
+    if not source_text:
+        return ""
+
+    if item_number and source_text.startswith(item_number):
+        rest = source_text[len(item_number):].strip()
+    else:
+        rest = source_text
+
+    # Known section vocabulary from this report family.
+    known_sections = [
+        "Roof Covering",
+        "Flashing",
+        "Gutters & Downspouts",
+        "Other Roof Penetrations",
+        "Exterior Wall-Covering Materials",
+        "Eaves, Soffits, and Fascia",
+        "Eaves, Soffits, and Fascia",
+        "Representative Number of Windows",
+        "All Exterior Doors",
+        "Porches, Patios, Decks, Balconies, and Carports",
+        "Railings, Guards, and Handrails",
+        "Vegetation, Surface Drainage, Retaining Walls, and Grading",
+        "Heating System",
+        "Thermostat and Normal Operating Controls",
+        "Main Water Shut-Off Valve",
+        "Water Supply",
+        "Hot Water Source",
+        "Drain, Waste, & Vent Systems",
+        "Electric Meter & Base",
+        "Main Service Disconnect",
+        "Electrical Wiring",
+        "Panelboards & Breakers",
+        "GFCIs",
+        "Electrical Defects",
+        "GFCI & Electric in Bathroom",
+        "Heat Source in Bathroom",
+        "Door",
+        "Laundry Room, Electric, and Tub",
+        "Kitchen Sink",
+        "GFCI",
+        "AFCI",
+        "Range/Oven/Cooktop",
+    ]
+
+    rest_low = rest.lower()
+
+    for section in known_sections:
+        if rest_low.startswith(section.lower()):
+            return section
+
+    # Fallback: take words before the all-caps finding title begins.
+    tokens = rest.split(" ")
+    section_words = []
+
+    for token in tokens[:12]:
+        bare = token.strip(".,:;()[]")
+
+        if len(section_words) >= 2 and bare.isupper() and len(bare) > 2:
+            break
+
+        section_words.append(token)
+
+    candidate = " ".join(section_words).strip()
+
+    return candidate[:120]
+
+
+def _hf_loc_build_standard_location_area(issue: dict) -> str:
+    explicit = _hf_loc_one_line(
+        issue.get("standard_location_area")
+        or issue.get("location")
+        or issue.get("area")
+        or issue.get("room")
+        or issue.get("source_location")
+        or issue.get("finding_location")
+    )
+
+    if explicit:
+        return explicit
+
+    text_location = _hf_loc_extract_location_from_text(issue)
+
+    system = _hf_loc_one_line(
+        issue.get("standard_system")
+        or issue.get("system")
+        or issue.get("source_report_section")
+    )
+
+    component = _hf_loc_one_line(
+        issue.get("standard_component")
+        or issue.get("component")
+    )
+
+    system_component = " / ".join([part for part in [system, component] if part])
+
+    if text_location and system_component:
+        return f"{text_location} — {system_component}"
+
+    if text_location:
+        return text_location
+
+    if system_component:
+        return system_component
+
+    section = _hf_loc_section_from_source_text(issue)
+
+    if section:
+        return section
+
+    return "Location not specified"
+
+
+def _hf_loc_source_pdf_url(record_id: str) -> str:
+    return f"/inspection-report/{record_id}"
+
+
+def _hf_loc_source_pdf_page_url(record_id: str, source_page) -> str:
+    base = _hf_loc_source_pdf_url(record_id)
+
+    if source_page:
+        return f"{base}#page={source_page}"
+
+    return base
+
+
+def _hf_loc_fetch_standard_issues(record_id: str, limit: int = 100):
+    """
+    Fetch from verified_issues directly so we can return fields missing from
+    older clean preview endpoint contracts.
+    """
+
+    conn = _hf_loc_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    record_id,
+                    title,
+
+                    source_item_number,
+                    source_page,
+                    source_report_section,
+                    source_finding_title,
+                    source_finding_text,
+                    source_recommendation,
+
+                    standard_category,
+                    standard_system,
+                    standard_component,
+                    standard_defect_type,
+                    standard_location_area,
+                    standard_severity,
+                    standard_risk_reasons,
+                    standard_plain_summary,
+                    standard_recommended_trade,
+                    standard_recommended_action,
+                    standard_monitoring_plan,
+                    homefax_standard_json,
+
+                    image_url,
+                    verified_image_url,
+                    candidate_image_urls,
+
+                    status,
+                    homeowner_decision,
+                    homeowner_note,
+                    homeowner_reviewed_at,
+                    current_status,
+                    hidden_from_review_queue
+                FROM verified_issues
+                WHERE record_id = %s
+                ORDER BY
+                    CASE
+                        WHEN source_item_number REGEXP '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+'
+                        THEN CAST(SUBSTRING_INDEX(source_item_number, '.', 1) AS UNSIGNED)
+                        ELSE 999
+                    END,
+                    CASE
+                        WHEN source_item_number REGEXP '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+'
+                        THEN CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(source_item_number, '.', 2), '.', -1) AS UNSIGNED)
+                        ELSE 999
+                    END,
+                    CASE
+                        WHEN source_item_number REGEXP '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+'
+                        THEN CAST(SUBSTRING_INDEX(source_item_number, '.', -1) AS UNSIGNED)
+                        ELSE 999
+                    END,
+                    id ASC
+                LIMIT %s
+                """,
+                (record_id, int(limit or 100)),
+            )
+
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                columns = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(columns, row)) for row in rows]
+
+            return rows
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_loc_issue_to_preview(issue: dict) -> dict:
+    record_id = _hf_loc_one_line(issue.get("record_id"))
+    source_page = issue.get("source_page")
+    source_page_clean = source_page if source_page not in ("", None) else None
+
+    standard_json = _hf_loc_parse_json(issue.get("homefax_standard_json"), {}) or {}
+
+    candidate_urls = _hf_loc_parse_json(issue.get("candidate_image_urls"), [])
+
+    if not isinstance(candidate_urls, list):
+        candidate_urls = []
+
+    risk_reasons = issue.get("standard_risk_reasons")
+
+    if not risk_reasons and isinstance(standard_json, dict):
+        risk_reasons = standard_json.get("risk_reasons")
+
+    parsed_risk = _hf_loc_parse_json(risk_reasons, risk_reasons)
+
+    if isinstance(parsed_risk, str):
+        parsed_risk = [
+            part.strip()
+            for part in parsed_risk.split(",")
+            if part.strip()
+        ]
+
+    if not isinstance(parsed_risk, list):
+        parsed_risk = []
+
+    source_report_section = _hf_loc_one_line(
+        issue.get("source_report_section")
+        or _hf_loc_section_from_source_text(issue)
+        or issue.get("standard_system")
+    )
+
+    standard_location_area = _hf_loc_build_standard_location_area(issue)
+
+    primary_image_url = _hf_loc_one_line(
+        issue.get("verified_image_url")
+        or issue.get("image_url")
+    )
+
+    return {
+        "id": issue.get("id"),
+        "title": _hf_loc_one_line(issue.get("title")),
+        "record_id": record_id,
+
+        # Source anchor fields
+        "source_item_number": _hf_loc_one_line(issue.get("source_item_number")),
+        "source_page": source_page_clean,
+        "source_report_section": source_report_section,
+        "source_pdf_url": _hf_loc_source_pdf_url(record_id),
+        "source_pdf_page_url": _hf_loc_source_pdf_page_url(record_id, source_page_clean),
+
+        # Original inspector fields
+        "source_finding_title": _hf_loc_one_line(issue.get("source_finding_title")),
+        "source_finding_text": _hf_loc_fix_encoding(issue.get("source_finding_text")),
+        "source_recommendation": _hf_loc_fix_encoding(issue.get("source_recommendation")),
+
+        # Standard/HomeFax fields
+        "standard_location_area": standard_location_area,
+        "location": standard_location_area,
+        "category": _hf_loc_one_line(issue.get("standard_category") or standard_json.get("category")),
+        "system": _hf_loc_one_line(issue.get("standard_system") or standard_json.get("system")),
+        "component": _hf_loc_one_line(issue.get("standard_component") or standard_json.get("component")),
+        "defect_type": _hf_loc_one_line(issue.get("standard_defect_type") or standard_json.get("defect_type")),
+        "severity": _hf_loc_one_line(issue.get("standard_severity") or standard_json.get("severity")),
+        "plain_summary": _hf_loc_one_line(issue.get("standard_plain_summary") or standard_json.get("plain_summary")),
+        "recommended_trade": _hf_loc_one_line(issue.get("standard_recommended_trade") or standard_json.get("recommended_trade")),
+        "recommended_action": _hf_loc_one_line(issue.get("standard_recommended_action") or standard_json.get("recommended_action")),
+        "monitoring_plan": _hf_loc_one_line(issue.get("standard_monitoring_plan") or standard_json.get("monitoring_plan")),
+        "risk_reasons": parsed_risk,
+
+        # Evidence fields
+        "primary_image_url": primary_image_url,
+        "candidate_image_count": len(candidate_urls),
+        "candidate_image_urls": candidate_urls,
+
+        # Review/workflow state fields
+        "status": _hf_loc_one_line(issue.get("status")),
+        "homeowner_decision": _hf_loc_one_line(issue.get("homeowner_decision")),
+        "homeowner_note": _hf_loc_one_line(issue.get("homeowner_note")),
+        "homeowner_reviewed_at": str(issue.get("homeowner_reviewed_at") or ""),
+        "current_status": _hf_loc_one_line(issue.get("current_status")),
+        "hidden_from_review_queue": _hf_loc_one_line(issue.get("hidden_from_review_queue")),
+    }
+
+
+@app.get("/records/{record_id}/homefax-standard-report-preview-clean-v4")
+def homefax_standard_report_preview_clean_v4(record_id: str, limit: int = 100):
+    issues = _hf_loc_fetch_standard_issues(record_id, limit=limit)
+    preview = [_hf_loc_issue_to_preview(issue) for issue in issues]
+
+    return {
+        "success": True,
+        "preview_version": "clean_v4_location_fields",
+        "schema_version": "homefax_standard_finding_v1",
+        "record_id": record_id,
+        "issues_total": len(preview),
+        "issues_previewed": len(preview),
+        "issues": preview,
+    }
+
+
+
+# ============================================================
+# Evidence Photo Candidate Cleanup Pass 1
+#
+# Purpose:
+# - Remove placeholder/tool/non-photo images from candidate_image_urls.
+# - Keep primary image first.
+# - Keep real-looking inspection photos.
+# - Preview before backfill.
+#
+# New endpoints:
+# GET  /records/{record_id}/evidence-photo-candidate-cleanup-preview
+# POST /records/{record_id}/evidence-photo-candidate-cleanup/backfill
+# ============================================================
+
+import json as _hf_img_clean_json
+import re as _hf_img_clean_re
+from urllib.parse import unquote as _hf_img_clean_unquote
+
+
+def _hf_img_clean_safe_text(value) -> str:
+    return str(value or "").replace("\x00", " ").strip()
+
+
+def _hf_img_clean_parse_json(value, fallback=None):
+    if fallback is None:
+        fallback = []
+
+    if value is None:
+        return fallback
+
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, dict):
+        return value
+
+    text = str(value).strip()
+
+    if not text:
+        return fallback
+
+    try:
+        parsed = _hf_img_clean_json.loads(text)
+        return parsed
+    except Exception:
+        return fallback
+
+
+def _hf_img_clean_get_connection():
+    if "_hf_report_db_connection" in globals():
+        return _hf_report_db_connection()
+
+    for name in ("get_db_connection", "get_connection", "db_connection"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No database connection helper found.")
+
+
+def _hf_img_clean_normalize_url(url: str) -> str:
+    url = _hf_img_clean_safe_text(url)
+    url = _hf_img_clean_unquote(url)
+    url = url.replace("\\/", "/")
+    return url
+
+
+def _hf_img_clean_filename(url: str) -> str:
+    clean = _hf_img_clean_normalize_url(url)
+    clean = clean.split("?")[0].split("#")[0]
+    return clean.rsplit("/", 1)[-1].lower()
+
+
+def _hf_img_clean_is_image_url(url: str) -> bool:
+    clean = _hf_img_clean_normalize_url(url).lower().split("?")[0].split("#")[0]
+    return clean.endswith((".jpg", ".jpeg", ".png", ".webp"))
+
+
+def _hf_img_clean_is_placeholder_url(url: str) -> bool:
+    """
+    Conservative placeholder detection.
+
+    We remove obvious UI/tool/placeholder candidates, but we do not delete
+    ambiguous report photos unless they clearly look non-photo.
+    """
+
+    clean = _hf_img_clean_normalize_url(url).lower()
+    filename = _hf_img_clean_filename(url)
+
+    if not clean:
+        return True
+
+    if not _hf_img_clean_is_image_url(clean):
+        return True
+
+    placeholder_tokens = [
+        "placeholder",
+        "no-image",
+        "no_image",
+        "missing-image",
+        "missing_image",
+        "default-image",
+        "default_image",
+        "imageoff",
+        "image-off",
+        "icon",
+        "wrench",
+        "tool",
+        "repair-icon",
+        "camera-placeholder",
+    ]
+
+    if any(token in clean for token in placeholder_tokens):
+        return True
+
+    # The dashboard shows black/white generic tool symbols. In this report family
+    # they often appear as repeated generic PNG assets, not real page photos.
+    generic_png_hashes = [
+        "9c7e25779a00",
+        "718979aa6ac3",
+        "105e4b1fa173",
+    ]
+
+    if filename.endswith(".png") and any(token in filename for token in generic_png_hashes):
+        return True
+
+    # Keep real extracted JPEG report photos by default.
+    return False
+
+
+def _hf_img_clean_url_score(url: str, issue: dict) -> int:
+    """
+    Higher score means better evidence candidate.
+    """
+
+    clean = _hf_img_clean_normalize_url(url).lower()
+    filename = _hf_img_clean_filename(url)
+
+    score = 0
+
+    if _hf_img_clean_is_placeholder_url(url):
+        return -999
+
+    if filename.endswith((".jpg", ".jpeg")):
+        score += 30
+
+    if filename.endswith(".webp"):
+        score += 20
+
+    if filename.endswith(".png"):
+        score += 5
+
+    if "/inspection-images/" in clean or "/inspection-images-s3/" in clean:
+        score += 20
+
+    if "page_" in filename and "_img_" in filename:
+        score += 20
+
+    primary = _hf_img_clean_normalize_url(
+        issue.get("verified_image_url") or issue.get("image_url") or ""
+    )
+
+    if primary and _hf_img_clean_normalize_url(url) == primary:
+        score += 100
+
+    # Prefer candidates close to source page when page is available.
+    source_page = issue.get("source_page")
+    if source_page not in ("", None):
+        try:
+            source_page_int = int(source_page)
+            page_match = _hf_img_clean_re.search(r"page_(\d+)_img_", filename)
+            if page_match:
+                image_page = int(page_match.group(1))
+                distance = abs(image_page - source_page_int)
+
+                if distance == 0:
+                    score += 35
+                elif distance == 1:
+                    score += 25
+                elif distance == 2:
+                    score += 15
+                elif distance <= 5:
+                    score += 5
+                else:
+                    score -= min(distance, 20)
+        except Exception:
+            pass
+
+    return score
+
+
+def _hf_img_clean_unique_urls(urls):
+    seen = set()
+    output = []
+
+    for url in urls:
+        clean = _hf_img_clean_normalize_url(url)
+
+        if not clean:
+            continue
+
+        key = clean.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        output.append(clean)
+
+    return output
+
+
+def _hf_img_clean_issue_candidates(issue: dict, max_images: int = 6):
+    raw_candidates = _hf_img_clean_parse_json(issue.get("candidate_image_urls"), [])
+
+    if not isinstance(raw_candidates, list):
+        raw_candidates = []
+
+    primary = _hf_img_clean_normalize_url(
+        issue.get("verified_image_url") or issue.get("image_url") or ""
+    )
+
+    combined = []
+
+    if primary:
+        combined.append(primary)
+
+    combined.extend(raw_candidates)
+    combined = _hf_img_clean_unique_urls(combined)
+
+    kept = []
+    removed = []
+
+    for url in combined:
+        if _hf_img_clean_is_placeholder_url(url):
+            removed.append(
+                {
+                    "url": url,
+                    "reason": "placeholder_or_non_photo",
+                }
+            )
+        else:
+            kept.append(url)
+
+    kept = sorted(
+        kept,
+        key=lambda candidate_url: _hf_img_clean_url_score(candidate_url, issue),
+        reverse=True,
+    )
+
+    # Primary must remain first if it is valid.
+    if primary and primary in kept:
+        kept = [primary] + [url for url in kept if url != primary]
+
+    kept = kept[: int(max_images or 6)]
+
+    return {
+        "old_candidates": raw_candidates,
+        "primary_image_url": primary,
+        "new_candidates": kept,
+        "removed_candidates": removed,
+        "old_count": len(raw_candidates),
+        "new_count": len(kept),
+        "removed_count": len(removed),
+        "changed": raw_candidates != kept,
+    }
+
+
+def _hf_img_clean_fetch_issues(record_id: str):
+    conn = _hf_img_clean_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    record_id,
+                    title,
+                    source_item_number,
+                    source_page,
+                    source_finding_title,
+                    standard_system,
+                    standard_component,
+                    image_url,
+                    verified_image_url,
+                    candidate_image_urls
+                FROM verified_issues
+                WHERE record_id = %s
+                ORDER BY
+                    CASE
+                        WHEN source_item_number REGEXP '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+'
+                        THEN CAST(SUBSTRING_INDEX(source_item_number, '.', 1) AS UNSIGNED)
+                        ELSE 999
+                    END,
+                    CASE
+                        WHEN source_item_number REGEXP '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+'
+                        THEN CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(source_item_number, '.', 2), '.', -1) AS UNSIGNED)
+                        ELSE 999
+                    END,
+                    CASE
+                        WHEN source_item_number REGEXP '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+'
+                        THEN CAST(SUBSTRING_INDEX(source_item_number, '.', -1) AS UNSIGNED)
+                        ELSE 999
+                    END,
+                    id ASC
+                """,
+                (record_id,),
+            )
+
+            rows = cursor.fetchall() or []
+
+            if rows and not isinstance(rows[0], dict):
+                columns = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(columns, row)) for row in rows]
+
+            return rows
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_img_clean_run(record_id: str, dry_run: bool = True, max_images: int = 6, limit: int = 0):
+    issues = _hf_img_clean_fetch_issues(record_id)
+
+    if limit and int(limit) > 0:
+        issues = issues[: int(limit)]
+
+    results = []
+    updates = []
+
+    for issue in issues:
+        cleanup = _hf_img_clean_issue_candidates(issue, max_images=max_images)
+
+        row = {
+            "id": issue.get("id"),
+            "source_item_number": issue.get("source_item_number"),
+            "title": issue.get("source_finding_title") or issue.get("title"),
+            "source_page": issue.get("source_page"),
+            "old_count": cleanup["old_count"],
+            "new_count": cleanup["new_count"],
+            "removed_count": cleanup["removed_count"],
+            "changed": cleanup["changed"],
+            "primary_image_url": cleanup["primary_image_url"],
+            "new_candidates": cleanup["new_candidates"],
+            "removed_candidates": cleanup["removed_candidates"],
+        }
+
+        results.append(row)
+
+        if cleanup["changed"]:
+            updates.append(
+                {
+                    "id": issue.get("id"),
+                    "candidate_image_urls": _hf_img_clean_json.dumps(cleanup["new_candidates"]),
+                }
+            )
+
+    if not dry_run and updates:
+        conn = _hf_img_clean_get_connection()
+
+        try:
+            with conn.cursor() as cursor:
+                for update in updates:
+                    cursor.execute(
+                        """
+                        UPDATE verified_issues
+                        SET candidate_image_urls = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            update["candidate_image_urls"],
+                            update["id"],
+                        ),
+                    )
+
+            conn.commit()
+
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return {
+        "success": True,
+        "dry_run": dry_run,
+        "record_id": record_id,
+        "issues_checked": len(issues),
+        "changed_count": len(updates),
+        "max_images": int(max_images or 6),
+        "results_preview": results[:15],
+        "total_removed_candidates": sum(item["removed_count"] for item in results),
+    }
+
+
+@app.get("/records/{record_id}/evidence-photo-candidate-cleanup-preview")
+def evidence_photo_candidate_cleanup_preview(record_id: str, max_images: int = 6, limit: int = 15):
+    return _hf_img_clean_run(
+        record_id=record_id,
+        dry_run=True,
+        max_images=max_images,
+        limit=limit,
+    )
+
+
+@app.post("/records/{record_id}/evidence-photo-candidate-cleanup/backfill")
+def evidence_photo_candidate_cleanup_backfill(record_id: str, max_images: int = 6):
+    return _hf_img_clean_run(
+        record_id=record_id,
+        dry_run=False,
+        max_images=max_images,
+        limit=0,
+    )
+
+
+
+# ============================================================
+# Standard Review Action Endpoint Pass 1
+#
+# Purpose:
+# - Dedicated compatibility endpoint for HomeFax standard finding cards.
+# - Updates existing verified_issues workflow columns.
+#
+# Endpoint:
+# PATCH /verified-issue/{issue_id}/standard-review-action
+# ============================================================
+
+from datetime import datetime as _hf_review_datetime
+from pydantic import BaseModel as _hf_review_BaseModel
+from typing import Optional as _hf_review_Optional
+
+
+class _HFStandardReviewActionPayload(_hf_review_BaseModel):
+    decision: str
+    note: _hf_review_Optional[str] = ""
+    homeowner_user_id: _hf_review_Optional[str] = None
+    homeowner_email: _hf_review_Optional[str] = None
+
+
+def _hf_review_get_connection():
+    if "_hf_report_db_connection" in globals():
+        return _hf_report_db_connection()
+
+    for name in ("get_db_connection", "get_connection", "db_connection"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No database connection helper found.")
+
+
+def _hf_review_normalize_decision(value: str) -> str:
+    decision = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+    allowed = {
+        "monitor",
+        "repair_needed",
+        "already_repaired",
+        "not_an_issue",
+        "wrong_photo",
+        "needs_contractor",
+    }
+
+    if decision not in allowed:
+        raise ValueError(f"Unsupported review decision: {decision}")
+
+    return decision
+
+
+def _hf_review_status_for_decision(decision: str):
+    """
+    Maps standard card decision to current workflow fields.
+    """
+    if decision == "monitor":
+        return {
+            "status": "monitor",
+            "current_status": "monitoring",
+            "hidden_from_review_queue": "no",
+        }
+
+    if decision == "repair_needed":
+        return {
+            "status": "repair_needed",
+            "current_status": "repair_needed",
+            "hidden_from_review_queue": "no",
+        }
+
+    if decision == "already_repaired":
+        return {
+            "status": "repaired",
+            "current_status": "repaired",
+            "hidden_from_review_queue": "yes",
+        }
+
+    if decision == "not_an_issue":
+        return {
+            "status": "dismissed",
+            "current_status": "dismissed",
+            "hidden_from_review_queue": "yes",
+        }
+
+    if decision == "wrong_photo":
+        return {
+            "status": "image_review_needed",
+            "current_status": "needs_image_review",
+            "hidden_from_review_queue": "no",
+        }
+
+    if decision == "needs_contractor":
+        return {
+            "status": "needs_contractor",
+            "current_status": "needs_contractor",
+            "hidden_from_review_queue": "no",
+        }
+
+    return {
+        "status": "reviewed",
+        "current_status": "open",
+        "hidden_from_review_queue": "no",
+    }
+
+
+@app.patch("/verified-issue/{issue_id}/standard-review-action")
+def update_verified_issue_standard_review_action(
+    issue_id: int,
+    payload: _HFStandardReviewActionPayload,
+):
+    decision = _hf_review_normalize_decision(payload.decision)
+    note = str(payload.note or "").strip()
+    status_map = _hf_review_status_for_decision(decision)
+
+    conn = _hf_review_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, source_item_number, source_finding_title,
+                       homeowner_decision, homeowner_note, status, current_status
+                FROM verified_issues
+                WHERE id = %s
+                """,
+                (issue_id,),
+            )
+
+            existing = cursor.fetchone()
+
+            if not existing:
+                return {
+                    "success": False,
+                    "error": "verified_issue_not_found",
+                    "issue_id": issue_id,
+                }
+
+            cursor.execute(
+                """
+                UPDATE verified_issues
+                SET homeowner_decision = %s,
+                    homeowner_note = %s,
+                    homeowner_reviewed_at = NOW(),
+                    status = %s,
+                    current_status = %s,
+                    hidden_from_review_queue = %s
+                WHERE id = %s
+                """,
+                (
+                    decision,
+                    note,
+                    status_map["status"],
+                    status_map["current_status"],
+                    status_map["hidden_from_review_queue"],
+                    issue_id,
+                ),
+            )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "issue_id": issue_id,
+            "decision": decision,
+            "note": note,
+            "status": status_map["status"],
+            "current_status": status_map["current_status"],
+            "hidden_from_review_queue": status_map["hidden_from_review_queue"],
+        }
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+

@@ -14010,3 +14010,331 @@ def homefax_intake_standard_preview_v1(record_id: str, limit: int = 100):
             "record_id": record_id,
             "detail": str(exc),
         }
+
+# ============================================================
+# HomeFax Intake Standard Validation Endpoint Pass 1
+#
+# Purpose:
+# - Validate HomeFax Intake Standard v1 payloads before processing.
+# - Give n8n, Zite, manual imports, future partner APIs, and tests
+#   a safe way to confirm payload readiness.
+#
+# Safety:
+# - Validation only.
+# - No database writes.
+# - No n8n calls.
+# - No dashboard changes.
+# ============================================================
+
+def _hf_intake_val_text(value) -> str:
+    return str(value or "").strip()
+
+
+def _hf_intake_val_is_obj(value) -> bool:
+    return isinstance(value, dict)
+
+
+def _hf_intake_val_is_array(value) -> bool:
+    return isinstance(value, list)
+
+
+def _hf_intake_val_bool(value, default=False) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return default
+
+    text = str(value).strip().lower()
+
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+
+    return default
+
+
+def _hf_intake_validate_payload(payload: dict) -> dict:
+    """
+    Validate a HomeFax Intake Standard v1 payload.
+
+    This validator intentionally returns warnings/errors instead of raising
+    so n8n/Zite/manual imports can get useful feedback.
+    """
+    errors = []
+    warnings = []
+    counts = {
+        "standard_findings": 0,
+        "findings_with_candidate_images_array": 0,
+        "findings_with_verified_images": 0,
+        "findings_baseline_locked": 0,
+        "findings_ready_for_review": 0,
+    }
+
+    if not isinstance(payload, dict):
+        return {
+            "valid": False,
+            "errors": ["payload must be a JSON object"],
+            "warnings": [],
+            "counts": counts,
+        }
+
+    required_top_level = [
+        "homefax_intake_standard_version",
+        "record_id",
+        "tenant_id",
+        "source",
+        "property",
+        "homeowner",
+        "inspection",
+        "original_report",
+        "processing",
+        "standard_findings",
+        "audit",
+    ]
+
+    for key in required_top_level:
+        if key not in payload:
+            errors.append(f"missing required top-level field: {key}")
+
+    version = _hf_intake_val_text(payload.get("homefax_intake_standard_version"))
+    if version != "1.0":
+        errors.append("homefax_intake_standard_version must be '1.0'")
+
+    if not _hf_intake_val_text(payload.get("record_id")):
+        errors.append("record_id is required")
+
+    if not _hf_intake_val_text(payload.get("tenant_id")):
+        errors.append("tenant_id is required")
+
+    object_fields = [
+        "source",
+        "property",
+        "homeowner",
+        "inspection",
+        "original_report",
+        "processing",
+        "audit",
+    ]
+
+    for key in object_fields:
+        if key in payload and not _hf_intake_val_is_obj(payload.get(key)):
+            errors.append(f"{key} must be an object")
+
+    standard_findings = payload.get("standard_findings")
+
+    if not _hf_intake_val_is_array(standard_findings):
+        errors.append("standard_findings must be an array")
+        standard_findings = []
+
+    counts["standard_findings"] = len(standard_findings)
+
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    property_obj = payload.get("property") if isinstance(payload.get("property"), dict) else {}
+    homeowner = payload.get("homeowner") if isinstance(payload.get("homeowner"), dict) else {}
+    original_report = payload.get("original_report") if isinstance(payload.get("original_report"), dict) else {}
+    processing = payload.get("processing") if isinstance(payload.get("processing"), dict) else {}
+
+    if not _hf_intake_val_text(source.get("source_system")):
+        warnings.append("source.source_system is blank")
+
+    if not _hf_intake_val_text(property_obj.get("address_full")):
+        errors.append("property.address_full is required")
+
+    if not _hf_intake_val_text(homeowner.get("email")):
+        warnings.append("homeowner.email is blank")
+
+    if not _hf_intake_val_text(original_report.get("file_name")):
+        errors.append("original_report.file_name is required")
+
+    if not _hf_intake_val_text(processing.get("pipeline_stage")):
+        warnings.append("processing.pipeline_stage is blank")
+
+    if processing.get("issues_count") not in ("", None):
+        try:
+            declared_count = int(processing.get("issues_count"))
+            if declared_count != len(standard_findings):
+                warnings.append(
+                    f"processing.issues_count ({declared_count}) does not match standard_findings length ({len(standard_findings)})"
+                )
+        except Exception:
+            warnings.append("processing.issues_count is not numeric")
+
+    allowed_image_statuses = {
+        "none",
+        "suggested",
+        "verified",
+        "mismatch",
+        "image_review_needed",
+    }
+
+    allowed_homeowner_decisions = {
+        "unreviewed",
+        "monitor",
+        "repair_needed",
+        "needs_contractor",
+        "wrong_photo",
+        "already_repaired",
+        "not_an_issue",
+    }
+
+    allowed_final_statuses = {
+        "not_approved",
+        "approved",
+        "rejected",
+    }
+
+    for index, finding in enumerate(standard_findings):
+        label = f"standard_findings[{index}]"
+
+        if not isinstance(finding, dict):
+            errors.append(f"{label} must be an object")
+            continue
+
+        finding_id = _hf_intake_val_text(finding.get("finding_id")) or f"index {index}"
+
+        source_obj = finding.get("source")
+        homefax_obj = finding.get("homefax")
+        evidence_obj = finding.get("evidence")
+        review_state = finding.get("review_state")
+        admin_state = finding.get("admin_state")
+        monitoring = finding.get("monitoring")
+
+        for section_name, section_value in [
+            ("source", source_obj),
+            ("homefax", homefax_obj),
+            ("evidence", evidence_obj),
+            ("review_state", review_state),
+            ("admin_state", admin_state),
+            ("monitoring", monitoring),
+        ]:
+            if not isinstance(section_value, dict):
+                errors.append(f"{label} ({finding_id}) missing or invalid object: {section_name}")
+
+        source_obj = source_obj if isinstance(source_obj, dict) else {}
+        homefax_obj = homefax_obj if isinstance(homefax_obj, dict) else {}
+        evidence_obj = evidence_obj if isinstance(evidence_obj, dict) else {}
+        review_state = review_state if isinstance(review_state, dict) else {}
+        admin_state = admin_state if isinstance(admin_state, dict) else {}
+        monitoring = monitoring if isinstance(monitoring, dict) else {}
+
+        if not _hf_intake_val_text(source_obj.get("source_finding_title")):
+            errors.append(f"{label} ({finding_id}) source.source_finding_title is required")
+
+        if not _hf_intake_val_text(source_obj.get("source_item_number")):
+            warnings.append(f"{label} ({finding_id}) source.source_item_number is blank")
+
+        if not _hf_intake_val_text(source_obj.get("source_finding_text")):
+            warnings.append(f"{label} ({finding_id}) source.source_finding_text is blank")
+
+        if not _hf_intake_val_text(homefax_obj.get("category")):
+            warnings.append(f"{label} ({finding_id}) homefax.category is blank")
+
+        if not _hf_intake_val_text(homefax_obj.get("system")):
+            warnings.append(f"{label} ({finding_id}) homefax.system is blank")
+
+        if not _hf_intake_val_text(homefax_obj.get("component")):
+            warnings.append(f"{label} ({finding_id}) homefax.component is blank")
+
+        candidate_image_urls = evidence_obj.get("candidate_image_urls")
+        if not isinstance(candidate_image_urls, list):
+            errors.append(f"{label} ({finding_id}) evidence.candidate_image_urls must be an array")
+        else:
+            counts["findings_with_candidate_images_array"] += 1
+
+        image_status = _hf_intake_val_text(evidence_obj.get("image_match_status")) or "none"
+        verified_image_url = _hf_intake_val_text(evidence_obj.get("verified_image_url"))
+
+        if image_status not in allowed_image_statuses:
+            errors.append(f"{label} ({finding_id}) invalid evidence.image_match_status: {image_status}")
+
+        if verified_image_url:
+            counts["findings_with_verified_images"] += 1
+
+        if verified_image_url and image_status != "verified":
+            errors.append(
+                f"{label} ({finding_id}) verified_image_url must be blank unless image_match_status is verified"
+            )
+
+        homeowner_decision = _hf_intake_val_text(review_state.get("homeowner_decision")) or "unreviewed"
+
+        if homeowner_decision not in allowed_homeowner_decisions:
+            errors.append(f"{label} ({finding_id}) invalid review_state.homeowner_decision: {homeowner_decision}")
+
+        if homeowner_decision != "unreviewed":
+            counts["findings_ready_for_review"] += 1
+
+        final_status = _hf_intake_val_text(admin_state.get("final_approval_status")) or "not_approved"
+        baseline_locked = _hf_intake_val_bool(admin_state.get("baseline_locked"), False)
+
+        if final_status not in allowed_final_statuses:
+            errors.append(f"{label} ({finding_id}) invalid admin_state.final_approval_status: {final_status}")
+
+        if baseline_locked:
+            counts["findings_baseline_locked"] += 1
+
+        if baseline_locked and final_status != "approved":
+            errors.append(
+                f"{label} ({finding_id}) baseline_locked cannot be true unless final_approval_status is approved"
+            )
+
+        alert_status = _hf_intake_val_text(monitoring.get("alert_status")) or "none"
+        allowed_alert_statuses = {
+            "none",
+            "active",
+            "sent",
+            "acknowledged",
+            "resolved",
+            "suppressed",
+        }
+
+        if alert_status not in allowed_alert_statuses:
+            warnings.append(f"{label} ({finding_id}) unknown monitoring.alert_status: {alert_status}")
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "counts": counts,
+    }
+
+
+@app.get("/homefax-intake-standard-validation-health")
+def homefax_intake_standard_validation_health():
+    """
+    Health check for HomeFax Intake Standard Validation Endpoint Pass 1.
+    """
+    return {
+        "success": True,
+        "service": "homefax_intake_standard_validation",
+        "version": "1.0",
+        "endpoints": [
+            "POST /homefax-intake-standard/validate-payload"
+        ],
+        "writes_to_database": False,
+        "calls_n8n": False,
+        "status": "ready",
+    }
+
+
+@app.post("/homefax-intake-standard/validate-payload")
+def homefax_intake_standard_validate_payload(payload: dict):
+    """
+    Validate a submitted HomeFax Intake Standard v1 payload.
+
+    This endpoint is intentionally read-only.
+    """
+    result = _hf_intake_validate_payload(payload)
+
+    return {
+        "success": True,
+        "validator_version": "homefax_intake_standard_validator_v1",
+        "payload_valid": result.get("valid"),
+        "errors_count": len(result.get("errors", [])),
+        "warnings_count": len(result.get("warnings", [])),
+        "errors": result.get("errors", []),
+        "warnings": result.get("warnings", []),
+        "counts": result.get("counts", {}),
+    }

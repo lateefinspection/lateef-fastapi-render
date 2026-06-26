@@ -13915,3 +13915,98 @@ def update_verified_issue_standard_review_action(
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Intake Standard API Preview Pass 1
+#
+# Purpose:
+# - Expose the official HomeFax Intake Standard v1 payload.
+# - Reuse the existing clean-v4 standard preview output.
+# - Reuse tools/homefax_intake_standard_mapper_v1.py mapping logic.
+#
+# Safety:
+# - Preview only.
+# - No database writes.
+# - No n8n calls.
+# - No dashboard changes.
+# ============================================================
+
+@app.get("/homefax-intake-standard-api-health")
+def homefax_intake_standard_api_health():
+    """
+    Health check for HomeFax Intake Standard API Preview Pass 1.
+    """
+    return {
+        "success": True,
+        "service": "homefax_intake_standard_api_preview",
+        "version": "1.0",
+        "endpoints": [
+            "/records/{record_id}/homefax-intake-standard-preview-v1"
+        ],
+        "writes_to_database": False,
+        "calls_n8n": False,
+        "status": "ready",
+    }
+
+
+@app.get("/records/{record_id}/homefax-intake-standard-preview-v1")
+def homefax_intake_standard_preview_v1(record_id: str, limit: int = 100):
+    """
+    Build a HomeFax Intake Standard v1 preview payload from the current
+    HomeFax standard clean-v4 preview endpoint.
+
+    This endpoint is intentionally read-only.
+    """
+    try:
+        from tools.homefax_intake_standard_mapper_v1 import build_homefax_intake_payload
+
+        if limit < 1:
+            limit = 1
+
+        if limit > 500:
+            limit = 500
+
+        # Reuse the existing standard preview function that powers the dashboard.
+        preview_payload = homefax_standard_report_preview_clean_v4(
+            record_id=record_id,
+            limit=limit,
+        )
+
+        if not isinstance(preview_payload, dict):
+            return {
+                "success": False,
+                "error": "clean_v4_preview_returned_non_dict",
+                "record_id": record_id,
+            }
+
+        if preview_payload.get("success") is not True:
+            return {
+                "success": False,
+                "error": "clean_v4_preview_failed",
+                "record_id": record_id,
+                "clean_v4_preview": preview_payload,
+            }
+
+        mapped_payload = build_homefax_intake_payload(
+            preview_payload=preview_payload,
+            record_id=record_id,
+            tenant_id="lateef-home-inspection",
+        )
+
+        return {
+            "success": True,
+            "preview_version": "homefax_intake_standard_preview_v1",
+            "record_id": record_id,
+            "homefax_intake_standard_version": mapped_payload.get("homefax_intake_standard_version"),
+            "issues_count": mapped_payload.get("processing", {}).get("issues_count"),
+            "candidate_images_count": mapped_payload.get("processing", {}).get("candidate_images_count"),
+            "payload": mapped_payload,
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": "homefax_intake_standard_preview_v1_failed",
+            "record_id": record_id,
+            "detail": str(exc),
+        }

@@ -1,0 +1,125 @@
+{
+  "plan_version": "1.0",
+  "workflow_name": "homefax-intake-standard-v1",
+  "purpose": "Define the n8n workflow nodes for HomeFax Intake Standard v1.",
+  "guardrails": {
+    "n8n_must_not": [
+      "final_approve_issues",
+      "baseline_lock_issues",
+      "verify_images",
+      "set_verified_image_url_for_suggested_images",
+      "convert_candidate_image_urls_to_string",
+      "remove_source_finding_text",
+      "overwrite_homeowner_decisions",
+      "overwrite_admin_decisions"
+    ]
+  },
+  "nodes": [
+    {
+      "order": 1,
+      "name": "Webhook Intake",
+      "type": "Webhook",
+      "method": "POST",
+      "path": "/homefax-intake-standard-v1",
+      "purpose": "Receive upload or intake metadata from Zite, Fillout, manual admin upload, or test tools."
+    },
+    {
+      "order": 2,
+      "name": "Normalize Intake Metadata",
+      "type": "Code",
+      "purpose": "Normalize property, homeowner, source, report, and tenant metadata."
+    },
+    {
+      "order": 3,
+      "name": "Ensure Record ID",
+      "type": "Code",
+      "purpose": "Guarantee one stable record_id is used throughout the workflow."
+    },
+    {
+      "order": 4,
+      "name": "Call FastAPI Analyze Report",
+      "type": "HTTP Request",
+      "method": "POST",
+      "endpoint": "/analyze-report/",
+      "purpose": "Parse PDF, detect adapter, extract findings, and collect image candidates."
+    },
+    {
+      "order": 5,
+      "name": "Call FastAPI Process Inspection",
+      "type": "HTTP Request",
+      "method": "POST",
+      "endpoint": "/process-inspection",
+      "purpose": "Store extracted findings as verified issues or standard findings."
+    },
+    {
+      "order": 6,
+      "name": "Call Intake Standard Preview",
+      "type": "HTTP Request",
+      "method": "GET",
+      "endpoint": "/records/{{record_id}}/homefax-intake-standard-preview-v1?limit=100",
+      "purpose": "Return the official HomeFax Intake Standard v1 payload."
+    },
+    {
+      "order": 7,
+      "name": "Extract Payload",
+      "type": "Code",
+      "purpose": "Extract response.payload and prepare it for validation."
+    },
+    {
+      "order": 8,
+      "name": "Validate Payload",
+      "type": "HTTP Request",
+      "method": "POST",
+      "endpoint": "/homefax-intake-standard/validate-payload",
+      "purpose": "Validate the HomeFax Intake Standard payload."
+    },
+    {
+      "order": 9,
+      "name": "IF Payload Valid",
+      "type": "IF",
+      "condition": {
+        "payload_valid": true,
+        "errors_count": 0
+      },
+      "purpose": "Branch valid payloads to dashboard response and invalid payloads to error response."
+    },
+    {
+      "order": 10,
+      "name": "Return Dashboard URL",
+      "type": "Respond to Webhook",
+      "branch": "valid",
+      "purpose": "Return record_id and dashboard_url quickly."
+    },
+    {
+      "order": 11,
+      "name": "Return Validation Errors",
+      "type": "Respond to Webhook",
+      "branch": "invalid",
+      "purpose": "Return validation errors and stop review-ready processing."
+    },
+    {
+      "order": 12,
+      "name": "Trigger Async S3 Finalization",
+      "type": "HTTP Request",
+      "method": "POST",
+      "endpoint": "/records/{{record_id}}/finalize-s3-images",
+      "branch": "valid_after_response_or_parallel",
+      "purpose": "Finalize S3 image storage without blocking the initial dashboard response."
+    }
+  ],
+  "success_response": {
+    "success": true,
+    "record_id": "{{record_id}}",
+    "dashboard_url": "https://homefax-dashboard.onrender.com/?record_id={{record_id}}",
+    "payload_valid": true,
+    "next_step": "Open dashboard_url to review verified issues. Images may finalize shortly."
+  },
+  "failure_response": {
+    "success": false,
+    "record_id": "{{record_id}}",
+    "payload_valid": false,
+    "errors": [],
+    "warnings": [],
+    "next_step": "Fix payload mapping before sending this inspection into review."
+  }
+}

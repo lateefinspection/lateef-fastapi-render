@@ -16,6 +16,15 @@ Webhook Intake
 → Validate Payload
 → Return Dashboard URL or Validation Errors
 
+## Confirmed workflow sync note
+
+During HomeFax Intake Standard n8n Workflow Build Pass 1, the live n8n workflow proved that response nodes must preserve `record_id` from the original Webhook body.
+
+The working Code node pattern is:
+
+```javascript
+$("Webhook").first().json.body
+
 ---
 
 ## Template files

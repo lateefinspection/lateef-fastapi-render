@@ -1,0 +1,156 @@
+{
+  "template_version": "1.0",
+  "name": "HomeFax Intake Standard n8n HTTP Request Templates v1",
+  "fastapi_base_urls": {
+    "local": "http://127.0.0.1:8000",
+    "production": "https://lateef-fastapi-docker.onrender.com",
+    "recommended_env_var": "FASTAPI_BASE_URL"
+  },
+  "http_request_nodes": [
+    {
+      "order": 1,
+      "name": "Call FastAPI Analyze Report",
+      "type": "HTTP Request",
+      "method": "POST",
+      "path": "/analyze-report/",
+      "url_expression": "{{$env.FASTAPI_BASE_URL}}/analyze-report/",
+      "body_type": "multipart_form_data",
+      "required_inputs": [
+        {
+          "field": "file",
+          "type": "binary_file",
+          "description": "Inspection PDF binary"
+        }
+      ],
+      "expected_response_fields": [
+        "success",
+        "detectedAdapter",
+        "findings_count",
+        "issuesWithImagesCount",
+        "findings",
+        "extractedIssues"
+      ],
+      "success_condition": {
+        "success": true
+      },
+      "failure_behavior": [
+        "stop_workflow",
+        "return_parser_error",
+        "do_not_call_process_inspection"
+      ]
+    },
+    {
+      "order": 2,
+      "name": "Call FastAPI Process Inspection",
+      "type": "HTTP Request",
+      "method": "POST",
+      "path": "/process-inspection",
+      "url_expression": "{{$env.FASTAPI_BASE_URL}}/process-inspection",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body_type": "json",
+      "required_body_fields": [
+        "record_id",
+        "tenant_id",
+        "property",
+        "homeowner",
+        "inspection",
+        "original_report",
+        "findings"
+      ],
+      "preserve_fields": [
+        "candidate_image_urls",
+        "image_url",
+        "image_match_status",
+        "source_finding_text",
+        "source_item_number",
+        "source_page"
+      ],
+      "must_not_set": [
+        "verified_image_url",
+        "baseline_locked",
+        "final_approval_status"
+      ],
+      "expected_response_fields": [
+        "success",
+        "record_id",
+        "created",
+        "updated",
+        "issues"
+      ]
+    },
+    {
+      "order": 3,
+      "name": "Call Intake Standard Preview",
+      "type": "HTTP Request",
+      "method": "GET",
+      "path": "/records/{{record_id}}/homefax-intake-standard-preview-v1?limit=100",
+      "url_expression": "{{$env.FASTAPI_BASE_URL}}/records/{{$json.record_id}}/homefax-intake-standard-preview-v1?limit=100",
+      "expected_response_fields": [
+        "success",
+        "payload"
+      ],
+      "success_condition": {
+        "success": true,
+        "payload_exists": true
+      },
+      "next_node": "Extract Payload"
+    },
+    {
+      "order": 4,
+      "name": "Validate Payload",
+      "type": "HTTP Request",
+      "method": "POST",
+      "path": "/homefax-intake-standard/validate-payload",
+      "url_expression": "{{$env.FASTAPI_BASE_URL}}/homefax-intake-standard/validate-payload",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body_type": "json",
+      "body_source": "full_json_from_extract_payload_node",
+      "expected_valid_response": {
+        "success": true,
+        "payload_valid": true,
+        "errors_count": 0
+      },
+      "valid_branch_condition": {
+        "payload_valid": true,
+        "errors_count": 0
+      },
+      "invalid_branch_condition": {
+        "payload_valid": false,
+        "errors_count_greater_than": 0
+      }
+    },
+    {
+      "order": 5,
+      "name": "Trigger Async S3 Finalization",
+      "type": "HTTP Request",
+      "method": "POST",
+      "path": "/records/{{record_id}}/finalize-s3-images",
+      "url_expression": "{{$env.FASTAPI_BASE_URL}}/records/{{$json.record_id}}/finalize-s3-images",
+      "body_type": "json",
+      "body": {
+        "record_id": "{{$json.record_id}}",
+        "triggered_by": "n8n",
+        "reason": "homefax_intake_standard_validated"
+      },
+      "rules": [
+        "do_not_block_initial_dashboard_response",
+        "run_after_validation_passes",
+        "log_finalization_result_separately",
+        "do_not_invalidate_intake_if_s3_finalization_fails"
+      ]
+    }
+  ],
+  "critical_guardrails": [
+    "do_not_flatten_candidate_image_urls",
+    "do_not_overwrite_verified_image_url",
+    "do_not_set_image_match_status_verified",
+    "do_not_set_baseline_locked_true",
+    "do_not_set_final_approval_status_approved",
+    "do_not_remove_original_inspector_finding_text",
+    "do_not_remove_source_page_data"
+  ]
+}

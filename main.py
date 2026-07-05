@@ -10,6 +10,10 @@ import json
 import uuid
 import hashlib
 import subprocess
+try:
+    from tools.candidate_image_filter_v1 import clean_issue_candidate_images
+except Exception:
+    clean_issue_candidate_images = None
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1906,8 +1910,33 @@ def process_inspection(data: InspectionProcessRequest):
                     clean_candidate_image_urls.append(candidate_url)
 
             candidate_image_urls = clean_candidate_image_urls
-            candidate_image_urls_json = to_json_or_none(candidate_image_urls)
 
+            # Candidate Image Cleanup / Decorative Image Filter Pass 2
+            # Remove obvious decorative/report assets before storing new records.
+            # Product safety rules:
+            # - candidate_image_urls remains an array
+            # - verified_image_url is not changed
+            # - image_match_status is not marked verified
+            # - S3 files are not deleted
+            if clean_issue_candidate_images:
+                try:
+                    image_cleanup_issue = {
+                        "image_url": image_url,
+                        "candidate_image_urls": candidate_image_urls,
+                    }
+
+                    image_cleanup_issue = clean_issue_candidate_images(image_cleanup_issue)
+
+                    candidate_image_urls = image_cleanup_issue.get("candidate_image_urls") or []
+
+                    cleaned_image_url = image_cleanup_issue.get("image_url")
+                    if cleaned_image_url:
+                        image_url = cleaned_image_url
+
+                except Exception as image_cleanup_error:
+                    print("CANDIDATE IMAGE CLEANUP WARNING:", image_cleanup_error)
+
+            candidate_image_urls_json = to_json_or_none(candidate_image_urls)
             dedupe_key = make_dedupe_key(record_id, finding, title, section)
             alert_key = f"{dedupe_key}:alert"
             task_key = f"{dedupe_key}:task"

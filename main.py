@@ -321,6 +321,8 @@ class InspectionProcessRequest(BaseModel):
     property_address: Optional[str] = ""
     inspection_id: Optional[str] = ""
     skip_s3_upload: bool = False
+    processing_mode: Optional[str] = ""
+    skip_notifications: bool = False
     findings: List[Finding]
 
 
@@ -1831,6 +1833,15 @@ def process_inspection(data: InspectionProcessRequest):
         findings = [model_to_dict(finding) for finding in (data.findings or [])]
         skip_s3_upload = bool(getattr(data, "skip_s3_upload", False))
 
+        processing_mode = clean_text(getattr(data, "processing_mode", "")).lower()
+        skip_notifications = bool(getattr(data, "skip_notifications", False))
+
+        if processing_mode == "test":
+            skip_notifications = True
+
+        if skip_notifications:
+            print(f"NOTIFICATION INFO: notifications suppressed for record_id={record_id}")
+
         if skip_s3_upload:
             print(f"S3 IMAGE INFO: skipping inline S3 upload for record_id={record_id}")
         else:
@@ -1954,12 +1965,19 @@ def process_inspection(data: InspectionProcessRequest):
                 alerts_created += 1
 
                 if severity in ["high", "critical"]:
-                    notify_record_owner(
-                        record_id,
-                        f"HomeFax Alert: {title}",
-                        f"{title} detected at {section}. {summary}",
-                    )
-
+                    if skip_notifications:
+                        print(
+                            "NOTIFICATION SUPPRESSED",
+                            f"record_id={record_id}",
+                            f"severity={severity}",
+                            f"title={title}",
+                        )
+                    else:
+                        notify_record_owner(
+                            record_id,
+                            f"HomeFax Alert: {title}",
+                            f"{title} detected at {section}. {summary}",
+                        )
             cursor.execute(
                 """
                 INSERT IGNORE INTO automation_tasks

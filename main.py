@@ -2555,6 +2555,15 @@ def update_issue_image_verification(issue_id: int, update: ImageVerificationUpda
     admin_note = clean_text(update.admin_note or "")
     needs_image_review = "no" if status == "verified" else "yes"
 
+    if status == "verified":
+        admin_image_decision = "approved"
+    elif status == "mismatch":
+        admin_image_decision = "mismatch"
+    elif status == "suggested":
+        admin_image_decision = "needs_review"
+    else:
+        admin_image_decision = "pending"
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -2584,6 +2593,7 @@ def update_issue_image_verification(issue_id: int, update: ImageVerificationUpda
                 image_match_status = %s,
                 verified_image_url = %s,
                 needs_image_review = %s,
+                admin_image_decision = %s,
                 admin_note = CASE
                     WHEN %s != '' THEN %s
                     ELSE admin_note
@@ -2595,6 +2605,7 @@ def update_issue_image_verification(issue_id: int, update: ImageVerificationUpda
                 status,
                 verified_image_url,
                 needs_image_review,
+                admin_image_decision,
                 admin_note,
                 admin_note,
                 issue_id,

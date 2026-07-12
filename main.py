@@ -14633,3 +14633,763 @@ def homefax_intake_standard_validate_payload(payload: dict):
         "warnings": result.get("warnings", []),
         "counts": result.get("counts", {}),
     }
+
+
+# ============================================================
+# HomeFax Monitoring Lifecycle Backend Pass 1
+#
+# Purpose:
+# - Create durable monitoring plans from locked HomeFax issues.
+# - Accept normalized device/manual monitoring events.
+# - Keep the device system future-proof by using provider/capability/event records.
+#
+# Product rules:
+# - Admin verifies HomeFax record quality.
+# - Admin does not manage contractor decisions.
+# - All devices feed monitoring events.
+# - Device data becomes HomeFax monitoring timeline data, not a separate dashboard island.
+#
+# New endpoints:
+# GET  /monitoring-lifecycle-health
+# POST /monitoring-lifecycle/init
+# POST /monitoring-plans/from-issue/{issue_id}
+# GET  /monitoring-plans/{record_id}
+# POST /integration-events/mock
+# GET  /monitoring-events/{record_id}
+# ============================================================
+
+import json as _hf_mon_json
+import datetime as _hf_mon_datetime
+from typing import Any as _hf_mon_Any
+from typing import Dict as _hf_mon_Dict
+from typing import List as _hf_mon_List
+from typing import Optional as _hf_mon_Optional
+
+from fastapi import HTTPException as _hf_mon_HTTPException
+from pydantic import BaseModel as _hf_mon_BaseModel
+
+
+def _hf_mon_safe_text(value) -> str:
+    return str(value or "").replace("\x00", " ").strip()
+
+
+def _hf_mon_one_line(value) -> str:
+    return " ".join(_hf_mon_safe_text(value).split())
+
+
+def _hf_mon_to_json(value) -> str:
+    if value is None:
+        value = []
+    return _hf_mon_json.dumps(value, ensure_ascii=False)
+
+
+def _hf_mon_parse_json(value, fallback=None):
+    if fallback is None:
+        fallback = []
+
+    if value is None:
+        return fallback
+
+    if isinstance(value, (list, dict)):
+        return value
+
+    text = str(value).strip()
+
+    if not text:
+        return fallback
+
+    try:
+        return _hf_mon_json.loads(text)
+    except Exception:
+        return fallback
+
+
+def _hf_mon_now_string() -> str:
+    return _hf_mon_datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hf_mon_get_connection():
+    """
+    Reuse whichever DB connection helper exists in the current main.py.
+    This keeps the patch compatible with the existing backend structure.
+    """
+
+    for name in (
+        "_hf_report_db_connection",
+        "_hf_loc_get_connection",
+        "get_db_connection",
+        "get_connection",
+        "db_connection",
+    ):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn()
+
+    raise RuntimeError("No database connection helper found for monitoring lifecycle.")
+
+
+def _hf_mon_rows_as_dicts(cursor, rows):
+    if not rows:
+        return []
+
+    first = rows[0]
+
+    if isinstance(first, dict):
+        return rows
+
+    columns = [desc[0] for desc in cursor.description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def _hf_mon_fetch_all(sql: str, params=None):
+    conn = _hf_mon_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params or ())
+            rows = cursor.fetchall() or []
+            return _hf_mon_rows_as_dicts(cursor, rows)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_mon_fetch_one(sql: str, params=None):
+    rows = _hf_mon_fetch_all(sql, params)
+    return rows[0] if rows else None
+
+
+def _hf_mon_execute(sql: str, params=None):
+    conn = _hf_mon_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params or ())
+            last_id = getattr(cursor, "lastrowid", None)
+        conn.commit()
+        return last_id
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _hf_mon_try_execute(sql: str, params=None):
+    try:
+        return {
+            "ok": True,
+            "last_id": _hf_mon_execute(sql, params),
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "last_id": None,
+            "error": str(exc),
+        }
+
+
+def _hf_mon_ensure_schema():
+    """
+    Create monitoring tables and add optional monitoring fields to verified_issues.
+    This endpoint is safe to call repeatedly.
+    """
+
+    results = []
+
+    ddl_statements = [
+        """
+        CREATE TABLE IF NOT EXISTS monitoring_plans (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          tenant_id VARCHAR(128) NOT NULL DEFAULT 'lateef-home-inspection',
+          property_id VARCHAR(128) DEFAULT '',
+          record_id VARCHAR(255) NOT NULL,
+          source_issue_id BIGINT NOT NULL,
+          system VARCHAR(255) DEFAULT '',
+          component VARCHAR(255) DEFAULT '',
+          location VARCHAR(255) DEFAULT '',
+          risk_type VARCHAR(128) DEFAULT '',
+          allowed_capabilities JSON NULL,
+          monitoring_plan_text TEXT NULL,
+          status VARCHAR(64) DEFAULT 'active',
+          created_from VARCHAR(128) DEFAULT 'admin_final_lock',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY uniq_monitoring_source_issue (source_issue_id),
+          INDEX idx_monitoring_record_id (record_id),
+          INDEX idx_monitoring_status (status),
+          INDEX idx_monitoring_risk_type (risk_type)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS user_integrations (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          tenant_id VARCHAR(128) NOT NULL DEFAULT 'lateef-home-inspection',
+          user_id VARCHAR(128) DEFAULT '',
+          property_id VARCHAR(128) DEFAULT '',
+          provider VARCHAR(128) NOT NULL,
+          provider_display_name VARCHAR(255) DEFAULT '',
+          connection_type VARCHAR(64) DEFAULT '',
+          capabilities JSON NULL,
+          status VARCHAR(64) DEFAULT 'disconnected',
+          access_token_encrypted TEXT NULL,
+          refresh_token_encrypted TEXT NULL,
+          last_sync_at TIMESTAMP NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_user_integrations_property (property_id),
+          INDEX idx_user_integrations_provider (provider),
+          INDEX idx_user_integrations_status (status)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS property_device_locations (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          tenant_id VARCHAR(128) NOT NULL DEFAULT 'lateef-home-inspection',
+          property_id VARCHAR(128) DEFAULT '',
+          provider VARCHAR(128) DEFAULT '',
+          device_id VARCHAR(255) DEFAULT '',
+          device_name VARCHAR(255) DEFAULT '',
+          location VARCHAR(255) DEFAULT '',
+          system VARCHAR(255) DEFAULT '',
+          component VARCHAR(255) DEFAULT '',
+          capabilities JSON NULL,
+          status VARCHAR(64) DEFAULT 'active',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_device_locations_property (property_id),
+          INDEX idx_device_locations_provider_device (provider, device_id),
+          INDEX idx_device_locations_status (status)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS integration_events (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          tenant_id VARCHAR(128) NOT NULL DEFAULT 'lateef-home-inspection',
+          property_id VARCHAR(128) DEFAULT '',
+          record_id VARCHAR(255) DEFAULT '',
+          user_integration_id BIGINT NULL,
+          monitoring_plan_id BIGINT NULL,
+          source_issue_id BIGINT NULL,
+          source_type VARCHAR(64) NOT NULL DEFAULT 'device_event',
+          provider VARCHAR(128) DEFAULT '',
+          device_id VARCHAR(255) DEFAULT '',
+          device_name VARCHAR(255) DEFAULT '',
+          capability VARCHAR(128) DEFAULT '',
+          system VARCHAR(255) DEFAULT '',
+          component VARCHAR(255) DEFAULT '',
+          location VARCHAR(255) DEFAULT '',
+          title VARCHAR(255) DEFAULT '',
+          summary TEXT NULL,
+          severity VARCHAR(64) DEFAULT 'info',
+          event_status VARCHAR(64) DEFAULT 'unreviewed',
+          homeowner_acknowledged VARCHAR(16) DEFAULT 'no',
+          homeowner_note TEXT NULL,
+          raw_payload JSON NULL,
+          occurred_at TIMESTAMP NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_integration_events_record (record_id),
+          INDEX idx_integration_events_plan (monitoring_plan_id),
+          INDEX idx_integration_events_issue (source_issue_id),
+          INDEX idx_integration_events_capability (capability),
+          INDEX idx_integration_events_status (event_status)
+        )
+        """,
+    ]
+
+    for statement in ddl_statements:
+        results.append(_hf_mon_try_execute(statement))
+
+    # Optional workflow columns on verified_issues.
+    # Duplicate-column errors are safe and expected after first run.
+    optional_alters = [
+        "ALTER TABLE verified_issues ADD COLUMN admin_decision VARCHAR(128) NULL",
+        "ALTER TABLE verified_issues ADD COLUMN monitoring_required VARCHAR(16) DEFAULT 'no'",
+        "ALTER TABLE verified_issues ADD COLUMN monitoring_plan_id BIGINT NULL",
+    ]
+
+    for statement in optional_alters:
+        result = _hf_mon_try_execute(statement)
+
+        if not result["ok"] and "Duplicate column" in result["error"]:
+            result["ok"] = True
+            result["error"] = "already_exists"
+
+        results.append(result)
+
+    return results
+
+
+def _hf_mon_get_issue(issue_id: int):
+    issue = _hf_mon_fetch_one(
+        "SELECT * FROM verified_issues WHERE id = %s LIMIT 1",
+        (int(issue_id),),
+    )
+
+    if not issue:
+        raise _hf_mon_HTTPException(status_code=404, detail=f"Verified issue {issue_id} not found.")
+
+    return issue
+
+
+def _hf_mon_normalized_decision(issue: dict) -> str:
+    return _hf_mon_one_line(
+        issue.get("homeowner_decision")
+        or issue.get("homeowner_review_decision")
+        or ""
+    ).lower()
+
+
+def _hf_mon_issue_should_monitor(issue: dict, force: bool = False) -> bool:
+    if force:
+        return True
+
+    decision = _hf_mon_normalized_decision(issue)
+    current_status = _hf_mon_one_line(issue.get("current_status") or issue.get("status")).lower()
+    monitoring_required = _hf_mon_one_line(issue.get("monitoring_required")).lower()
+
+    return (
+        decision in {"monitor", "monitor_this", "monitoring"}
+        or current_status == "monitoring"
+        or monitoring_required in {"yes", "true", "1"}
+    )
+
+
+def _hf_mon_infer_system(issue: dict) -> str:
+    return _hf_mon_one_line(
+        issue.get("standard_system")
+        or issue.get("system")
+        or issue.get("section")
+        or issue.get("source_report_section")
+        or ""
+    )
+
+
+def _hf_mon_infer_component(issue: dict) -> str:
+    return _hf_mon_one_line(
+        issue.get("standard_component")
+        or issue.get("component")
+        or issue.get("source_report_section")
+        or ""
+    )
+
+
+def _hf_mon_infer_location(issue: dict) -> str:
+    return _hf_mon_one_line(
+        issue.get("standard_location_area")
+        or issue.get("location")
+        or issue.get("area")
+        or issue.get("room")
+        or issue.get("source_report_section")
+        or ""
+    )
+
+
+def _hf_mon_infer_monitoring_text(issue: dict) -> str:
+    return _hf_mon_one_line(
+        issue.get("standard_monitoring_plan")
+        or issue.get("monitoring_plan")
+        or "Monitor this issue for changes, recurrence, worsening conditions, or related device alerts."
+    )
+
+
+def _hf_mon_infer_risk_type(issue: dict) -> str:
+    haystack = " ".join([
+        _hf_mon_one_line(issue.get("title")).lower(),
+        _hf_mon_one_line(issue.get("summary")).lower(),
+        _hf_mon_infer_system(issue).lower(),
+        _hf_mon_infer_component(issue).lower(),
+        _hf_mon_infer_location(issue).lower(),
+    ])
+
+    if any(token in haystack for token in ["leak", "water", "plumbing", "moisture", "sump", "drain"]):
+        return "water_moisture"
+
+    if any(token in haystack for token in ["mold", "humidity", "air quality", "radon", "iaq", "co2", "voc"]):
+        return "indoor_air_quality"
+
+    if any(token in haystack for token in ["electrical", "gfci", "breaker", "panel", "wire", "outlet"]):
+        return "electrical"
+
+    if any(token in haystack for token in ["hvac", "furnace", "air conditioner", "thermostat", "heating", "cooling"]):
+        return "hvac"
+
+    if any(token in haystack for token in ["foundation", "settlement", "crack", "structural", "soil"]):
+        return "structural"
+
+    if any(token in haystack for token in ["roof", "gutter", "downspout", "flashing", "wind", "rain"]):
+        return "weather_envelope"
+
+    return "general_monitoring"
+
+
+def _hf_mon_allowed_capabilities(risk_type: str):
+    mapping = {
+        "water_moisture": ["WATER_LEAK", "WATER_SHUTOFF", "MOISTURE", "HUMIDITY", "PHOTO_EVIDENCE"],
+        "indoor_air_quality": ["HUMIDITY", "MOLD_RISK", "RADON", "CO2", "VOC", "AIR_QUALITY", "PHOTO_EVIDENCE"],
+        "electrical": ["ELECTRICAL_LOAD", "ELECTRICAL_ANOMALY", "PHOTO_EVIDENCE"],
+        "hvac": ["TEMPERATURE", "THERMAL", "HVAC_RUNTIME", "HUMIDITY", "PHOTO_EVIDENCE"],
+        "structural": ["FOUNDATION_MOVEMENT", "SOIL_MOISTURE", "PHOTO_EVIDENCE", "VIDEO_EVIDENCE"],
+        "weather_envelope": ["WEATHER_RAIN", "WEATHER_WIND", "MOISTURE", "PHOTO_EVIDENCE"],
+        "general_monitoring": ["PHOTO_EVIDENCE", "DOCUMENT_EVIDENCE", "MANUAL_CHECK"],
+    }
+
+    return mapping.get(risk_type, mapping["general_monitoring"])
+
+
+def _hf_mon_find_plan_by_issue(issue_id: int):
+    return _hf_mon_fetch_one(
+        """
+        SELECT *
+        FROM monitoring_plans
+        WHERE source_issue_id = %s
+        LIMIT 1
+        """,
+        (int(issue_id),),
+    )
+
+
+def _hf_mon_find_plan_by_id(plan_id: int):
+    return _hf_mon_fetch_one(
+        """
+        SELECT *
+        FROM monitoring_plans
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (int(plan_id),),
+    )
+
+
+def _hf_mon_create_or_update_plan_from_issue(issue_id: int, force: bool = False):
+    _hf_mon_ensure_schema()
+
+    issue = _hf_mon_get_issue(issue_id)
+
+    if not _hf_mon_issue_should_monitor(issue, force=force):
+        raise _hf_mon_HTTPException(
+            status_code=409,
+            detail="This issue is not marked for monitoring. Use force=true only for admin backfill or repair.",
+        )
+
+    record_id = _hf_mon_one_line(issue.get("record_id"))
+    tenant_id = _hf_mon_one_line(issue.get("tenant_id") or "lateef-home-inspection")
+    property_id = _hf_mon_one_line(issue.get("property_id") or "")
+    system = _hf_mon_infer_system(issue)
+    component = _hf_mon_infer_component(issue)
+    location = _hf_mon_infer_location(issue)
+    risk_type = _hf_mon_infer_risk_type(issue)
+    allowed_capabilities = _hf_mon_allowed_capabilities(risk_type)
+    monitoring_plan_text = _hf_mon_infer_monitoring_text(issue)
+
+    _hf_mon_execute(
+        """
+        INSERT INTO monitoring_plans (
+          tenant_id,
+          property_id,
+          record_id,
+          source_issue_id,
+          system,
+          component,
+          location,
+          risk_type,
+          allowed_capabilities,
+          monitoring_plan_text,
+          status,
+          created_from
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSON), %s, 'active', 'admin_final_lock')
+        ON DUPLICATE KEY UPDATE
+          tenant_id = VALUES(tenant_id),
+          property_id = VALUES(property_id),
+          record_id = VALUES(record_id),
+          system = VALUES(system),
+          component = VALUES(component),
+          location = VALUES(location),
+          risk_type = VALUES(risk_type),
+          allowed_capabilities = VALUES(allowed_capabilities),
+          monitoring_plan_text = VALUES(monitoring_plan_text),
+          status = 'active',
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            tenant_id,
+            property_id,
+            record_id,
+            int(issue_id),
+            system,
+            component,
+            location,
+            risk_type,
+            _hf_mon_to_json(allowed_capabilities),
+            monitoring_plan_text,
+        ),
+    )
+
+    plan = _hf_mon_find_plan_by_issue(issue_id)
+
+    if plan:
+        _hf_mon_try_execute(
+            """
+            UPDATE verified_issues
+            SET
+              monitoring_required = 'yes',
+              monitoring_plan_id = %s,
+              current_status = CASE
+                WHEN COALESCE(current_status, '') IN ('', 'open', 'active') THEN 'monitoring'
+                ELSE current_status
+              END,
+              updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+            """,
+            (plan["id"], int(issue_id)),
+        )
+
+    return {
+        "issue": issue,
+        "plan": plan,
+        "allowed_capabilities": allowed_capabilities,
+    }
+
+
+class _HFMonCreatePlanRequest(_hf_mon_BaseModel):
+    force: bool = False
+
+
+class _HFMonMockEventRequest(_hf_mon_BaseModel):
+    record_id: _hf_mon_Optional[str] = ""
+    monitoring_plan_id: _hf_mon_Optional[int] = None
+    source_issue_id: _hf_mon_Optional[int] = None
+    tenant_id: _hf_mon_Optional[str] = "lateef-home-inspection"
+    property_id: _hf_mon_Optional[str] = ""
+    source_type: _hf_mon_Optional[str] = "device_event"
+    provider: _hf_mon_Optional[str] = "manual"
+    device_id: _hf_mon_Optional[str] = ""
+    device_name: _hf_mon_Optional[str] = ""
+    capability: _hf_mon_Optional[str] = "MANUAL_CHECK"
+    system: _hf_mon_Optional[str] = ""
+    component: _hf_mon_Optional[str] = ""
+    location: _hf_mon_Optional[str] = ""
+    title: _hf_mon_Optional[str] = "Manual monitoring event"
+    summary: _hf_mon_Optional[str] = ""
+    severity: _hf_mon_Optional[str] = "info"
+    event_status: _hf_mon_Optional[str] = "unreviewed"
+    homeowner_acknowledged: _hf_mon_Optional[str] = "no"
+    homeowner_note: _hf_mon_Optional[str] = ""
+    raw_payload: _hf_mon_Optional[_hf_mon_Dict[str, _hf_mon_Any]] = None
+    occurred_at: _hf_mon_Optional[str] = None
+
+
+@app.get("/monitoring-lifecycle-health")
+def monitoring_lifecycle_health():
+    table_checks = {}
+
+    for table_name in (
+        "monitoring_plans",
+        "integration_events",
+        "property_device_locations",
+        "user_integrations",
+    ):
+        try:
+            row = _hf_mon_fetch_one(f"SELECT COUNT(*) AS count_value FROM {table_name}")
+            table_checks[table_name] = {
+                "ok": True,
+                "count": row.get("count_value") if row else 0,
+            }
+        except Exception as exc:
+            table_checks[table_name] = {
+                "ok": False,
+                "error": str(exc),
+            }
+
+    return {
+        "success": True,
+        "service": "homefax_monitoring_lifecycle",
+        "schema_hint": "call POST /monitoring-lifecycle/init if any table check is false",
+        "tables": table_checks,
+    }
+
+
+@app.post("/monitoring-lifecycle/init")
+def monitoring_lifecycle_init():
+    results = _hf_mon_ensure_schema()
+    failed = [item for item in results if not item.get("ok")]
+
+    return {
+        "success": len(failed) == 0,
+        "message": (
+            "Monitoring lifecycle schema initialized."
+            if not failed
+            else "Monitoring lifecycle schema initialization failed for one or more operations."
+        ),
+        "failed_count": len(failed),
+        "results": results,
+    }
+
+
+@app.post("/monitoring-plans/from-issue/{issue_id}")
+def monitoring_plan_from_issue(issue_id: int, request: _HFMonCreatePlanRequest = _HFMonCreatePlanRequest()):
+    result = _hf_mon_create_or_update_plan_from_issue(issue_id, force=bool(request.force))
+
+    return {
+        "success": True,
+        "message": "Monitoring plan created or updated from verified issue.",
+        "issue_id": issue_id,
+        "monitoring_plan": result["plan"],
+        "allowed_capabilities": result["allowed_capabilities"],
+    }
+
+
+@app.get("/monitoring-plans/{record_id}")
+def monitoring_plans_for_record(record_id: str):
+    _hf_mon_ensure_schema()
+
+    plans = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM monitoring_plans
+        WHERE record_id = %s
+        ORDER BY id ASC
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    for plan in plans:
+        plan["allowed_capabilities"] = _hf_mon_parse_json(plan.get("allowed_capabilities"), [])
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "count": len(plans),
+        "monitoring_plans": plans,
+    }
+
+
+@app.post("/integration-events/mock")
+def create_mock_integration_event(request: _HFMonMockEventRequest):
+    _hf_mon_ensure_schema()
+
+    plan = None
+
+    if request.monitoring_plan_id:
+        plan = _hf_mon_find_plan_by_id(int(request.monitoring_plan_id))
+
+    if not plan and request.source_issue_id:
+        plan = _hf_mon_find_plan_by_issue(int(request.source_issue_id))
+
+    record_id = _hf_mon_one_line(request.record_id or "")
+    source_issue_id = request.source_issue_id
+    monitoring_plan_id = request.monitoring_plan_id
+
+    if plan:
+        record_id = record_id or _hf_mon_one_line(plan.get("record_id"))
+        source_issue_id = source_issue_id or plan.get("source_issue_id")
+        monitoring_plan_id = monitoring_plan_id or plan.get("id")
+
+    event_system = _hf_mon_one_line(request.system or (plan or {}).get("system"))
+    event_component = _hf_mon_one_line(request.component or (plan or {}).get("component"))
+    event_location = _hf_mon_one_line(request.location or (plan or {}).get("location"))
+
+    raw_payload = request.raw_payload or {
+        "source": "manual_mock_event",
+        "note": "Created by Monitoring Lifecycle Backend Pass 1 test endpoint.",
+    }
+
+    event_id = _hf_mon_execute(
+        """
+        INSERT INTO integration_events (
+          tenant_id,
+          property_id,
+          record_id,
+          user_integration_id,
+          monitoring_plan_id,
+          source_issue_id,
+          source_type,
+          provider,
+          device_id,
+          device_name,
+          capability,
+          system,
+          component,
+          location,
+          title,
+          summary,
+          severity,
+          event_status,
+          homeowner_acknowledged,
+          homeowner_note,
+          raw_payload,
+          occurred_at
+        )
+        VALUES (
+          %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSON), %s
+        )
+        """,
+        (
+            _hf_mon_one_line(request.tenant_id or "lateef-home-inspection"),
+            _hf_mon_one_line(request.property_id or (plan or {}).get("property_id") or ""),
+            record_id,
+            monitoring_plan_id,
+            source_issue_id,
+            _hf_mon_one_line(request.source_type or "device_event"),
+            _hf_mon_one_line(request.provider or "manual"),
+            _hf_mon_one_line(request.device_id or ""),
+            _hf_mon_one_line(request.device_name or ""),
+            _hf_mon_one_line(request.capability or "MANUAL_CHECK"),
+            event_system,
+            event_component,
+            event_location,
+            _hf_mon_one_line(request.title or "Manual monitoring event"),
+            _hf_mon_safe_text(request.summary or ""),
+            _hf_mon_one_line(request.severity or "info"),
+            _hf_mon_one_line(request.event_status or "unreviewed"),
+            _hf_mon_one_line(request.homeowner_acknowledged or "no"),
+            _hf_mon_safe_text(request.homeowner_note or ""),
+            _hf_mon_to_json(raw_payload),
+            request.occurred_at or _hf_mon_now_string(),
+        ),
+    )
+
+    event = _hf_mon_fetch_one(
+        "SELECT * FROM integration_events WHERE id = %s LIMIT 1",
+        (event_id,),
+    )
+
+    if event:
+        event["raw_payload"] = _hf_mon_parse_json(event.get("raw_payload"), {})
+
+    return {
+        "success": True,
+        "message": "Mock integration event created.",
+        "event": event,
+        "linked_monitoring_plan": plan,
+    }
+
+
+@app.get("/monitoring-events/{record_id}")
+def monitoring_events_for_record(record_id: str):
+    _hf_mon_ensure_schema()
+
+    events = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM integration_events
+        WHERE record_id = %s
+        ORDER BY COALESCE(occurred_at, created_at) DESC, id DESC
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    for event in events:
+        event["raw_payload"] = _hf_mon_parse_json(event.get("raw_payload"), {})
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "count": len(events),
+        "events": events,
+    }

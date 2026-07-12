@@ -13201,6 +13201,11 @@ def _hf_loc_fetch_standard_issues(record_id: str, limit: int = 100):
                     id,
                     record_id,
                     title,
+                    summary,
+                    section,
+                    severity,
+                    risk_score,
+                    risk_level,
 
                     source_item_number,
                     source_page,
@@ -13271,8 +13276,144 @@ def _hf_loc_fetch_standard_issues(record_id: str, limit: int = 100):
             pass
 
 
+
+def _hf_loc_parse_source_item_number_from_summary(summary: str) -> str:
+    text = _hf_loc_one_line(summary)
+
+    match = _hf_loc_re.search(r"Report item\s+([0-9]+(?:\.[0-9]+)+)", text, _hf_loc_re.IGNORECASE)
+    if match:
+        return _hf_loc_one_line(match.group(1))
+
+    match = _hf_loc_re.search(r"\b([0-9]+(?:\.[0-9]+)+)\b", text)
+    if match:
+        return _hf_loc_one_line(match.group(1))
+
+    return ""
+
+
+def _hf_loc_parse_labeled_summary_value(summary: str, label: str) -> str:
+    text = _hf_loc_one_line(summary)
+
+    if not text:
+        return ""
+
+    # Examples:
+    # System: Electrical - GFCIs — Component: Electrical - GFCIs — Review...
+    pattern = rf"{_hf_loc_re.escape(label)}:\s*(.*?)(?:\s+—\s+[A-Z][A-Za-z ]+:|\s+—\s+Review|$)"
+    match = _hf_loc_re.search(pattern, text)
+
+    if match:
+        return _hf_loc_fix_encoding(match.group(1))
+
+    return ""
+
+
+def _hf_loc_split_system_component(section: str) -> tuple[str, str]:
+    text = _hf_loc_fix_encoding(section)
+
+    if " - " in text:
+        system, component = text.split(" - ", 1)
+        return _hf_loc_one_line(system), _hf_loc_one_line(component)
+
+    if " – " in text:
+        system, component = text.split(" – ", 1)
+        return _hf_loc_one_line(system), _hf_loc_one_line(component)
+
+    if text:
+        return text, text
+
+    return "", ""
+
+
+def _hf_loc_infer_trade(system: str, component: str, title: str) -> str:
+    combined = f"{system} {component} {title}".lower()
+
+    if any(word in combined for word in ["electrical", "gfci", "afci", "breaker", "wiring", "receptacle", "meter", "disconnect"]):
+        return "Licensed electrician"
+
+    if any(word in combined for word in ["plumbing", "water", "sink", "pipe", "drain", "valve", "waste", "hot water"]):
+        return "Licensed plumber"
+
+    if any(word in combined for word in ["roof", "flashing", "gutter", "downspout", "shingle", "covering"]):
+        return "Qualified roofing contractor"
+
+    if any(word in combined for word in ["heating", "cooling", "hvac", "thermostat", "furnace", "heat source"]):
+        return "Licensed HVAC contractor"
+
+    if any(word in combined for word in ["window", "door", "wall", "siding", "exterior", "eaves", "fascia", "soffit"]):
+        return "Qualified exterior contractor"
+
+    if any(word in combined for word in ["deck", "porch", "handrail", "railing", "guard", "structural", "ledger"]):
+        return "Qualified structural contractor"
+
+    return "Qualified professional"
+
+
+def _hf_loc_build_plain_summary(title: str, system: str, component: str, severity: str) -> str:
+    clean_title = _hf_loc_fix_encoding(title)
+    clean_system = _hf_loc_fix_encoding(system)
+    clean_component = _hf_loc_fix_encoding(component)
+    clean_severity = _hf_loc_fix_encoding(severity).lower()
+
+    parts = []
+
+    if clean_title:
+        parts.append(f"This finding reports: {clean_title}.")
+
+    area = " - ".join([part for part in [clean_system, clean_component] if part])
+    if area:
+        parts.append(f"It is related to {area}.")
+
+    if clean_severity:
+        parts.append(f"The current severity is marked as {clean_severity}.")
+
+    parts.append("Review the inspector finding, confirm the supporting photo, and decide whether this should be repaired, monitored, or dismissed.")
+
+    return _hf_loc_one_line(" ".join(parts))
+
+
+def _hf_loc_build_monitoring_plan(title: str, system: str, component: str) -> str:
+    combined = f"{title} {system} {component}".lower()
+
+    if any(word in combined for word in ["gfci", "afci", "breaker", "wiring", "electrical", "receptacle", "meter", "disconnect"]):
+        return "Monitor for tripped devices, non-working outlets, exposed wiring, missing covers, nuisance trips, or safety changes until corrected by a qualified electrician."
+
+    if any(word in combined for word in ["water", "leak", "pipe", "sink", "drain", "valve", "plumbing", "waste"]):
+        return "Monitor for active leaks, staining, moisture, corrosion, water pressure changes, slow drainage, odors, or recurring dampness."
+
+    if any(word in combined for word in ["roof", "flashing", "gutter", "downspout", "covering"]):
+        return "Monitor during and after rainfall for water entry, loose materials, overflow, ponding, staining, or worsening exterior drainage."
+
+    if any(word in combined for word in ["window", "door", "wall", "siding", "exterior", "eaves", "fascia", "soffit"]):
+        return "Monitor for water entry, drafts, rot, loose materials, cracking, staining, or worsening exterior damage."
+
+    if any(word in combined for word in ["heating", "cooling", "hvac", "thermostat", "furnace", "heat source"]):
+        return "Monitor for unusual noise, poor heating or cooling performance, short cycling, odors, rust, leaks, or comfort issues."
+
+    if any(word in combined for word in ["deck", "porch", "handrail", "railing", "guard", "structural", "ledger"]):
+        return "Monitor for movement, loose components, deterioration, unsafe guard/handrail conditions, water damage, or worsening structural concerns."
+
+    return "Monitor for worsening conditions, completed repairs, moisture issues, safety changes, or recurrence."
+
+
+def _hf_loc_extract_recommendation_from_summary(summary: str) -> str:
+    text = _hf_loc_fix_encoding(summary)
+
+    if "Review and correct as recommended by a qualified contractor" in text:
+        return "Review and correct as recommended by a qualified contractor."
+
+    if "Review and correct" in text:
+        return "Review and correct as recommended by a qualified professional."
+
+    return ""
+
+
 def _hf_loc_issue_to_preview(issue: dict) -> dict:
     record_id = _hf_loc_one_line(issue.get("record_id"))
+    title = _hf_loc_fix_encoding(issue.get("title"))
+    summary = _hf_loc_fix_encoding(issue.get("summary"))
+    section = _hf_loc_fix_encoding(issue.get("section"))
+    severity = _hf_loc_fix_encoding(issue.get("standard_severity") or issue.get("severity"))
     source_page = issue.get("source_page")
     source_page_clean = source_page if source_page not in ("", None) else None
 
@@ -13300,13 +13441,101 @@ def _hf_loc_issue_to_preview(issue: dict) -> dict:
     if not isinstance(parsed_risk, list):
         parsed_risk = []
 
-    source_report_section = _hf_loc_one_line(
-        issue.get("source_report_section")
-        or _hf_loc_section_from_source_text(issue)
-        or issue.get("standard_system")
+    summary_system = _hf_loc_parse_labeled_summary_value(summary, "System")
+    summary_component = _hf_loc_parse_labeled_summary_value(summary, "Component")
+    section_system, section_component = _hf_loc_split_system_component(section)
+
+    system = _hf_loc_one_line(
+        issue.get("standard_system")
+        or standard_json.get("system")
+        or summary_system
+        or section_system
     )
 
-    standard_location_area = _hf_loc_build_standard_location_area(issue)
+    component = _hf_loc_one_line(
+        issue.get("standard_component")
+        or standard_json.get("component")
+        or summary_component
+        or section_component
+    )
+
+    category = _hf_loc_one_line(
+        issue.get("standard_category")
+        or standard_json.get("category")
+        or system
+    )
+
+    defect_type = _hf_loc_one_line(
+        issue.get("standard_defect_type")
+        or standard_json.get("defect_type")
+        or title
+    )
+
+    source_item_number = _hf_loc_one_line(
+        issue.get("source_item_number")
+        or _hf_loc_parse_source_item_number_from_summary(summary)
+    )
+
+    source_report_section = _hf_loc_one_line(
+        issue.get("source_report_section")
+        or _hf_loc_section_from_source_text({
+            **issue,
+            "source_item_number": source_item_number,
+            "source_finding_text": issue.get("source_finding_text") or summary,
+        })
+        or section
+        or system
+    )
+
+    source_finding_text = _hf_loc_fix_encoding(
+        issue.get("source_finding_text")
+        or summary
+        or title
+    )
+
+    source_finding_title = _hf_loc_one_line(
+        issue.get("source_finding_title")
+        or title
+    )
+
+    source_recommendation = _hf_loc_fix_encoding(
+        issue.get("source_recommendation")
+        or _hf_loc_extract_recommendation_from_summary(summary)
+    )
+
+    recommended_action = _hf_loc_one_line(
+        issue.get("standard_recommended_action")
+        or standard_json.get("recommended_action")
+        or source_recommendation
+        or "Review and correct as recommended by a qualified professional."
+    )
+
+    recommended_trade = _hf_loc_one_line(
+        issue.get("standard_recommended_trade")
+        or standard_json.get("recommended_trade")
+        or _hf_loc_infer_trade(system, component, title)
+    )
+
+    plain_summary = _hf_loc_one_line(
+        issue.get("standard_plain_summary")
+        or standard_json.get("plain_summary")
+        or _hf_loc_build_plain_summary(title, system, component, severity)
+    )
+
+    monitoring_plan = _hf_loc_one_line(
+        issue.get("standard_monitoring_plan")
+        or standard_json.get("monitoring_plan")
+        or _hf_loc_build_monitoring_plan(title, system, component)
+    )
+
+    standard_location_area = _hf_loc_build_standard_location_area({
+        **issue,
+        "source_item_number": source_item_number,
+        "source_finding_text": source_finding_text,
+        "source_report_section": source_report_section,
+        "standard_system": system,
+        "standard_component": component,
+    })
 
     primary_image_url = _hf_loc_one_line(
         issue.get("verified_image_url")
@@ -13315,33 +13544,33 @@ def _hf_loc_issue_to_preview(issue: dict) -> dict:
 
     return {
         "id": issue.get("id"),
-        "title": _hf_loc_one_line(issue.get("title")),
+        "title": title,
         "record_id": record_id,
 
         # Source anchor fields
-        "source_item_number": _hf_loc_one_line(issue.get("source_item_number")),
+        "source_item_number": source_item_number,
         "source_page": source_page_clean,
         "source_report_section": source_report_section,
         "source_pdf_url": _hf_loc_source_pdf_url(record_id),
         "source_pdf_page_url": _hf_loc_source_pdf_page_url(record_id, source_page_clean),
 
         # Original inspector fields
-        "source_finding_title": _hf_loc_one_line(issue.get("source_finding_title")),
-        "source_finding_text": _hf_loc_fix_encoding(issue.get("source_finding_text")),
-        "source_recommendation": _hf_loc_fix_encoding(issue.get("source_recommendation")),
+        "source_finding_title": source_finding_title,
+        "source_finding_text": source_finding_text,
+        "source_recommendation": source_recommendation,
 
         # Standard/HomeFax fields
         "standard_location_area": standard_location_area,
         "location": standard_location_area,
-        "category": _hf_loc_one_line(issue.get("standard_category") or standard_json.get("category")),
-        "system": _hf_loc_one_line(issue.get("standard_system") or standard_json.get("system")),
-        "component": _hf_loc_one_line(issue.get("standard_component") or standard_json.get("component")),
-        "defect_type": _hf_loc_one_line(issue.get("standard_defect_type") or standard_json.get("defect_type")),
-        "severity": _hf_loc_one_line(issue.get("standard_severity") or standard_json.get("severity")),
-        "plain_summary": _hf_loc_one_line(issue.get("standard_plain_summary") or standard_json.get("plain_summary")),
-        "recommended_trade": _hf_loc_one_line(issue.get("standard_recommended_trade") or standard_json.get("recommended_trade")),
-        "recommended_action": _hf_loc_one_line(issue.get("standard_recommended_action") or standard_json.get("recommended_action")),
-        "monitoring_plan": _hf_loc_one_line(issue.get("standard_monitoring_plan") or standard_json.get("monitoring_plan")),
+        "category": category,
+        "system": system,
+        "component": component,
+        "defect_type": defect_type,
+        "severity": severity,
+        "plain_summary": plain_summary,
+        "recommended_trade": recommended_trade,
+        "recommended_action": recommended_action,
+        "monitoring_plan": monitoring_plan,
         "risk_reasons": parsed_risk,
 
         # Evidence fields

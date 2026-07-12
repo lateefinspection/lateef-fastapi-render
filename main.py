@@ -3146,9 +3146,56 @@ def final_approve_verified_issue(issue_id: int, update: FinalApprovalUpdate):
         cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
         row = cursor.fetchone()
 
+        # HomeFax Monitoring Lifecycle Backend Pass 2
+        # Auto-create/update a monitoring plan when a monitored issue is final approved and baseline locked.
+        monitoring_lifecycle = {
+            "checked": True,
+            "created_or_updated": False,
+            "reason": "",
+            "monitoring_plan": None,
+            "allowed_capabilities": [],
+        }
+
+        try:
+            final_is_approved = final_approval_status == "approved"
+            baseline_is_locked = baseline_locked == "yes"
+
+            if final_is_approved and baseline_is_locked:
+                issue_for_monitoring = row or existing
+                should_monitor = _hf_mon_issue_should_monitor(issue_for_monitoring, force=False)
+
+                if should_monitor:
+                    monitoring_result = _hf_mon_create_or_update_plan_from_issue(issue_id, force=True)
+                    monitoring_lifecycle = {
+                        "checked": True,
+                        "created_or_updated": True,
+                        "reason": "final_approval_lock_monitoring_issue",
+                        "monitoring_plan": monitoring_result.get("plan"),
+                        "allowed_capabilities": monitoring_result.get("allowed_capabilities", []),
+                    }
+
+                    # Re-fetch row after monitoring_plan_id/current_status update.
+                    cursor.execute("SELECT * FROM verified_issues WHERE id = %s LIMIT 1", (issue_id,))
+                    row = cursor.fetchone()
+                else:
+                    monitoring_lifecycle["reason"] = "issue_not_marked_for_monitoring"
+            else:
+                monitoring_lifecycle["reason"] = "final_approval_not_locked_or_not_approved"
+
+        except Exception as monitoring_error:
+            monitoring_lifecycle = {
+                "checked": True,
+                "created_or_updated": False,
+                "reason": "monitoring_plan_creation_failed",
+                "error": str(monitoring_error),
+                "monitoring_plan": None,
+                "allowed_capabilities": [],
+            }
+
         return {
             "success": True,
             "message": "Final approval status updated.",
+            "monitoring_lifecycle": monitoring_lifecycle,
             "issue": normalize_issue_with_review_fields(row),
         }
 
@@ -15393,3 +15440,9 @@ def monitoring_events_for_record(record_id: str):
         "count": len(events),
         "events": events,
     }
+
+
+# ============================================================
+# HomeFax Monitoring Lifecycle Backend Pass 2
+# Final approval route auto-creates monitoring plans for monitored locked issues.
+# ============================================================

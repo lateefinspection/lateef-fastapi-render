@@ -13360,7 +13360,15 @@ def _hf_loc_build_plain_summary(title: str, system: str, component: str, severit
     if clean_title:
         parts.append(f"This finding reports: {clean_title}.")
 
-    area = " - ".join([part for part in [clean_system, clean_component] if part])
+    area_parts = []
+    if clean_system:
+        area_parts.append(clean_system)
+
+    if clean_component and clean_component.lower() != clean_system.lower():
+        area_parts.append(clean_component)
+
+    area = " - ".join(area_parts)
+
     if area:
         parts.append(f"It is related to {area}.")
 
@@ -13478,13 +13486,13 @@ def _hf_loc_issue_to_preview(issue: dict) -> dict:
 
     source_report_section = _hf_loc_one_line(
         issue.get("source_report_section")
+        or section
+        or system
         or _hf_loc_section_from_source_text({
             **issue,
             "source_item_number": source_item_number,
             "source_finding_text": issue.get("source_finding_text") or summary,
         })
-        or section
-        or system
     )
 
     source_finding_text = _hf_loc_fix_encoding(

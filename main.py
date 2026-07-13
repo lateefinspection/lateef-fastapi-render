@@ -14099,6 +14099,9 @@ from typing import Optional as _hf_review_Optional
 class _HFStandardReviewActionPayload(_hf_review_BaseModel):
     decision: str
     note: _hf_review_Optional[str] = ""
+    homeowner_image_decision: _hf_review_Optional[str] = ""
+    homeowner_selected_image_url: _hf_review_Optional[str] = ""
+    homeowner_selected_image_note: _hf_review_Optional[str] = ""
     homeowner_user_id: _hf_review_Optional[str] = None
     homeowner_email: _hf_review_Optional[str] = None
 
@@ -14113,6 +14116,60 @@ def _hf_review_get_connection():
             return fn()
 
     raise RuntimeError("No database connection helper found.")
+
+
+# Homeowner Image Selection Save Pass 1A
+def _hf_review_add_column_if_missing(cursor, table_name: str, column_name: str, column_definition: str):
+    helper = globals().get("add_column_if_missing")
+
+    if callable(helper):
+        return helper(cursor, table_name, column_name, column_definition)
+
+    try:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+    except Exception as exc:
+        message = str(exc).lower()
+        if "duplicate column" not in message and "1060" not in message:
+            raise
+
+
+def _hf_review_ensure_homeowner_image_selection_schema():
+    conn = _hf_review_get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            _hf_review_add_column_if_missing(
+                cursor,
+                "verified_issues",
+                "homeowner_image_decision",
+                "VARCHAR(100) DEFAULT 'unreviewed'",
+            )
+            _hf_review_add_column_if_missing(
+                cursor,
+                "verified_issues",
+                "homeowner_selected_image_url",
+                "TEXT NULL",
+            )
+            _hf_review_add_column_if_missing(
+                cursor,
+                "verified_issues",
+                "homeowner_selected_image_note",
+                "TEXT NULL",
+            )
+            _hf_review_add_column_if_missing(
+                cursor,
+                "verified_issues",
+                "homeowner_selected_image_updated_at",
+                "DATETIME NULL",
+            )
+
+        conn.commit()
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _hf_review_normalize_decision(value: str) -> str:
@@ -14191,9 +14248,40 @@ def update_verified_issue_standard_review_action(
     issue_id: int,
     payload: _HFStandardReviewActionPayload,
 ):
+    _hf_review_ensure_homeowner_image_selection_schema()
+
     decision = _hf_review_normalize_decision(payload.decision)
     note = str(payload.note or "").strip()
     status_map = _hf_review_status_for_decision(decision)
+
+    homeowner_selected_image_url = str(payload.homeowner_selected_image_url or "").strip()
+    homeowner_selected_image_note = str(payload.homeowner_selected_image_note or note or "").strip()
+    homeowner_image_decision = str(payload.homeowner_image_decision or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+    if not homeowner_image_decision:
+        if decision == "wrong_photo":
+            homeowner_image_decision = "mismatch"
+        elif homeowner_selected_image_url:
+            homeowner_image_decision = "selected"
+        else:
+            homeowner_image_decision = "no_image"
+
+    allowed_homeowner_image_decisions = {
+        "unreviewed",
+        "accepted",
+        "selected",
+        "mismatch",
+        "needs_review",
+        "no_image",
+    }
+
+    if homeowner_image_decision not in allowed_homeowner_image_decisions:
+        return {
+            "success": False,
+            "error": "invalid_homeowner_image_decision",
+            "allowed": sorted(allowed_homeowner_image_decisions),
+            "received": homeowner_image_decision,
+        }
 
     conn = _hf_review_get_connection()
 
@@ -14202,7 +14290,9 @@ def update_verified_issue_standard_review_action(
             cursor.execute(
                 """
                 SELECT id, source_item_number, source_finding_title,
-                       homeowner_decision, homeowner_note, status, current_status
+                       homeowner_decision, homeowner_note, status, current_status,
+                       image_url, verified_image_url, homeowner_selected_image_url,
+                       homeowner_image_decision
                 FROM verified_issues
                 WHERE id = %s
                 """,
@@ -14223,6 +14313,10 @@ def update_verified_issue_standard_review_action(
                 UPDATE verified_issues
                 SET homeowner_decision = %s,
                     homeowner_note = %s,
+                    homeowner_image_decision = %s,
+                    homeowner_selected_image_url = %s,
+                    homeowner_selected_image_note = %s,
+                    homeowner_selected_image_updated_at = NOW(),
                     homeowner_reviewed_at = NOW(),
                     status = %s,
                     current_status = %s,
@@ -14232,6 +14326,9 @@ def update_verified_issue_standard_review_action(
                 (
                     decision,
                     note,
+                    homeowner_image_decision,
+                    homeowner_selected_image_url,
+                    homeowner_selected_image_note,
                     status_map["status"],
                     status_map["current_status"],
                     status_map["hidden_from_review_queue"],
@@ -14246,6 +14343,9 @@ def update_verified_issue_standard_review_action(
             "issue_id": issue_id,
             "decision": decision,
             "note": note,
+            "homeowner_image_decision": homeowner_image_decision,
+            "homeowner_selected_image_url": homeowner_selected_image_url,
+            "homeowner_selected_image_note": homeowner_selected_image_note,
             "status": status_map["status"],
             "current_status": status_map["current_status"],
             "hidden_from_review_queue": status_map["hidden_from_review_queue"],

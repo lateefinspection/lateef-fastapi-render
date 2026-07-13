@@ -14480,6 +14480,7 @@ def _hf_dual_monitoring_profile(issue: dict, monitoring_trigger: str = "", monit
     }
 
 
+# Dual Action Monitoring Plan SQL Quote Fix
 # Dual Action Monitoring Plan Sync Pass 2 Schema Compatibility Fix
 def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monitoring_trigger: str, monitoring_plan_text: str, post_repair_monitoring_required: str = "") -> dict:
     if not _hf_dual_monitoring_yes(monitoring_required):
@@ -14586,11 +14587,11 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
                     property_id = %s,
                     record_id = %s,
                     source_issue_id = %s,
-                    system = %s,
-                    component = %s,
-                    location = %s,
+                    `system` = %s,
+                    `component` = %s,
+                    `location` = %s,
                     risk_type = %s,
-                    status = %s,
+                    `status` = %s,
                     monitoring_plan_text = %s,
                     allowed_capabilities = %s,
                     monitoring_rules = %s,
@@ -14627,11 +14628,11 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
                     property_id,
                     record_id,
                     source_issue_id,
-                    system,
-                    component,
-                    location,
+                    `system`,
+                    `component`,
+                    `location`,
                     risk_type,
-                    status,
+                    `status`,
                     monitoring_plan_text,
                     allowed_capabilities,
                     monitoring_rules,

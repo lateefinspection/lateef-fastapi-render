@@ -14102,6 +14102,13 @@ class _HFStandardReviewActionPayload(_hf_review_BaseModel):
     homeowner_image_decision: _hf_review_Optional[str] = ""
     homeowner_selected_image_url: _hf_review_Optional[str] = ""
     homeowner_selected_image_note: _hf_review_Optional[str] = ""
+
+    # Dual Action + Monitoring Decision Pass 1
+    monitoring_required: _hf_review_Optional[str] = ""
+    monitoring_trigger: _hf_review_Optional[str] = ""
+    monitoring_plan_text: _hf_review_Optional[str] = ""
+    post_repair_monitoring_required: _hf_review_Optional[str] = ""
+
     homeowner_user_id: _hf_review_Optional[str] = None
     homeowner_email: _hf_review_Optional[str] = None
 
@@ -14162,6 +14169,32 @@ def _hf_review_ensure_homeowner_image_selection_schema():
                 "verified_issues",
                 "homeowner_selected_image_updated_at",
                 "DATETIME NULL",
+            )
+
+            # Dual Action + Monitoring Decision Pass 1
+            _hf_review_add_column_if_missing(
+                cursor,
+                "verified_issues",
+                "monitoring_required",
+                "VARCHAR(16) DEFAULT 'no'",
+            )
+            _hf_review_add_column_if_missing(
+                cursor,
+                "verified_issues",
+                "monitoring_trigger",
+                "VARCHAR(128) DEFAULT ''",
+            )
+            _hf_review_add_column_if_missing(
+                cursor,
+                "verified_issues",
+                "monitoring_plan_text",
+                "TEXT NULL",
+            )
+            _hf_review_add_column_if_missing(
+                cursor,
+                "verified_issues",
+                "post_repair_monitoring_required",
+                "VARCHAR(16) DEFAULT 'no'",
             )
 
         conn.commit()
@@ -14259,6 +14292,49 @@ def update_verified_issue_standard_review_action(
     homeowner_selected_image_note = str(payload.homeowner_selected_image_note or note or "").strip()
     homeowner_image_decision = str(payload.homeowner_image_decision or "").strip().lower().replace("-", "_").replace(" ", "_")
 
+    # Dual Action + Monitoring Decision Pass 1
+    monitoring_required = str(payload.monitoring_required or "").strip().lower()
+    monitoring_trigger = str(payload.monitoring_trigger or "").strip().lower().replace("-", "_").replace(" ", "_")
+    monitoring_plan_text = str(payload.monitoring_plan_text or "").strip()
+    post_repair_monitoring_required = str(payload.post_repair_monitoring_required or "").strip().lower()
+
+    if monitoring_required in {"true", "1", "yes", "y", "on"}:
+        monitoring_required = "yes"
+    elif monitoring_required in {"false", "0", "no", "n", "off", ""}:
+        monitoring_required = "no"
+
+    if post_repair_monitoring_required in {"true", "1", "yes", "y", "on"}:
+        post_repair_monitoring_required = "yes"
+    elif post_repair_monitoring_required in {"false", "0", "no", "n", "off", ""}:
+        post_repair_monitoring_required = "no"
+
+    # A pure monitor decision always requires monitoring.
+    if decision == "monitor":
+        monitoring_required = "yes"
+
+    # Already repaired can still need post-repair watch.
+    if decision == "already_repaired" and post_repair_monitoring_required == "yes":
+        monitoring_required = "yes"
+
+    if monitoring_required == "yes" and not monitoring_trigger:
+        monitoring_trigger = "general_watch"
+
+    if monitoring_required == "yes" and not monitoring_plan_text:
+        if monitoring_trigger in {"weather_rain_wind", "rain_high_wind", "rain", "high_wind"}:
+            monitoring_plan_text = (
+                "Monitor during and after heavy rain or high winds for water entry, loose materials, "
+                "staining, leaks, movement, or worsening exterior conditions."
+            )
+        elif decision in {"needs_contractor", "repair_needed"}:
+            monitoring_plan_text = (
+                "Monitor this issue until repair is completed, then continue post-repair follow-up for recurrence, "
+                "worsening conditions, or new evidence."
+            )
+        else:
+            monitoring_plan_text = (
+                "Monitor this issue for changes, recurrence, worsening conditions, or related evidence updates."
+            )
+
     if not homeowner_image_decision:
         if decision == "wrong_photo":
             homeowner_image_decision = "mismatch"
@@ -14293,7 +14369,9 @@ def update_verified_issue_standard_review_action(
                 SELECT id, source_item_number, source_finding_title,
                        homeowner_decision, homeowner_note, status, current_status,
                        image_url, verified_image_url, homeowner_selected_image_url,
-                       homeowner_image_decision
+                       homeowner_image_decision, monitoring_required,
+                       monitoring_trigger, monitoring_plan_text,
+                       post_repair_monitoring_required
                 FROM verified_issues
                 WHERE id = %s
                 """,
@@ -14318,6 +14396,10 @@ def update_verified_issue_standard_review_action(
                     homeowner_selected_image_url = %s,
                     homeowner_selected_image_note = %s,
                     homeowner_selected_image_updated_at = NOW(),
+                    monitoring_required = %s,
+                    monitoring_trigger = %s,
+                    monitoring_plan_text = %s,
+                    post_repair_monitoring_required = %s,
                     homeowner_reviewed_at = NOW(),
                     status = %s,
                     current_status = %s,
@@ -14330,6 +14412,10 @@ def update_verified_issue_standard_review_action(
                     homeowner_image_decision,
                     homeowner_selected_image_url,
                     homeowner_selected_image_note,
+                    monitoring_required,
+                    monitoring_trigger,
+                    monitoring_plan_text,
+                    post_repair_monitoring_required,
                     status_map["status"],
                     status_map["current_status"],
                     status_map["hidden_from_review_queue"],
@@ -14347,6 +14433,10 @@ def update_verified_issue_standard_review_action(
             "homeowner_image_decision": homeowner_image_decision,
             "homeowner_selected_image_url": homeowner_selected_image_url,
             "homeowner_selected_image_note": homeowner_selected_image_note,
+            "monitoring_required": monitoring_required,
+            "monitoring_trigger": monitoring_trigger,
+            "monitoring_plan_text": monitoring_plan_text,
+            "post_repair_monitoring_required": post_repair_monitoring_required,
             "status": status_map["status"],
             "current_status": status_map["current_status"],
             "hidden_from_review_queue": status_map["hidden_from_review_queue"],

@@ -14121,12 +14121,13 @@ def _hf_review_get_connection():
 # Homeowner Image Selection Save Pass 1A
 def _hf_review_add_column_if_missing(cursor, table_name: str, column_name: str, column_definition: str):
     helper = globals().get("add_column_if_missing")
+    full_column_definition = f"{column_name} {column_definition}"
 
     if callable(helper):
-        return helper(cursor, table_name, column_name, column_definition)
+        return helper(cursor, table_name, column_name, full_column_definition)
 
     try:
-        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {full_column_definition}")
     except Exception as exc:
         message = str(exc).lower()
         if "duplicate column" not in message and "1060" not in message:

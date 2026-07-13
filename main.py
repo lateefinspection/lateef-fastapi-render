@@ -14480,6 +14480,7 @@ def _hf_dual_monitoring_profile(issue: dict, monitoring_trigger: str = "", monit
     }
 
 
+# Dual Action Monitoring Plan Sync Pass 2 Schema Compatibility Fix
 def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monitoring_trigger: str, monitoring_plan_text: str, post_repair_monitoring_required: str = "") -> dict:
     if not _hf_dual_monitoring_yes(monitoring_required):
         return {
@@ -14492,7 +14493,6 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
     cursor = None
 
     try:
-        # Prefer existing monitoring schema helper when available.
         schema_helper = globals().get("_hf_mon_ensure_schema")
         if callable(schema_helper):
             schema_helper()
@@ -14507,6 +14507,17 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
 
         conn = get_connection()
         cursor = conn.cursor()
+
+        # Keep the existing monitoring_plans schema compatible with the newer dual-action logic.
+        add_column = globals().get("_hf_review_add_column_if_missing")
+        if callable(add_column):
+            try:
+                add_column(cursor, "monitoring_plans", "monitoring_rules", "TEXT NULL")
+                add_column(cursor, "monitoring_plans", "monitoring_trigger", "VARCHAR(128) DEFAULT ''")
+                add_column(cursor, "monitoring_plans", "post_repair_monitoring_required", "VARCHAR(16) DEFAULT 'no'")
+            except Exception:
+                # Do not block plan sync if optional display columns cannot be added.
+                pass
 
         cursor.execute(
             """
@@ -14537,10 +14548,14 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
 
         tenant_id = issue.get("tenant_id") or "lateef-home-inspection"
         property_id = issue.get("property_id") or record_id or ""
-        status = issue.get("current_status") or issue.get("status") or "monitoring"
+        system = issue.get("system") or issue.get("category") or ""
+        component = issue.get("component") or ""
+        location = issue.get("location") or ""
+
+        current_status = issue.get("current_status") or issue.get("status") or "monitoring"
 
         plan_status = "active"
-        if status in {"closed", "resolved"} and _hf_dual_monitoring_yes(post_repair_monitoring_required):
+        if current_status in {"closed", "resolved"} and _hf_dual_monitoring_yes(post_repair_monitoring_required):
             plan_status = "post_repair_watch"
 
         import json as _hf_dual_json
@@ -14548,12 +14563,12 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
         allowed_capabilities_json = _hf_dual_json.dumps(profile["allowed_capabilities"])
         monitoring_rules_json = _hf_dual_json.dumps(profile["monitoring_rules"])
 
-        # Update existing plan for this issue if present.
+        # Existing production schema uses source_issue_id, not issue_id.
         cursor.execute(
             """
             SELECT id
             FROM monitoring_plans
-            WHERE issue_id = %s
+            WHERE source_issue_id = %s
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -14570,12 +14585,17 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
                 SET tenant_id = %s,
                     property_id = %s,
                     record_id = %s,
-                    issue_id = %s,
+                    source_issue_id = %s,
+                    system = %s,
+                    component = %s,
+                    location = %s,
                     risk_type = %s,
-                    plan_status = %s,
+                    status = %s,
                     monitoring_plan_text = %s,
                     allowed_capabilities = %s,
                     monitoring_rules = %s,
+                    monitoring_trigger = %s,
+                    post_repair_monitoring_required = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
@@ -14584,11 +14604,16 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
                     property_id,
                     record_id,
                     issue_id,
+                    system,
+                    component,
+                    location,
                     profile["risk_type"],
                     plan_status,
                     monitoring_plan_text,
                     allowed_capabilities_json,
                     monitoring_rules_json,
+                    monitoring_trigger,
+                    post_repair_monitoring_required or "no",
                     plan_id,
                 ),
             )
@@ -14601,27 +14626,39 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
                     tenant_id,
                     property_id,
                     record_id,
-                    issue_id,
+                    source_issue_id,
+                    system,
+                    component,
+                    location,
                     risk_type,
-                    plan_status,
+                    status,
                     monitoring_plan_text,
                     allowed_capabilities,
                     monitoring_rules,
+                    monitoring_trigger,
+                    post_repair_monitoring_required,
+                    created_from,
                     created_at,
                     updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                 """,
                 (
                     tenant_id,
                     property_id,
                     record_id,
                     issue_id,
+                    system,
+                    component,
+                    location,
                     profile["risk_type"],
                     plan_status,
                     monitoring_plan_text,
                     allowed_capabilities_json,
                     monitoring_rules_json,
+                    monitoring_trigger,
+                    post_repair_monitoring_required or "no",
+                    "dual_action_review",
                 ),
             )
             plan_id = cursor.lastrowid
@@ -14658,6 +14695,7 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
             "allowed_capabilities": profile["allowed_capabilities"],
             "monitoring_rules": profile["monitoring_rules"],
             "plan_status": plan_status,
+            "schema_key": "source_issue_id",
         }
 
     except Exception as exc:
@@ -14684,7 +14722,6 @@ def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monit
                 conn.close()
         except Exception:
             pass
-
 
 
 @app.patch("/verified-issue/{issue_id}/standard-review-action")

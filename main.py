@@ -14277,6 +14277,416 @@ def _hf_review_status_for_decision(decision: str):
     }
 
 
+
+# Dual Action Monitoring Plan Sync Pass 2
+def _hf_dual_monitoring_yes(value) -> bool:
+    return str(value or "").strip().lower() in {"yes", "true", "1", "y", "on"}
+
+
+def _hf_dual_monitoring_text_blob(issue: dict, monitoring_trigger: str = "", monitoring_plan_text: str = "") -> str:
+    parts = [
+        issue.get("source_finding_title"),
+        issue.get("title"),
+        issue.get("source_item_number"),
+        issue.get("system"),
+        issue.get("component"),
+        issue.get("category"),
+        issue.get("location"),
+        issue.get("recommendation"),
+        issue.get("action"),
+        issue.get("trade"),
+        monitoring_trigger,
+        monitoring_plan_text,
+    ]
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _hf_dual_monitoring_profile(issue: dict, monitoring_trigger: str = "", monitoring_plan_text: str = "") -> dict:
+    text = _hf_dual_monitoring_text_blob(issue, monitoring_trigger, monitoring_plan_text)
+
+    trigger = str(monitoring_trigger or "").strip().lower()
+
+    # Foundation / settlement / soil profile
+    if any(word in text for word in [
+        "settlement",
+        "foundation",
+        "structural",
+        "crack",
+        "bowing",
+        "movement",
+        "heaving",
+        "soil",
+        "grading",
+        "slope",
+        "erosion",
+        "expansive",
+        "dry soil",
+        "lawn",
+    ]):
+        return {
+            "risk_type": "foundation_soil_movement",
+            "allowed_capabilities": [
+                "WEATHER_RAIN",
+                "WEATHER_DROUGHT",
+                "SOIL_MOISTURE",
+                "FOUNDATION_MOVEMENT",
+                "PHOTO_EVIDENCE",
+                "MANUAL_CHECK",
+            ],
+            "monitoring_rules": {
+                "trigger_group": trigger or "foundation_soil_watch",
+                "weather_triggers": ["heavy_rain", "extended_dry_period", "drought"],
+                "device_triggers": ["SOIL_MOISTURE", "FOUNDATION_MOVEMENT"],
+                "manual_triggers": ["new_crack_photo", "crack_width_change", "water_entry", "new_staining"],
+            },
+        }
+
+    # Roof / flashing / exterior envelope profile
+    if any(word in text for word in [
+        "roof",
+        "flashing",
+        "shingle",
+        "gutter",
+        "downspout",
+        "fascia",
+        "soffit",
+        "chimney",
+        "skylight",
+        "siding",
+        "exterior envelope",
+    ]):
+        return {
+            "risk_type": "roof_envelope_weather",
+            "allowed_capabilities": [
+                "WEATHER_RAIN",
+                "WEATHER_WIND",
+                "ROOF_ENVELOPE",
+                "MOISTURE",
+                "PHOTO_EVIDENCE",
+                "MANUAL_CHECK",
+            ],
+            "monitoring_rules": {
+                "trigger_group": trigger or "roof_weather_watch",
+                "weather_triggers": ["heavy_rain", "high_wind", "storm"],
+                "device_triggers": ["MOISTURE"],
+                "manual_triggers": ["new_roof_photo", "staining", "leak_report", "loose_material"],
+            },
+        }
+
+    # Water / plumbing / basement moisture profile
+    if any(word in text for word in [
+        "leak",
+        "moisture",
+        "water",
+        "plumbing",
+        "basement",
+        "sump",
+        "drain",
+        "seepage",
+        "stain",
+        "mold",
+        "humidity",
+    ]):
+        return {
+            "risk_type": "water_moisture",
+            "allowed_capabilities": [
+                "WATER_LEAK",
+                "WATER_SHUTOFF",
+                "MOISTURE",
+                "HUMIDITY",
+                "WEATHER_RAIN",
+                "SUMP_PUMP",
+                "PHOTO_EVIDENCE",
+                "MANUAL_CHECK",
+            ],
+            "monitoring_rules": {
+                "trigger_group": trigger or "water_moisture_watch",
+                "weather_triggers": ["heavy_rain"],
+                "device_triggers": ["WATER_LEAK", "MOISTURE", "HUMIDITY", "SUMP_PUMP"],
+                "manual_triggers": ["new_staining", "odor", "standing_water", "new_photo"],
+            },
+        }
+
+    # Electrical profile
+    if any(word in text for word in [
+        "electrical",
+        "gfci",
+        "outlet",
+        "breaker",
+        "panel",
+        "wire",
+        "wiring",
+        "junction",
+        "ground",
+        "polarity",
+    ]):
+        return {
+            "risk_type": "electrical_safety",
+            "allowed_capabilities": [
+                "ELECTRICAL_LOAD",
+                "ELECTRICAL_ANOMALY",
+                "PHOTO_EVIDENCE",
+                "MANUAL_CHECK",
+            ],
+            "monitoring_rules": {
+                "trigger_group": trigger or "electrical_safety_watch",
+                "weather_triggers": [],
+                "device_triggers": ["ELECTRICAL_LOAD", "ELECTRICAL_ANOMALY"],
+                "manual_triggers": ["repair_photo", "electrician_update", "recurrence_report"],
+            },
+        }
+
+    # HVAC / environment profile
+    if any(word in text for word in [
+        "hvac",
+        "furnace",
+        "air conditioner",
+        "ac",
+        "condenser",
+        "thermostat",
+        "temperature",
+        "vent",
+        "duct",
+    ]):
+        return {
+            "risk_type": "hvac_environment",
+            "allowed_capabilities": [
+                "HVAC_RUNTIME",
+                "TEMPERATURE",
+                "HUMIDITY",
+                "PHOTO_EVIDENCE",
+                "MANUAL_CHECK",
+            ],
+            "monitoring_rules": {
+                "trigger_group": trigger or "hvac_environment_watch",
+                "weather_triggers": ["extreme_temperature"],
+                "device_triggers": ["HVAC_RUNTIME", "TEMPERATURE", "HUMIDITY"],
+                "manual_triggers": ["service_update", "comfort_issue", "new_photo"],
+            },
+        }
+
+    return {
+        "risk_type": "general_monitoring",
+        "allowed_capabilities": [
+            "PHOTO_EVIDENCE",
+            "MANUAL_CHECK",
+        ],
+        "monitoring_rules": {
+            "trigger_group": trigger or "general_watch",
+            "weather_triggers": [],
+            "device_triggers": [],
+            "manual_triggers": ["new_photo", "status_update", "recurrence_report"],
+        },
+    }
+
+
+def _hf_dual_monitoring_sync_plan(issue_id: int, monitoring_required: str, monitoring_trigger: str, monitoring_plan_text: str, post_repair_monitoring_required: str = "") -> dict:
+    if not _hf_dual_monitoring_yes(monitoring_required):
+        return {
+            "attempted": False,
+            "created_or_updated": False,
+            "reason": "monitoring_required is not yes",
+        }
+
+    conn = None
+    cursor = None
+
+    try:
+        # Prefer existing monitoring schema helper when available.
+        schema_helper = globals().get("_hf_mon_ensure_schema")
+        if callable(schema_helper):
+            schema_helper()
+
+        get_connection = globals().get("_hf_mon_get_connection") or globals().get("get_db_connection")
+        if not callable(get_connection):
+            return {
+                "attempted": True,
+                "created_or_updated": False,
+                "error": "No database connection helper available for monitoring sync.",
+            }
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM verified_issues
+            WHERE id = %s
+            """,
+            (issue_id,),
+        )
+        issue = cursor.fetchone()
+
+        if not issue:
+            return {
+                "attempted": True,
+                "created_or_updated": False,
+                "error": "Issue not found.",
+            }
+
+        profile = _hf_dual_monitoring_profile(issue, monitoring_trigger, monitoring_plan_text)
+
+        record_id = (
+            issue.get("record_id")
+            or issue.get("inspection_record_id")
+            or issue.get("submission_id")
+            or issue.get("source_record_id")
+            or ""
+        )
+
+        tenant_id = issue.get("tenant_id") or "lateef-home-inspection"
+        property_id = issue.get("property_id") or record_id or ""
+        status = issue.get("current_status") or issue.get("status") or "monitoring"
+
+        plan_status = "active"
+        if status in {"closed", "resolved"} and _hf_dual_monitoring_yes(post_repair_monitoring_required):
+            plan_status = "post_repair_watch"
+
+        import json as _hf_dual_json
+
+        allowed_capabilities_json = _hf_dual_json.dumps(profile["allowed_capabilities"])
+        monitoring_rules_json = _hf_dual_json.dumps(profile["monitoring_rules"])
+
+        # Update existing plan for this issue if present.
+        cursor.execute(
+            """
+            SELECT id
+            FROM monitoring_plans
+            WHERE issue_id = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (issue_id,),
+        )
+        existing_plan = cursor.fetchone()
+
+        if existing_plan:
+            plan_id = existing_plan.get("id")
+
+            cursor.execute(
+                """
+                UPDATE monitoring_plans
+                SET tenant_id = %s,
+                    property_id = %s,
+                    record_id = %s,
+                    issue_id = %s,
+                    risk_type = %s,
+                    plan_status = %s,
+                    monitoring_plan_text = %s,
+                    allowed_capabilities = %s,
+                    monitoring_rules = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    issue_id,
+                    profile["risk_type"],
+                    plan_status,
+                    monitoring_plan_text,
+                    allowed_capabilities_json,
+                    monitoring_rules_json,
+                    plan_id,
+                ),
+            )
+
+            created = False
+        else:
+            cursor.execute(
+                """
+                INSERT INTO monitoring_plans (
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    issue_id,
+                    risk_type,
+                    plan_status,
+                    monitoring_plan_text,
+                    allowed_capabilities,
+                    monitoring_rules,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                """,
+                (
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    issue_id,
+                    profile["risk_type"],
+                    plan_status,
+                    monitoring_plan_text,
+                    allowed_capabilities_json,
+                    monitoring_rules_json,
+                ),
+            )
+            plan_id = cursor.lastrowid
+            created = True
+
+        cursor.execute(
+            """
+            UPDATE verified_issues
+            SET monitoring_required = %s,
+                monitoring_trigger = %s,
+                monitoring_plan_text = %s,
+                post_repair_monitoring_required = %s,
+                monitoring_plan_id = %s
+            WHERE id = %s
+            """,
+            (
+                "yes",
+                monitoring_trigger,
+                monitoring_plan_text,
+                post_repair_monitoring_required or "no",
+                plan_id,
+                issue_id,
+            ),
+        )
+
+        conn.commit()
+
+        return {
+            "attempted": True,
+            "created_or_updated": True,
+            "created": created,
+            "plan_id": plan_id,
+            "risk_type": profile["risk_type"],
+            "allowed_capabilities": profile["allowed_capabilities"],
+            "monitoring_rules": profile["monitoring_rules"],
+            "plan_status": plan_status,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        return {
+            "attempted": True,
+            "created_or_updated": False,
+            "error": str(exc),
+        }
+
+    finally:
+        try:
+            if cursor:
+                cursor.close()
+        except Exception:
+            pass
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+
 @app.patch("/verified-issue/{issue_id}/standard-review-action")
 def update_verified_issue_standard_review_action(
     issue_id: int,
@@ -14425,6 +14835,15 @@ def update_verified_issue_standard_review_action(
 
         conn.commit()
 
+        # Dual Action Monitoring Plan Sync Pass 2
+        monitoring_lifecycle = _hf_dual_monitoring_sync_plan(
+            issue_id=issue_id,
+            monitoring_required=monitoring_required,
+            monitoring_trigger=monitoring_trigger,
+            monitoring_plan_text=monitoring_plan_text,
+            post_repair_monitoring_required=post_repair_monitoring_required,
+        )
+
         return {
             "success": True,
             "issue_id": issue_id,
@@ -14437,6 +14856,7 @@ def update_verified_issue_standard_review_action(
             "monitoring_trigger": monitoring_trigger,
             "monitoring_plan_text": monitoring_plan_text,
             "post_repair_monitoring_required": post_repair_monitoring_required,
+            "monitoring_lifecycle": monitoring_lifecycle,
             "status": status_map["status"],
             "current_status": status_map["current_status"],
             "hidden_from_review_queue": status_map["hidden_from_review_queue"],

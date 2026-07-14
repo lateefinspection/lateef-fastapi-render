@@ -2403,6 +2403,8 @@ def get_verified_issue(issue_id: int):
 
 
 def update_verified_issue_common(issue_id: int, update: VerifiedIssueStatusUpdate):
+    # Baseline Lock API Guard Pass 1B
+    _hf_guard_verified_issue_not_baseline_locked(issue_id, "legacy-status-alias")
     fields = []
     params = []
 

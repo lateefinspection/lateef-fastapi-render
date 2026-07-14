@@ -2541,8 +2541,98 @@ def put_verified_issue_alias(issue_id: int, update: VerifiedIssueStatusUpdate):
     return update_verified_issue_common(issue_id, update)
 
 
+
+# Baseline Lock API Guard Pass 1
+def _hf_truthy_lock_value(value):
+    return str(value or "").strip().lower() in {
+        "yes",
+        "true",
+        "1",
+        "locked",
+        "approved",
+        "final_approved",
+    }
+
+
+def _hf_guard_verified_issue_not_baseline_locked(issue_id: int, action_name: str = "update"):
+    """
+    Prevent mutation of verified issues after final baseline lock.
+
+    This protects the audit trail. Once an issue is final-approved or baseline-locked,
+    client/UI bugs, direct curl calls, or automation retries cannot mutate review state.
+    """
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    baseline_locked,
+                    final_approval_status,
+                    title
+                FROM verified_issues
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (issue_id,),
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Verified issue {issue_id} was not found.",
+            )
+
+        baseline_locked = row.get("baseline_locked")
+        final_approval_status = row.get("final_approval_status")
+
+        if _hf_truthy_lock_value(baseline_locked) or _hf_truthy_lock_value(final_approval_status):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "success": False,
+                    "error": "baseline_locked",
+                    "message": "This issue is baseline locked and cannot be changed.",
+                    "issue_id": issue_id,
+                    "title": row.get("title"),
+                    "action": action_name,
+                    "baseline_locked": baseline_locked,
+                    "final_approval_status": final_approval_status,
+                },
+            )
+
+        return row
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "baseline_lock_guard_failed",
+                "message": str(exc),
+                "issue_id": issue_id,
+                "action": action_name,
+            },
+        )
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+
 @app.patch("/verified-issue/{issue_id}/image-verification")
 def update_issue_image_verification(issue_id: int, update: ImageVerificationUpdate):
+    _hf_guard_verified_issue_not_baseline_locked(issue_id, "image-verification")
     ensure_core_tables()
 
     allowed_statuses = {"none", "suggested", "verified", "mismatch"}
@@ -2762,6 +2852,7 @@ def fetch_verified_issue_row(issue_id: int):
 
 @app.patch("/verified-issue/{issue_id}/homeowner-review")
 def submit_homeowner_issue_review(issue_id: int, update: HomeownerReviewUpdate):
+    _hf_guard_verified_issue_not_baseline_locked(issue_id, "homeowner-review")
     """
     Homeowner review route.
 
@@ -2906,6 +2997,7 @@ def submit_homeowner_issue_review(issue_id: int, update: HomeownerReviewUpdate):
 
 @app.patch("/verified-issue/{issue_id}/admin-review")
 def submit_admin_issue_review(issue_id: int, update: AdminReviewUpdate):
+    _hf_guard_verified_issue_not_baseline_locked(issue_id, "admin-review")
     """
     Admin review route.
 
@@ -3051,6 +3143,7 @@ def submit_admin_issue_review(issue_id: int, update: AdminReviewUpdate):
 
 @app.patch("/verified-issue/{issue_id}/final-approval")
 def final_approve_verified_issue(issue_id: int, update: FinalApprovalUpdate):
+    _hf_guard_verified_issue_not_baseline_locked(issue_id, "final-approval")
     """
     Final platform approval route.
 
@@ -3631,6 +3724,7 @@ def hide_record_from_review_queue(update: ReviewQueueCleanupRequest):
 
 @app.patch("/verified-issue/{issue_id}/hide-from-review-queue")
 def hide_single_issue_from_review_queue(issue_id: int, update: ReviewQueueDismissIssueRequest):
+    _hf_guard_verified_issue_not_baseline_locked(issue_id, "hide-from-review-queue")
     """
     Hides one issue from the admin review queue without deleting it.
     """
@@ -14734,6 +14828,7 @@ def update_verified_issue_standard_review_action(
     issue_id: int,
     payload: _HFStandardReviewActionPayload,
 ):
+    _hf_guard_verified_issue_not_baseline_locked(issue_id, "standard-review-action")
     _hf_review_ensure_homeowner_image_selection_schema()
 
     decision = _hf_review_normalize_decision(payload.decision)

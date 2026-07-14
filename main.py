@@ -2194,7 +2194,11 @@ def normalize_verified_issue_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "status": row.get("status"),
         "homeowner_decision": row.get("homeowner_decision"),
         "homeowner_note": row.get("homeowner_note") or "",
+        # Verified Issues Homeowner Selected Image Normalizer Patch
         "homeowner_image_decision": row.get("homeowner_image_decision") or "unreviewed",
+        "homeowner_selected_image_url": row.get("homeowner_selected_image_url") or "",
+        "homeowner_selected_image_note": row.get("homeowner_selected_image_note") or "",
+        "homeowner_selected_image_updated_at": row.get("homeowner_selected_image_updated_at").isoformat() if row.get("homeowner_selected_image_updated_at") else None,
         "homeowner_reviewed_at": (
             row.get("homeowner_reviewed_at").isoformat()
             if row.get("homeowner_reviewed_at")

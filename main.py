@@ -15981,6 +15981,63 @@ class _HFMonMockEventRequest(_hf_mon_BaseModel):
     occurred_at: _hf_mon_Optional[str] = None
 
 
+
+
+class _HFMonitoringEventReviewPayload(BaseModel):
+    event_status: str | None = None
+    review_decision: str | None = None
+    review_note: str | None = None
+    reviewed_by: str | None = "admin"
+    followup_required: bool | None = None
+
+
+
+# Monitoring Event Review Backend Pass 1
+def _hf_mon_ensure_event_review_schema():
+    """
+    Adds review/audit fields to integration_events.
+
+    MySQL-compatible.
+    These fields let HomeFax review monitoring/device/weather/manual events
+    without mutating the locked verified issue baseline.
+    """
+    statements = [
+        "ALTER TABLE integration_events ADD COLUMN review_decision VARCHAR(128) NULL",
+        "ALTER TABLE integration_events ADD COLUMN review_note TEXT NULL",
+        "ALTER TABLE integration_events ADD COLUMN reviewed_by VARCHAR(128) NULL",
+        "ALTER TABLE integration_events ADD COLUMN reviewed_at TIMESTAMP NULL",
+        "ALTER TABLE integration_events ADD COLUMN resolved_at TIMESTAMP NULL",
+        "ALTER TABLE integration_events ADD COLUMN escalated_at TIMESTAMP NULL",
+        "ALTER TABLE integration_events ADD COLUMN followup_required BOOLEAN DEFAULT FALSE",
+    ]
+
+    results = []
+
+    for statement in statements:
+        result = _hf_mon_try_execute(statement)
+
+        if not result.get("ok") and "Duplicate column" in str(result.get("error")):
+            result["ok"] = True
+            result["error"] = "already_exists"
+
+        results.append(result)
+
+    failed = [item for item in results if not item.get("ok")]
+
+    if failed:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "monitoring_event_review_schema_failed",
+                "failed": failed,
+            },
+        )
+
+    return results
+
+
+
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():
     table_checks = {}
@@ -16165,6 +16222,202 @@ def create_mock_integration_event(request: _HFMonMockEventRequest):
         "event": event,
         "linked_monitoring_plan": plan,
     }
+
+
+
+
+@app.patch("/monitoring-event/{event_id}/review")
+def review_monitoring_event(event_id: int, payload: _HFMonitoringEventReviewPayload):
+    """
+    Review a monitoring/integration event.
+
+    Important:
+    - This does NOT mutate the locked verified issue baseline.
+    - It only updates the event lifecycle state.
+    - Locked issues may still receive and review new monitoring events.
+    """
+    _hf_mon_ensure_schema()
+    _hf_mon_ensure_event_review_schema()
+
+    allowed_statuses = {
+        "unreviewed",
+        "acknowledged",
+        "resolved",
+        "dismissed",
+        "escalated",
+        "false_alarm",
+    }
+
+    allowed_decisions = {
+        "monitor",
+        "repair_needed",
+        "contractor_needed",
+        "resolved",
+        "false_alarm",
+        "needs_followup",
+    }
+
+    event_status = str(payload.event_status or "").strip().lower()
+    review_decision = str(payload.review_decision or "").strip().lower()
+    review_note = str(payload.review_note or "").strip()
+    reviewed_by = str(payload.reviewed_by or "admin").strip() or "admin"
+
+    if not event_status:
+        event_status = "acknowledged"
+
+    if event_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_event_status",
+                "message": f"Invalid event_status: {event_status}",
+                "allowed_statuses": sorted(allowed_statuses),
+            },
+        )
+
+    if review_decision and review_decision not in allowed_decisions:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_review_decision",
+                "message": f"Invalid review_decision: {review_decision}",
+                "allowed_decisions": sorted(allowed_decisions),
+            },
+        )
+
+    if not review_decision:
+        if event_status == "resolved":
+            review_decision = "resolved"
+        elif event_status == "false_alarm":
+            review_decision = "false_alarm"
+        elif event_status == "escalated":
+            review_decision = "needs_followup"
+        else:
+            review_decision = "monitor"
+
+    followup_required = payload.followup_required
+
+    if followup_required is None:
+        followup_required = event_status == "escalated" or review_decision in {
+            "repair_needed",
+            "contractor_needed",
+            "needs_followup",
+        }
+
+    fields = [
+        "event_status = %s",
+        "review_decision = %s",
+        "review_note = %s",
+        "reviewed_by = %s",
+        "reviewed_at = NOW()",
+        "followup_required = %s",
+    ]
+
+    params = [
+        event_status,
+        review_decision,
+        review_note,
+        reviewed_by,
+        1 if followup_required else 0,
+    ]
+
+    if event_status == "resolved":
+        fields.append("resolved_at = NOW()")
+
+    if event_status == "escalated":
+        fields.append("escalated_at = NOW()")
+
+    params.append(event_id)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_events
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (event_id,),
+            )
+            existing = cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "monitoring_event_not_found",
+                        "message": f"Monitoring event {event_id} was not found.",
+                        "event_id": event_id,
+                    },
+                )
+
+            cursor.execute(
+                f"""
+                UPDATE integration_events
+                SET {", ".join(fields)}
+                WHERE id = %s
+                """,
+                params,
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_events
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (event_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Monitoring event review saved.",
+            "event": row,
+        }
+
+    except HTTPException:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "monitoring_event_review_failed",
+                "message": str(exc),
+                "event_id": event_id,
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 
 @app.get("/monitoring-events/{record_id}")

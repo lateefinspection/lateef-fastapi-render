@@ -16604,6 +16604,7 @@ def ingest_device_event(payload: _HFDeviceEventIngestPayload):
             pass
 
 
+# Weather Provider Duplicate Filter Pass 1
 @app.get("/device-events/{record_id}/insights")
 def device_event_insights_for_record(record_id: str):
     """
@@ -16617,6 +16618,8 @@ def device_event_insights_for_record(record_id: str):
         SELECT *
         FROM integration_events
         WHERE record_id = %s
+          AND COALESCE(event_lifecycle_status, '') <> 'archived_duplicate'
+          AND COALESCE(event_status, '') <> 'archived_duplicate'
         ORDER BY occurred_at DESC, id DESC
         """,
         (_hf_mon_one_line(record_id),),
@@ -17299,6 +17302,8 @@ def weather_event_insights_for_record(record_id: str):
         SELECT *
         FROM integration_events
         WHERE record_id = %s
+          AND COALESCE(event_lifecycle_status, '') <> 'archived_duplicate'
+          AND COALESCE(event_status, '') <> 'archived_duplicate'
           AND (
             source_type = 'weather_event'
             OR provider = 'weather'

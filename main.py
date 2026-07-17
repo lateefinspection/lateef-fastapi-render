@@ -18294,83 +18294,233 @@ def _hf_weather_provider_update_connection_after_sync(record_id: str, payload: _
     }
 
 
+
+
+# Weather Provider Adapter Pass 1B - idempotent safe response fix
+def _hf_weather_provider_existing_event(record_id: str, provider_event_id: str):
+    if not provider_event_id:
+        return None
+
+    rows = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM integration_events
+        WHERE record_id = %s
+          AND provider = 'weather'
+          AND provider_event_id = %s
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (_hf_mon_one_line(record_id), provider_event_id),
+    )
+
+    return rows[0] if rows else None
+
+
+def _hf_weather_provider_event_summary(event_row: dict | None, fallback: dict | None = None):
+    event_row = event_row or {}
+    fallback = fallback or {}
+
+    def pick(key, default=None):
+        value = event_row.get(key)
+        if value is None or value == "":
+            value = fallback.get(key, default)
+        return value
+
+    try:
+        confidence = float(pick("match_confidence", 0) or 0)
+    except Exception:
+        confidence = 0.0
+
+    return {
+        "id": pick("id"),
+        "provider": pick("provider"),
+        "source_type": pick("source_type"),
+        "provider_event_id": pick("provider_event_id"),
+        "capability": pick("capability"),
+        "severity": pick("severity"),
+        "match_status": pick("match_status"),
+        "match_confidence": confidence,
+        "monitoring_plan_id": pick("monitoring_plan_id"),
+        "source_issue_id": pick("source_issue_id"),
+        "compiled_insight_title": pick("compiled_insight_title"),
+        "homeowner_confirmation_status": pick("homeowner_confirmation_status"),
+        "alert_status": pick("alert_status"),
+        "occurred_at": str(pick("occurred_at", "") or ""),
+    }
+
+
+def _hf_weather_provider_make_provider_event_id(record_id: str, weather_event_type: str, occurred_at: str | None):
+    clean_time = _hf_device_normalize(occurred_at) or "now"
+    return f"weather-{record_id}-{_hf_weather_event_type(weather_event_type)}-{clean_time}"
+
+
 @app.post("/weather-provider/{record_id}/sync")
 def sync_weather_provider_for_record(record_id: str, payload: _HFWeatherProviderSyncPayload):
     """
     Provider-neutral weather adapter sync.
 
-    This does not call a live weather API yet. It accepts provider-style weather
-    values, decides which HomeFax weather events should be created, sends them
-    through the existing Weather Event Intelligence pipeline, and updates the
-    device connection registry.
+    This endpoint is idempotent by provider_event_id:
+    if a provider event already exists for this record, it is skipped instead of duplicated.
     """
-    _hf_mon_ensure_schema()
-    _hf_device_ensure_intelligence_schema()
-    _hf_device_connection_ensure_schema()
+    try:
+        _hf_mon_ensure_schema()
+        _hf_device_ensure_intelligence_schema()
+        _hf_device_connection_ensure_schema()
 
-    clean_record_id = _hf_device_normalize(record_id)
+        clean_record_id = _hf_device_normalize(record_id)
 
-    if not clean_record_id:
+        if not clean_record_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "error": "record_id_required",
+                    "message": "record_id is required.",
+                },
+            )
+
+        candidates = _hf_weather_provider_build_candidate_events(clean_record_id, payload)
+
+        created_event_summaries = []
+        skipped_event_summaries = []
+        failed_events = []
+        last_event_at = None
+
+        for candidate in candidates:
+            weather_event_type = candidate["weather_event_type"]
+            provider_event_id = _hf_weather_provider_make_provider_event_id(
+                clean_record_id,
+                weather_event_type,
+                payload.occurred_at,
+            )
+
+            existing = _hf_weather_provider_existing_event(clean_record_id, provider_event_id)
+
+            if existing:
+                skipped_event_summaries.append(
+                    _hf_weather_provider_event_summary(existing, {"provider_event_id": provider_event_id})
+                )
+
+                if existing.get("occurred_at"):
+                    last_event_at = str(existing.get("occurred_at"))
+                elif payload.occurred_at:
+                    last_event_at = payload.occurred_at
+
+                continue
+
+            try:
+                weather_payload = _HFWeatherEventIngestPayload(
+                    tenant_id=payload.tenant_id or "lateef-home-inspection",
+                    property_id=payload.property_id or "",
+                    record_id=clean_record_id,
+                    property_address=payload.property_address or "",
+                    weather_event_type=weather_event_type,
+                    severity=candidate["severity"],
+                    title=candidate["title"],
+                    summary=candidate["summary"],
+                    occurred_at=payload.occurred_at,
+                    forecast_window=payload.forecast_window or "Provider sync",
+                    rainfall_inches=payload.rainfall_inches,
+                    wind_mph=payload.wind_mph,
+                    temperature_f=payload.temperature_f,
+                    humidity_percent=payload.humidity_percent,
+                    raw_payload=_hf_weather_provider_make_raw_payload(
+                        payload,
+                        weather_event_type,
+                    ),
+                )
+
+                result = ingest_weather_event(weather_payload)
+                event_row = (result or {}).get("event") or {}
+                intelligence = (result or {}).get("intelligence") or {}
+
+                created_event_summaries.append(
+                    _hf_weather_provider_event_summary(event_row, intelligence)
+                )
+
+                if event_row.get("occurred_at"):
+                    last_event_at = str(event_row.get("occurred_at"))
+                elif payload.occurred_at:
+                    last_event_at = payload.occurred_at
+
+            except HTTPException as exc:
+                failed_events.append({
+                    "candidate": candidate,
+                    "provider_event_id": provider_event_id,
+                    "error": exc.detail,
+                })
+            except Exception as exc:
+                failed_events.append({
+                    "candidate": candidate,
+                    "provider_event_id": provider_event_id,
+                    "error": str(exc),
+                })
+
+        connection_update_summary = {
+            "updated": False,
+            "connection_id": None,
+            "provider": "weather",
+            "connection_status": None,
+            "health_status": None,
+            "last_sync_at": None,
+            "last_event_at": None,
+        }
+
+        try:
+            connection_update = _hf_weather_provider_update_connection_after_sync(
+                clean_record_id,
+                payload,
+                last_event_at,
+                len(created_event_summaries),
+            )
+
+            connection = (connection_update or {}).get("connection") or {}
+
+            connection_update_summary = {
+                "updated": bool((connection_update or {}).get("updated")),
+                "connection_id": connection.get("id"),
+                "provider": connection.get("provider"),
+                "connection_status": connection.get("connection_status"),
+                "health_status": connection.get("health_status"),
+                "last_sync_at": str(connection.get("last_sync_at") or ""),
+                "last_event_at": str(connection.get("last_event_at") or ""),
+            }
+
+        except Exception as exc:
+            failed_events.append({
+                "candidate": "connection_update",
+                "error": str(exc),
+            })
+
+        success = len(failed_events) == 0
+
+        return {
+            "success": success,
+            "message": "Weather provider adapter sync completed." if success else "Weather provider adapter sync completed with errors.",
+            "record_id": clean_record_id,
+            "candidate_count": len(candidates),
+            "created_count": len(created_event_summaries),
+            "skipped_count": len(skipped_event_summaries),
+            "failed_count": len(failed_events),
+            "created_events": created_event_summaries,
+            "skipped_events": skipped_event_summaries,
+            "failed_events": failed_events,
+            "connection_update": connection_update_summary,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
         raise HTTPException(
-            status_code=400,
+            status_code=500,
             detail={
                 "success": False,
-                "error": "record_id_required",
-                "message": "record_id is required.",
+                "error": "weather_provider_adapter_sync_failed",
+                "message": str(exc),
             },
         )
-
-    candidates = _hf_weather_provider_build_candidate_events(clean_record_id, payload)
-
-    created_results = []
-    last_event_at = None
-
-    for candidate in candidates:
-        weather_payload = _HFWeatherEventIngestPayload(
-            tenant_id=payload.tenant_id or "lateef-home-inspection",
-            property_id=payload.property_id or "",
-            record_id=clean_record_id,
-            property_address=payload.property_address or "",
-            weather_event_type=candidate["weather_event_type"],
-            severity=candidate["severity"],
-            title=candidate["title"],
-            summary=candidate["summary"],
-            occurred_at=payload.occurred_at,
-            forecast_window=payload.forecast_window or "Provider sync",
-            rainfall_inches=payload.rainfall_inches,
-            wind_mph=payload.wind_mph,
-            temperature_f=payload.temperature_f,
-            humidity_percent=payload.humidity_percent,
-            raw_payload=_hf_weather_provider_make_raw_payload(
-                payload,
-                candidate["weather_event_type"],
-            ),
-        )
-
-        result = ingest_weather_event(weather_payload)
-        created_results.append(result)
-
-        event_row = (result or {}).get("event") or {}
-        if event_row.get("occurred_at"):
-            last_event_at = event_row.get("occurred_at")
-
-    connection_update = _hf_weather_provider_update_connection_after_sync(
-        clean_record_id,
-        payload,
-        last_event_at,
-        len(created_results),
-    )
-
-    return {
-        "success": True,
-        "message": "Weather provider adapter sync completed.",
-        "record_id": clean_record_id,
-        "candidate_count": len(candidates),
-        "created_count": len(created_results),
-        "created_events": created_results,
-        "connection_update": connection_update,
-    }
-
 
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():

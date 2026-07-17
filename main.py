@@ -19075,6 +19075,7 @@ def review_monitoring_event(event_id: int, payload: _HFMonitoringEventReviewPayl
             pass
 
 
+# Monitoring Lifecycle Archived Duplicate Filter Pass 1
 @app.get("/monitoring-events/{record_id}")
 def monitoring_events_for_record(record_id: str):
     _hf_mon_ensure_schema()
@@ -19084,6 +19085,8 @@ def monitoring_events_for_record(record_id: str):
         SELECT *
         FROM integration_events
         WHERE record_id = %s
+          AND COALESCE(event_lifecycle_status, '') <> 'archived_duplicate'
+          AND COALESCE(event_status, '') <> 'archived_duplicate'
         ORDER BY COALESCE(occurred_at, created_at) DESC, id DESC
         """,
         (_hf_mon_one_line(record_id),),

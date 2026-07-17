@@ -17321,6 +17321,660 @@ def weather_event_insights_for_record(record_id: str):
     }
 
 
+
+
+# ============================================================
+# Homeowner Device Connection Registry Pass 1
+#
+# Purpose:
+# - Track homeowner-connected providers/devices at the property/record level.
+# - Store provider capabilities before real OAuth/provider integrations exist.
+# - Give HomeFax a stable registry for weather, Ting, thermostats, sensors,
+#   water leak devices, hubs, manual uploads, and email-alert fallbacks.
+#
+# New endpoints:
+# POST  /device-connections/register
+# GET   /device-connections/{record_id}
+# PATCH /device-connection/{connection_id}/status
+# ============================================================
+
+class _HFDeviceConnectionRegisterPayload(BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_id: str | None = ""
+    record_id: str
+    homeowner_email: str | None = ""
+    provider: str
+    provider_account_id: str | None = ""
+    connection_label: str | None = ""
+    connection_status: str | None = "connected"
+    capabilities: list[str] | str | None = None
+    device_count: int | None = 0
+    health_status: str | None = "healthy"
+    notes: str | None = ""
+
+
+class _HFDeviceConnectionStatusPayload(BaseModel):
+    connection_status: str | None = None
+    health_status: str | None = None
+    last_sync_at: str | None = None
+    last_event_at: str | None = None
+    device_count: int | None = None
+    notes: str | None = None
+
+
+def _hf_connection_allowed_provider(provider: str) -> str:
+    value = _hf_device_lower(provider)
+
+    aliases = {
+        "mock_leak_sensor": "mock-leak-sensor",
+        "mock leak sensor": "mock-leak-sensor",
+        "homeassistant": "home_assistant",
+        "home assistant": "home_assistant",
+        "manual": "manual_upload",
+        "email": "email_alert",
+        "weather_service": "weather",
+    }
+
+    return aliases.get(value, value)
+
+
+def _hf_connection_default_capabilities(provider: str):
+    provider_key = _hf_connection_allowed_provider(provider)
+
+    defaults = {
+        "weather": [
+            "WEATHER_RAIN",
+            "WEATHER_WIND",
+            "WEATHER_FREEZE",
+            "WEATHER_HEAT",
+            "WEATHER_DROUGHT",
+            "HUMIDITY",
+        ],
+        "ting": [
+            "ELECTRICAL_ANOMALY",
+            "ELECTRICAL_LOAD",
+        ],
+        "ecobee": [
+            "HVAC_RUNTIME",
+            "TEMPERATURE",
+            "HUMIDITY",
+        ],
+        "smartthings": [
+            "WATER_LEAK",
+            "MOISTURE",
+            "TEMPERATURE",
+            "HUMIDITY",
+            "MOTION",
+            "CONTACT",
+        ],
+        "home_assistant": [
+            "WATER_LEAK",
+            "MOISTURE",
+            "TEMPERATURE",
+            "HUMIDITY",
+            "ELECTRICAL_ANOMALY",
+            "HVAC_RUNTIME",
+            "AIR_QUALITY",
+        ],
+        "mock-leak-sensor": [
+            "WATER_LEAK",
+            "MOISTURE",
+        ],
+        "manual_upload": [
+            "PHOTO_EVIDENCE",
+            "DOCUMENT_EVIDENCE",
+            "MANUAL_CHECK",
+        ],
+        "email_alert": [
+            "EMAIL_ALERT",
+            "DOCUMENT_EVIDENCE",
+        ],
+    }
+
+    return defaults.get(provider_key, ["GENERAL_DEVICE_EVENT"])
+
+
+def _hf_connection_capabilities_json(value, provider: str):
+    try:
+        import json
+
+        if value is None or value == "":
+            capabilities = _hf_connection_default_capabilities(provider)
+        elif isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                capabilities = parsed if isinstance(parsed, list) else [value]
+            except Exception:
+                capabilities = [
+                    item.strip().upper()
+                    for item in value.split(",")
+                    if item.strip()
+                ]
+        elif isinstance(value, list):
+            capabilities = value
+        else:
+            capabilities = _hf_connection_default_capabilities(provider)
+
+        cleaned = []
+
+        for item in capabilities:
+            capability = str(item or "").strip().upper().replace(" ", "_").replace("-", "_")
+            if capability and capability not in cleaned:
+                cleaned.append(capability)
+
+        return json.dumps(cleaned)
+
+    except Exception:
+        return "[]"
+
+
+def _hf_device_connection_ensure_schema():
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS device_connections (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            tenant_id VARCHAR(128) DEFAULT 'lateef-home-inspection',
+            property_id VARCHAR(255) DEFAULT '',
+            record_id VARCHAR(255) NOT NULL,
+            homeowner_email VARCHAR(255) DEFAULT '',
+            provider VARCHAR(128) NOT NULL,
+            provider_account_id VARCHAR(255) DEFAULT '',
+            connection_label VARCHAR(255) DEFAULT '',
+            connection_status VARCHAR(64) DEFAULT 'connected',
+            capabilities_json JSON NULL,
+            device_count INT DEFAULT 0,
+            last_sync_at TIMESTAMP NULL,
+            last_event_at TIMESTAMP NULL,
+            health_status VARCHAR(64) DEFAULT 'healthy',
+            notes TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_device_connections_record_id (record_id),
+            INDEX idx_device_connections_provider (provider),
+            INDEX idx_device_connections_status (connection_status),
+            INDEX idx_device_connections_health (health_status)
+        )
+        """,
+        """
+        ALTER TABLE integration_events
+        ADD COLUMN device_connection_id BIGINT NULL
+        """,
+    ]
+
+    results = []
+
+    for statement in statements:
+        result = _hf_mon_try_execute(statement)
+
+        if not result.get("ok"):
+            error_text = str(result.get("error") or "")
+            if "Duplicate column" in error_text or "already exists" in error_text:
+                result["ok"] = True
+                result["error"] = "already_exists"
+
+        results.append(result)
+
+    failed = [item for item in results if not item.get("ok")]
+
+    if failed:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "device_connection_schema_failed",
+                "failed": failed,
+            },
+        )
+
+    return results
+
+
+def _hf_device_connection_row_to_response(row):
+    if not row:
+        return None
+
+    output = dict(row)
+    output["capabilities"] = _hf_mon_parse_json(output.get("capabilities_json"), [])
+    return output
+
+
+@app.post("/device-connections/register")
+def register_device_connection(payload: _HFDeviceConnectionRegisterPayload):
+    """
+    Register or update a homeowner-connected provider/device source.
+
+    This is the registry foundation. Real OAuth and provider-specific adapters
+    can later write to this same table.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_connection_ensure_schema()
+
+    record_id = _hf_device_normalize(payload.record_id)
+    provider = _hf_connection_allowed_provider(payload.provider)
+
+    if not record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "record_id_required",
+                "message": "record_id is required.",
+            },
+        )
+
+    if not provider:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "provider_required",
+                "message": "provider is required.",
+            },
+        )
+
+    allowed_statuses = {
+        "connected",
+        "pending",
+        "disconnected",
+        "error",
+        "needs_reauth",
+        "disabled",
+    }
+
+    connection_status = _hf_device_lower(payload.connection_status) or "connected"
+
+    if connection_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_connection_status",
+                "allowed_statuses": sorted(allowed_statuses),
+            },
+        )
+
+    allowed_health = {
+        "healthy",
+        "warning",
+        "error",
+        "unknown",
+        "syncing",
+        "stale",
+    }
+
+    health_status = _hf_device_lower(payload.health_status) or "healthy"
+
+    if health_status not in allowed_health:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_health_status",
+                "allowed_health_statuses": sorted(allowed_health),
+            },
+        )
+
+    capabilities_json = _hf_connection_capabilities_json(payload.capabilities, provider)
+    provider_account_id = _hf_device_normalize(payload.provider_account_id)
+    connection_label = _hf_device_normalize(payload.connection_label) or provider.replace("_", " ").title()
+    device_count = int(payload.device_count or 0)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM device_connections
+                WHERE record_id = %s
+                  AND provider = %s
+                  AND COALESCE(provider_account_id, '') = %s
+                LIMIT 1
+                """,
+                (record_id, provider, provider_account_id),
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                cursor.execute(
+                    """
+                    UPDATE device_connections
+                    SET
+                        tenant_id = %s,
+                        property_id = %s,
+                        homeowner_email = %s,
+                        connection_label = %s,
+                        connection_status = %s,
+                        capabilities_json = CAST(%s AS JSON),
+                        device_count = %s,
+                        health_status = %s,
+                        notes = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        _hf_device_normalize(payload.tenant_id) or "lateef-home-inspection",
+                        _hf_device_normalize(payload.property_id),
+                        _hf_device_normalize(payload.homeowner_email),
+                        connection_label,
+                        connection_status,
+                        capabilities_json,
+                        device_count,
+                        health_status,
+                        _hf_device_normalize(payload.notes),
+                        existing.get("id"),
+                    ),
+                )
+                connection_id = existing.get("id")
+                created = False
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO device_connections (
+                        tenant_id,
+                        property_id,
+                        record_id,
+                        homeowner_email,
+                        provider,
+                        provider_account_id,
+                        connection_label,
+                        connection_status,
+                        capabilities_json,
+                        device_count,
+                        health_status,
+                        notes
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        CAST(%s AS JSON),
+                        %s, %s, %s
+                    )
+                    """,
+                    (
+                        _hf_device_normalize(payload.tenant_id) or "lateef-home-inspection",
+                        _hf_device_normalize(payload.property_id),
+                        record_id,
+                        _hf_device_normalize(payload.homeowner_email),
+                        provider,
+                        provider_account_id,
+                        connection_label,
+                        connection_status,
+                        capabilities_json,
+                        device_count,
+                        health_status,
+                        _hf_device_normalize(payload.notes),
+                    ),
+                )
+                connection_id = cursor.lastrowid
+                created = True
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM device_connections
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (connection_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "created": created,
+            "message": "Device connection registered.",
+            "connection": _hf_device_connection_row_to_response(row),
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "device_connection_register_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/device-connections/{record_id}")
+def device_connections_for_record(record_id: str):
+    """
+    Return all registered homeowner/provider/device connections for a record.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_connection_ensure_schema()
+
+    rows = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM device_connections
+        WHERE record_id = %s
+        ORDER BY
+          CASE connection_status
+            WHEN 'connected' THEN 1
+            WHEN 'pending' THEN 2
+            WHEN 'needs_reauth' THEN 3
+            WHEN 'error' THEN 4
+            WHEN 'disconnected' THEN 5
+            ELSE 6
+          END,
+          provider ASC,
+          id ASC
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    connections = [_hf_device_connection_row_to_response(row) for row in rows]
+
+    capability_counts = {}
+
+    for connection in connections:
+        for capability in connection.get("capabilities", []):
+            capability_counts[capability] = capability_counts.get(capability, 0) + 1
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "count": len(connections),
+        "connections": connections,
+        "capability_counts": capability_counts,
+    }
+
+
+@app.patch("/device-connection/{connection_id}/status")
+def update_device_connection_status(connection_id: int, payload: _HFDeviceConnectionStatusPayload):
+    """
+    Update connection health/status, sync timestamps, event timestamps, and notes.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_connection_ensure_schema()
+
+    allowed_statuses = {
+        "connected",
+        "pending",
+        "disconnected",
+        "error",
+        "needs_reauth",
+        "disabled",
+    }
+
+    allowed_health = {
+        "healthy",
+        "warning",
+        "error",
+        "unknown",
+        "syncing",
+        "stale",
+    }
+
+    updates = []
+    params = []
+
+    if payload.connection_status is not None:
+        connection_status = _hf_device_lower(payload.connection_status)
+
+        if connection_status not in allowed_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "error": "invalid_connection_status",
+                    "allowed_statuses": sorted(allowed_statuses),
+                },
+            )
+
+        updates.append("connection_status = %s")
+        params.append(connection_status)
+
+    if payload.health_status is not None:
+        health_status = _hf_device_lower(payload.health_status)
+
+        if health_status not in allowed_health:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "error": "invalid_health_status",
+                    "allowed_health_statuses": sorted(allowed_health),
+                },
+            )
+
+        updates.append("health_status = %s")
+        params.append(health_status)
+
+    if payload.last_sync_at is not None:
+        updates.append("last_sync_at = %s")
+        params.append(_hf_device_normalize(payload.last_sync_at) or None)
+
+    if payload.last_event_at is not None:
+        updates.append("last_event_at = %s")
+        params.append(_hf_device_normalize(payload.last_event_at) or None)
+
+    if payload.device_count is not None:
+        updates.append("device_count = %s")
+        params.append(int(payload.device_count or 0))
+
+    if payload.notes is not None:
+        updates.append("notes = %s")
+        params.append(_hf_device_normalize(payload.notes))
+
+    if not updates:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "no_updates_provided",
+                "message": "Provide at least one field to update.",
+            },
+        )
+
+    params.append(connection_id)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM device_connections
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (connection_id,),
+            )
+            existing = cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "device_connection_not_found",
+                        "message": f"Device connection {connection_id} was not found.",
+                    },
+                )
+
+            cursor.execute(
+                f"""
+                UPDATE device_connections
+                SET {", ".join(updates)}
+                WHERE id = %s
+                """,
+                params,
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM device_connections
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (connection_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Device connection status updated.",
+            "connection": _hf_device_connection_row_to_response(row),
+        }
+
+    except HTTPException:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "device_connection_status_update_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():
     table_checks = {}

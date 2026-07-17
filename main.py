@@ -16038,6 +16038,744 @@ def _hf_mon_ensure_event_review_schema():
 
 
 
+
+
+# ============================================================
+# Device Event Intelligence Backend Pass 1
+#
+# Purpose:
+# - Ingest homeowner-owned device/weather/sensor events.
+# - Normalize provider-specific data into HomeFax capabilities.
+# - Auto-match events to property systems, findings, and monitoring plans.
+# - Generate homeowner-ready compiled insights.
+# - Keep admin out of normal device telemetry review.
+#
+# New endpoints:
+# POST  /device-events/ingest
+# GET   /device-events/{record_id}/insights
+# PATCH /device-event/{event_id}/homeowner-confirmation
+# ============================================================
+
+class _HFDeviceEventIngestPayload(BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_id: str | None = ""
+    record_id: str
+    provider: str
+    provider_event_id: str | None = ""
+    source_type: str | None = "device_event"
+    device_id: str | None = ""
+    device_name: str | None = ""
+    capability: str | None = ""
+    severity: str | None = "info"
+    system: str | None = ""
+    component: str | None = ""
+    location: str | None = ""
+    title: str | None = ""
+    summary: str | None = ""
+    raw_payload: dict | list | str | None = None
+    occurred_at: str | None = None
+
+
+class _HFDeviceEventHomeownerConfirmationPayload(BaseModel):
+    homeowner_confirmation_status: str
+    homeowner_note: str | None = ""
+    homeowner_acknowledged: str | None = "yes"
+
+
+def _hf_device_json_dumps(value):
+    try:
+        import json
+
+        if value is None:
+            return "{}"
+
+        if isinstance(value, str):
+            return value
+
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return "{}"
+
+
+def _hf_device_normalize(value) -> str:
+    return str(value or "").strip()
+
+
+def _hf_device_lower(value) -> str:
+    return _hf_device_normalize(value).lower()
+
+
+def _hf_device_infer_capability(payload: _HFDeviceEventIngestPayload) -> str:
+    explicit = _hf_device_normalize(payload.capability).upper()
+
+    if explicit:
+        return explicit
+
+    haystack = " ".join([
+        _hf_device_lower(payload.provider),
+        _hf_device_lower(payload.device_name),
+        _hf_device_lower(payload.title),
+        _hf_device_lower(payload.summary),
+        _hf_device_json_dumps(payload.raw_payload).lower(),
+    ])
+
+    if any(token in haystack for token in ["leak", "water_detected", "water detected", "moisture"]):
+        return "WATER_LEAK"
+
+    if any(token in haystack for token in ["humidity", "mold", "damp", "iaq"]):
+        return "HUMIDITY"
+
+    if any(token in haystack for token in ["ting", "voltage", "electrical", "arc", "power", "breaker"]):
+        return "ELECTRICAL_ANOMALY"
+
+    if any(token in haystack for token in ["thermostat", "hvac", "runtime", "temperature"]):
+        return "HVAC_RUNTIME"
+
+    if any(token in haystack for token in ["rain", "storm", "wind", "weather"]):
+        return "WEATHER_RAIN"
+
+    return "GENERAL_DEVICE_EVENT"
+
+
+def _hf_device_infer_system(capability: str, payload: _HFDeviceEventIngestPayload) -> str:
+    explicit = _hf_device_normalize(payload.system)
+
+    if explicit:
+        return explicit
+
+    cap = _hf_device_normalize(capability).upper()
+
+    if cap in {"WATER_LEAK", "MOISTURE"}:
+        return "Plumbing"
+
+    if cap in {"ELECTRICAL_ANOMALY", "ELECTRICAL_LOAD"}:
+        return "Electrical"
+
+    if cap in {"HVAC_RUNTIME", "TEMPERATURE"}:
+        return "HVAC"
+
+    if cap in {"HUMIDITY", "MOLD_RISK", "AIR_QUALITY", "VOC", "CO2", "RADON"}:
+        return "Indoor Air Quality"
+
+    if cap in {"WEATHER_RAIN", "WEATHER_WIND", "WEATHER_DROUGHT"}:
+        return "Weather"
+
+    return ""
+
+
+def _hf_device_infer_title(capability: str, payload: _HFDeviceEventIngestPayload) -> str:
+    explicit = _hf_device_normalize(payload.title)
+
+    if explicit:
+        return explicit
+
+    labels = {
+        "WATER_LEAK": "Water leak monitoring event",
+        "MOISTURE": "Moisture monitoring event",
+        "ELECTRICAL_ANOMALY": "Electrical monitoring event",
+        "HVAC_RUNTIME": "HVAC monitoring event",
+        "TEMPERATURE": "Temperature monitoring event",
+        "HUMIDITY": "Humidity monitoring event",
+        "MOLD_RISK": "Mold risk monitoring event",
+        "WEATHER_RAIN": "Weather rain risk event",
+        "WEATHER_WIND": "Weather wind risk event",
+        "GENERAL_DEVICE_EVENT": "Device monitoring event",
+    }
+
+    return labels.get(_hf_device_normalize(capability).upper(), "Device monitoring event")
+
+
+def _hf_device_find_matching_plan(record_id: str, capability: str, system_name: str):
+    plans = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM monitoring_plans
+        WHERE record_id = %s
+        ORDER BY id ASC
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    cap = _hf_device_normalize(capability).upper()
+    system_lower = _hf_device_lower(system_name)
+
+    best_plan = None
+    best_score = 0
+    best_reason = ""
+
+    for plan in plans:
+        allowed = plan.get("allowed_capabilities") or ""
+        risk_type = _hf_device_lower(plan.get("risk_type"))
+        plan_text = " ".join([
+            _hf_device_lower(plan.get("title")),
+            _hf_device_lower(plan.get("monitoring_plan_text")),
+            risk_type,
+            _hf_device_lower(allowed),
+        ])
+
+        score = 0
+        reasons = []
+
+        if cap and cap in str(allowed).upper():
+            score += 60
+            reasons.append(f"capability {cap} is allowed by monitoring plan")
+
+        if system_lower and system_lower in plan_text:
+            score += 15
+            reasons.append(f"system {system_name} appears in plan context")
+
+        if cap in {"WATER_LEAK", "MOISTURE"} and any(token in plan_text for token in ["water", "moisture", "leak", "plumbing"]):
+            score += 25
+            reasons.append("water/moisture event matched water-related monitoring context")
+
+        if cap == "ELECTRICAL_ANOMALY" and any(token in plan_text for token in ["electrical", "gfci", "breaker", "panel"]):
+            score += 25
+            reasons.append("electrical event matched electrical monitoring context")
+
+        if cap in {"WEATHER_RAIN", "WEATHER_WIND"} and any(token in plan_text for token in ["roof", "weather", "rain", "wind", "foundation", "drainage"]):
+            score += 25
+            reasons.append("weather event matched weather-sensitive monitoring context")
+
+        if score > best_score:
+            best_plan = plan
+            best_score = score
+            best_reason = "; ".join(reasons)
+
+    if not best_plan:
+        return None, 0.0, "No matching monitoring plan found."
+
+    confidence = min(round(best_score / 100, 2), 0.99)
+
+    return best_plan, confidence, best_reason or "Monitoring plan matched by rules engine."
+
+
+def _hf_device_find_related_issue_ids(record_id: str, capability: str, system_name: str):
+    cap = _hf_device_normalize(capability).upper()
+    system_lower = _hf_device_lower(system_name)
+
+    issue_rows = _hf_mon_fetch_all(
+        """
+        SELECT id, title, section, summary, current_status, baseline_locked, final_approval_status
+        FROM verified_issues
+        WHERE record_id = %s
+        ORDER BY id ASC
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    matches = []
+
+    for issue in issue_rows:
+        haystack = " ".join([
+            _hf_device_lower(issue.get("title")),
+            _hf_device_lower(issue.get("section")),
+            _hf_device_lower(issue.get("summary")),
+            _hf_device_lower(issue.get("current_status")),
+        ])
+
+        score = 0
+
+        if system_lower and system_lower in haystack:
+            score += 20
+
+        if cap in {"WATER_LEAK", "MOISTURE"} and any(token in haystack for token in ["leak", "water", "plumbing", "moisture", "drain"]):
+            score += 50
+
+        if cap == "ELECTRICAL_ANOMALY" and any(token in haystack for token in ["electrical", "gfci", "breaker", "panel", "wire", "outlet"]):
+            score += 50
+
+        if cap in {"HUMIDITY", "MOLD_RISK"} and any(token in haystack for token in ["mold", "humidity", "attic", "crawl", "ventilation"]):
+            score += 50
+
+        if cap in {"HVAC_RUNTIME", "TEMPERATURE"} and any(token in haystack for token in ["hvac", "heating", "cooling", "furnace", "thermostat"]):
+            score += 50
+
+        if score > 0:
+            matches.append((score, issue.get("id")))
+
+    matches.sort(reverse=True)
+
+    return [issue_id for _, issue_id in matches[:5] if issue_id is not None]
+
+
+def _hf_device_compile_insight(payload: _HFDeviceEventIngestPayload, capability: str, system_name: str, plan, confidence: float, related_issue_ids):
+    cap_label = capability.replace("_", " ").title()
+    system_label = system_name or "home system"
+
+    if capability == "WATER_LEAK":
+        title = "Water leak monitoring detected an event"
+        action = "Inspect the related area and upload a follow-up photo if moisture is present."
+    elif capability == "ELECTRICAL_ANOMALY":
+        title = "Electrical monitoring detected an anomaly"
+        action = "Review the provider alert. If alerts repeat or the provider recommends service, contact a licensed electrician."
+    elif capability in {"HUMIDITY", "MOLD_RISK"}:
+        title = "Indoor air or humidity monitoring detected a concern"
+        action = "Check the affected area for moisture, odor, staining, or ventilation problems."
+    elif capability in {"HVAC_RUNTIME", "TEMPERATURE"}:
+        title = "HVAC or temperature monitoring detected a change"
+        action = "Check comfort, thermostat settings, filter status, and recent HVAC behavior."
+    elif capability.startswith("WEATHER_"):
+        title = "Weather risk detected for a monitored home condition"
+        action = "Review related monitoring plans and check vulnerable areas after the weather event."
+    else:
+        title = f"{cap_label} event received"
+        action = "Review this device event and confirm whether it is relevant to your home."
+
+    if plan:
+        summary = (
+            f"HomeFax matched this {cap_label.lower()} event to an active monitoring plan "
+            f"for {system_label}. Match confidence: {confidence}."
+        )
+    elif related_issue_ids:
+        summary = (
+            f"HomeFax matched this {cap_label.lower()} event to related HomeFax findings "
+            f"for {system_label}. Match confidence: {confidence}."
+        )
+    else:
+        summary = (
+            f"HomeFax received this {cap_label.lower()} event for the property. "
+            "No high-confidence monitoring plan match was found yet."
+        )
+
+    return title, summary, action
+
+
+def _hf_device_ensure_intelligence_schema():
+    statements = [
+        "ALTER TABLE integration_events ADD COLUMN provider_event_id VARCHAR(255) NULL",
+        "ALTER TABLE integration_events ADD COLUMN match_status VARCHAR(64) DEFAULT 'unmatched'",
+        "ALTER TABLE integration_events ADD COLUMN match_confidence DECIMAL(5,2) DEFAULT 0",
+        "ALTER TABLE integration_events ADD COLUMN matched_by VARCHAR(64) DEFAULT 'rules_engine'",
+        "ALTER TABLE integration_events ADD COLUMN match_reason TEXT NULL",
+        "ALTER TABLE integration_events ADD COLUMN matched_issue_ids_json JSON NULL",
+        "ALTER TABLE integration_events ADD COLUMN homeowner_confirmation_status VARCHAR(64) DEFAULT 'not_required'",
+        "ALTER TABLE integration_events ADD COLUMN event_lifecycle_status VARCHAR(64) DEFAULT 'compiled'",
+        "ALTER TABLE integration_events ADD COLUMN alert_status VARCHAR(64) DEFAULT 'not_sent'",
+        "ALTER TABLE integration_events ADD COLUMN compiled_insight_title VARCHAR(255) NULL",
+        "ALTER TABLE integration_events ADD COLUMN compiled_insight_summary TEXT NULL",
+        "ALTER TABLE integration_events ADD COLUMN recommended_homeowner_action TEXT NULL",
+    ]
+
+    results = []
+
+    for statement in statements:
+        result = _hf_mon_try_execute(statement)
+
+        if not result.get("ok") and "Duplicate column" in str(result.get("error")):
+            result["ok"] = True
+            result["error"] = "already_exists"
+
+        results.append(result)
+
+    failed = [item for item in results if not item.get("ok")]
+
+    if failed:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "device_event_intelligence_schema_failed",
+                "failed": failed,
+            },
+        )
+
+    return results
+
+
+@app.post("/device-events/ingest")
+def ingest_device_event(payload: _HFDeviceEventIngestPayload):
+    """
+    Ingest and automatically compile a homeowner device/weather/sensor event.
+
+    This is not an admin review workflow. HomeFax normalizes, classifies,
+    auto-matches, scores, and creates a homeowner-ready insight.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_ensure_intelligence_schema()
+
+    record_id = _hf_device_normalize(payload.record_id)
+
+    if not record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "record_id_required",
+                "message": "record_id is required.",
+            },
+        )
+
+    provider = _hf_device_lower(payload.provider)
+
+    if not provider:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "provider_required",
+                "message": "provider is required.",
+            },
+        )
+
+    capability = _hf_device_infer_capability(payload)
+    system_name = _hf_device_infer_system(capability, payload)
+    title = _hf_device_infer_title(capability, payload)
+    severity = _hf_device_lower(payload.severity) or "info"
+
+    matched_plan, confidence, match_reason = _hf_device_find_matching_plan(record_id, capability, system_name)
+    related_issue_ids = _hf_device_find_related_issue_ids(record_id, capability, system_name)
+
+    monitoring_plan_id = matched_plan.get("id") if matched_plan else None
+    source_issue_id = matched_plan.get("source_issue_id") if matched_plan else (related_issue_ids[0] if related_issue_ids else None)
+
+    if matched_plan:
+        match_status = "auto_matched"
+    elif related_issue_ids:
+        match_status = "auto_matched"
+        confidence = max(confidence, 0.65)
+        if match_reason == "No matching monitoring plan found.":
+            match_reason = "Matched to related verified issue by rules engine."
+    else:
+        match_status = "unmatched"
+        confidence = 0.0
+
+    homeowner_confirmation_status = "pending" if severity in {"high", "critical"} or confidence < 0.75 else "not_required"
+    event_lifecycle_status = "compiled"
+    alert_status = "ready" if severity in {"high", "critical"} else "not_sent"
+
+    compiled_title, compiled_summary, recommended_action = _hf_device_compile_insight(
+        payload,
+        capability,
+        system_name,
+        matched_plan,
+        confidence,
+        related_issue_ids,
+    )
+
+    raw_payload = _hf_device_json_dumps(payload.raw_payload)
+    matched_issue_ids_json = _hf_device_json_dumps(related_issue_ids)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO integration_events (
+                  tenant_id,
+                  property_id,
+                  record_id,
+                  user_integration_id,
+                  monitoring_plan_id,
+                  source_issue_id,
+                  source_type,
+                  provider,
+                  provider_event_id,
+                  device_id,
+                  device_name,
+                  capability,
+                  `system`,
+                  component,
+                  location,
+                  title,
+                  summary,
+                  severity,
+                  event_status,
+                  homeowner_acknowledged,
+                  homeowner_note,
+                  raw_payload,
+                  occurred_at,
+                  match_status,
+                  match_confidence,
+                  matched_by,
+                  match_reason,
+                  matched_issue_ids_json,
+                  homeowner_confirmation_status,
+                  event_lifecycle_status,
+                  alert_status,
+                  compiled_insight_title,
+                  compiled_insight_summary,
+                  recommended_homeowner_action
+                )
+                VALUES (
+                  %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                  CAST(%s AS JSON),
+                  %s,
+                  %s, %s, %s, %s,
+                  CAST(%s AS JSON),
+                  %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    _hf_device_normalize(payload.tenant_id) or "lateef-home-inspection",
+                    _hf_device_normalize(payload.property_id),
+                    record_id,
+                    monitoring_plan_id,
+                    source_issue_id,
+                    _hf_device_normalize(payload.source_type) or "device_event",
+                    provider,
+                    _hf_device_normalize(payload.provider_event_id),
+                    _hf_device_normalize(payload.device_id),
+                    _hf_device_normalize(payload.device_name),
+                    capability,
+                    system_name,
+                    _hf_device_normalize(payload.component),
+                    _hf_device_normalize(payload.location),
+                    title,
+                    _hf_device_normalize(payload.summary) or compiled_summary,
+                    severity,
+                    "compiled",
+                    "no",
+                    "",
+                    raw_payload,
+                    _hf_device_normalize(payload.occurred_at) or None,
+                    match_status,
+                    confidence,
+                    "rules_engine",
+                    match_reason,
+                    matched_issue_ids_json,
+                    homeowner_confirmation_status,
+                    event_lifecycle_status,
+                    alert_status,
+                    compiled_title,
+                    compiled_summary,
+                    recommended_action,
+                ),
+            )
+
+            event_id = cursor.lastrowid
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_events
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (event_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Device event ingested and compiled by HomeFax.",
+            "event": row,
+            "intelligence": {
+                "match_status": match_status,
+                "match_confidence": float(confidence),
+                "matched_by": "rules_engine",
+                "match_reason": match_reason,
+                "matched_issue_ids": related_issue_ids,
+                "monitoring_plan_id": monitoring_plan_id,
+                "source_issue_id": source_issue_id,
+                "homeowner_confirmation_status": homeowner_confirmation_status,
+                "alert_status": alert_status,
+                "compiled_insight_title": compiled_title,
+                "compiled_insight_summary": compiled_summary,
+                "recommended_homeowner_action": recommended_action,
+            },
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "device_event_ingest_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/device-events/{record_id}/insights")
+def device_event_insights_for_record(record_id: str):
+    """
+    Return homeowner-ready compiled device/weather/sensor insights for a record.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_ensure_intelligence_schema()
+
+    events = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM integration_events
+        WHERE record_id = %s
+        ORDER BY occurred_at DESC, id DESC
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    for event in events:
+        event["raw_payload"] = _hf_mon_parse_json(event.get("raw_payload"), {})
+        event["matched_issue_ids_json"] = _hf_mon_parse_json(event.get("matched_issue_ids_json"), [])
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "count": len(events),
+        "insights": events,
+    }
+
+
+@app.patch("/device-event/{event_id}/homeowner-confirmation")
+def confirm_device_event_by_homeowner(event_id: int, payload: _HFDeviceEventHomeownerConfirmationPayload):
+    """
+    Let the homeowner confirm, deny, handle, or comment on a compiled device event.
+
+    This is the correct human-in-the-loop step for homeowner-owned devices.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_ensure_intelligence_schema()
+
+    allowed_statuses = {
+        "pending",
+        "confirmed",
+        "denied",
+        "photo_uploaded",
+        "handled",
+        "not_relevant",
+        "still_happening",
+    }
+
+    status = _hf_device_lower(payload.homeowner_confirmation_status)
+
+    if status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_homeowner_confirmation_status",
+                "message": f"Invalid homeowner_confirmation_status: {status}",
+                "allowed_statuses": sorted(allowed_statuses),
+            },
+        )
+
+    homeowner_acknowledged = _hf_device_normalize(payload.homeowner_acknowledged) or "yes"
+    homeowner_note = _hf_device_normalize(payload.homeowner_note)
+
+    if status in {"confirmed", "photo_uploaded", "still_happening"}:
+        lifecycle_status = "acknowledged_by_homeowner"
+    elif status == "handled":
+        lifecycle_status = "resolved_by_homeowner"
+    elif status in {"denied", "not_relevant"}:
+        lifecycle_status = "archived"
+    else:
+        lifecycle_status = "compiled"
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_events
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (event_id,),
+            )
+            existing = cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "device_event_not_found",
+                        "message": f"Device event {event_id} was not found.",
+                    },
+                )
+
+            cursor.execute(
+                """
+                UPDATE integration_events
+                SET
+                    homeowner_confirmation_status = %s,
+                    homeowner_acknowledged = %s,
+                    homeowner_note = %s,
+                    event_lifecycle_status = %s
+                WHERE id = %s
+                """,
+                (
+                    status,
+                    homeowner_acknowledged,
+                    homeowner_note,
+                    lifecycle_status,
+                    event_id,
+                ),
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_events
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (event_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Homeowner device event confirmation saved.",
+            "event": row,
+        }
+
+    except HTTPException:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "homeowner_device_event_confirmation_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():
     table_checks = {}

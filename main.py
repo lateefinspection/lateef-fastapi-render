@@ -17066,6 +17066,261 @@ def backfill_device_event_intelligence_for_record(record_id: str, payload: _HFDe
     }
 
 
+
+
+# ============================================================
+# Weather Event Intelligence Pass 1
+#
+# Purpose:
+# - Ingest weather risk events into the same HomeFax intelligence pipeline.
+# - Auto-match weather to weather-sensitive monitoring plans.
+# - Create homeowner-ready compiled insights.
+# - No admin review required for normal weather telemetry.
+#
+# New endpoints:
+# POST /weather-events/ingest
+# GET  /weather-events/{record_id}/insights
+# ============================================================
+
+class _HFWeatherEventIngestPayload(BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_id: str | None = ""
+    record_id: str
+    property_address: str | None = ""
+    weather_event_type: str
+    severity: str | None = "info"
+    title: str | None = ""
+    summary: str | None = ""
+    occurred_at: str | None = None
+    forecast_window: str | None = ""
+    rainfall_inches: float | None = None
+    wind_mph: float | None = None
+    temperature_f: float | None = None
+    humidity_percent: float | None = None
+    raw_payload: dict | list | str | None = None
+
+
+def _hf_weather_event_type(value) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _hf_weather_capability(weather_event_type: str) -> str:
+    event_type = _hf_weather_event_type(weather_event_type)
+
+    mapping = {
+        "heavy_rain": "WEATHER_RAIN",
+        "rain": "WEATHER_RAIN",
+        "storm": "WEATHER_RAIN",
+        "thunderstorm": "WEATHER_RAIN",
+        "high_wind": "WEATHER_WIND",
+        "wind": "WEATHER_WIND",
+        "freeze": "WEATHER_FREEZE",
+        "freezing": "WEATHER_FREEZE",
+        "heat": "WEATHER_HEAT",
+        "extreme_heat": "WEATHER_HEAT",
+        "drought": "WEATHER_DROUGHT",
+        "dry_period": "WEATHER_DROUGHT",
+        "humidity": "HUMIDITY",
+        "high_humidity": "HUMIDITY",
+    }
+
+    return mapping.get(event_type, "WEATHER_EVENT")
+
+
+def _hf_weather_system_for_capability(capability: str) -> str:
+    cap = str(capability or "").strip().upper()
+
+    if cap in {"WEATHER_RAIN", "WEATHER_WIND", "WEATHER_FREEZE", "WEATHER_HEAT", "WEATHER_DROUGHT"}:
+        return "Weather"
+
+    if cap == "HUMIDITY":
+        return "Indoor Air Quality"
+
+    return "Weather"
+
+
+def _hf_weather_default_title(weather_event_type: str, capability: str) -> str:
+    event_type = _hf_weather_event_type(weather_event_type)
+
+    labels = {
+        "heavy_rain": "Heavy rain risk detected",
+        "rain": "Rain risk detected",
+        "storm": "Storm risk detected",
+        "thunderstorm": "Storm risk detected",
+        "high_wind": "High wind risk detected",
+        "wind": "Wind risk detected",
+        "freeze": "Freeze risk detected",
+        "freezing": "Freeze risk detected",
+        "heat": "Heat risk detected",
+        "extreme_heat": "Extreme heat risk detected",
+        "drought": "Drought risk detected",
+        "dry_period": "Extended dry period risk detected",
+        "humidity": "Humidity risk detected",
+        "high_humidity": "High humidity risk detected",
+    }
+
+    return labels.get(event_type, capability.replace("_", " ").title())
+
+
+def _hf_weather_default_summary(payload: _HFWeatherEventIngestPayload, capability: str) -> str:
+    parts = []
+
+    if payload.property_address:
+        parts.append(f"Weather risk detected near {payload.property_address}.")
+
+    event_label = _hf_weather_event_type(payload.weather_event_type).replace("_", " ")
+
+    if event_label:
+        parts.append(f"Event type: {event_label}.")
+
+    if payload.forecast_window:
+        parts.append(f"Forecast window: {payload.forecast_window}.")
+
+    if payload.rainfall_inches is not None:
+        parts.append(f"Rainfall: {payload.rainfall_inches} inches.")
+
+    if payload.wind_mph is not None:
+        parts.append(f"Wind: {payload.wind_mph} mph.")
+
+    if payload.temperature_f is not None:
+        parts.append(f"Temperature: {payload.temperature_f}°F.")
+
+    if payload.humidity_percent is not None:
+        parts.append(f"Humidity: {payload.humidity_percent}%.")
+
+    if not parts:
+        parts.append(f"HomeFax received a {capability.replace('_', ' ').lower()} weather event for this property.")
+
+    return " ".join(parts)
+
+
+def _hf_weather_raw_payload(payload: _HFWeatherEventIngestPayload, capability: str):
+    base = {
+        "weather_event_type": _hf_weather_event_type(payload.weather_event_type),
+        "capability": capability,
+        "property_address": payload.property_address or "",
+        "forecast_window": payload.forecast_window or "",
+        "rainfall_inches": payload.rainfall_inches,
+        "wind_mph": payload.wind_mph,
+        "temperature_f": payload.temperature_f,
+        "humidity_percent": payload.humidity_percent,
+    }
+
+    if payload.raw_payload:
+        base["source_payload"] = payload.raw_payload
+
+    return base
+
+
+@app.post("/weather-events/ingest")
+def ingest_weather_event(payload: _HFWeatherEventIngestPayload):
+    """
+    Ingest a weather event and compile it through the existing HomeFax device/event intelligence layer.
+
+    This endpoint is provider-neutral. Later, live weather providers can call this endpoint
+    or feed the same normalized payload shape.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_ensure_intelligence_schema()
+
+    record_id = _hf_device_normalize(payload.record_id)
+
+    if not record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "record_id_required",
+                "message": "record_id is required.",
+            },
+        )
+
+    weather_event_type = _hf_weather_event_type(payload.weather_event_type)
+
+    if not weather_event_type:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "weather_event_type_required",
+                "message": "weather_event_type is required.",
+            },
+        )
+
+    capability = _hf_weather_capability(weather_event_type)
+    system_name = _hf_weather_system_for_capability(capability)
+    title = _hf_device_normalize(payload.title) or _hf_weather_default_title(weather_event_type, capability)
+    summary = _hf_device_normalize(payload.summary) or _hf_weather_default_summary(payload, capability)
+
+    device_payload = _HFDeviceEventIngestPayload(
+        tenant_id=payload.tenant_id or "lateef-home-inspection",
+        property_id=payload.property_id or "",
+        record_id=record_id,
+        provider="weather",
+        provider_event_id=f"weather-{record_id}-{weather_event_type}-{_hf_device_normalize(payload.occurred_at) or 'now'}",
+        source_type="weather_event",
+        device_id="weather-service",
+        device_name="HomeFax Weather Intelligence",
+        capability=capability,
+        severity=payload.severity or "info",
+        system=system_name,
+        component="",
+        location=payload.property_address or "",
+        title=title,
+        summary=summary,
+        raw_payload=_hf_weather_raw_payload(payload, capability),
+        occurred_at=payload.occurred_at,
+    )
+
+    result = ingest_device_event(device_payload)
+
+    if isinstance(result, dict):
+        result["weather_intelligence"] = {
+            "weather_event_type": weather_event_type,
+            "capability": capability,
+            "system": system_name,
+            "property_address": payload.property_address or "",
+            "forecast_window": payload.forecast_window or "",
+        }
+
+    return result
+
+
+@app.get("/weather-events/{record_id}/insights")
+def weather_event_insights_for_record(record_id: str):
+    """
+    Return weather-only HomeFax intelligence events for a record.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_ensure_intelligence_schema()
+
+    events = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM integration_events
+        WHERE record_id = %s
+          AND (
+            source_type = 'weather_event'
+            OR provider = 'weather'
+            OR capability LIKE 'WEATHER%%'
+          )
+        ORDER BY occurred_at DESC, id DESC
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    for event in events:
+        event["raw_payload"] = _hf_mon_parse_json(event.get("raw_payload"), {})
+        event["matched_issue_ids_json"] = _hf_mon_parse_json(event.get("matched_issue_ids_json"), [])
+
+    return {
+        "success": True,
+        "record_id": record_id,
+        "count": len(events),
+        "weather_insights": events,
+    }
+
+
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():
     table_checks = {}

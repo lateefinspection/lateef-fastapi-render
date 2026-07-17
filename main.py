@@ -16776,6 +16776,296 @@ def confirm_device_event_by_homeowner(event_id: int, payload: _HFDeviceEventHome
             pass
 
 
+
+
+# ============================================================
+# Device Event Backfill Pass 1
+#
+# Purpose:
+# - Reprocess older integration_events through the Device Event Intelligence layer.
+# - Fill compiled homeowner insight fields for events created before intelligence existed.
+# - Keep admin out of normal device telemetry review.
+#
+# New endpoint:
+# POST /device-events/{record_id}/backfill-intelligence
+# ============================================================
+
+class _HFDeviceEventBackfillPayload(BaseModel):
+    force: bool | None = False
+    limit: int | None = 100
+
+
+class _HFDeviceEventBackfillShim:
+    """
+    Small object used to reuse Device Event Intelligence helper functions
+    against existing integration_events rows.
+    """
+
+    def __init__(self, row: dict):
+        self.tenant_id = row.get("tenant_id") or "lateef-home-inspection"
+        self.property_id = row.get("property_id") or ""
+        self.record_id = row.get("record_id") or ""
+        self.provider = row.get("provider") or ""
+        self.provider_event_id = row.get("provider_event_id") or ""
+        self.source_type = row.get("source_type") or "device_event"
+        self.device_id = row.get("device_id") or ""
+        self.device_name = row.get("device_name") or ""
+        self.capability = row.get("capability") or ""
+        self.severity = row.get("severity") or "info"
+        self.system = row.get("system") or row.get("`system`") or ""
+        self.component = row.get("component") or ""
+        self.location = row.get("location") or ""
+        self.title = row.get("title") or ""
+        self.summary = row.get("summary") or ""
+        self.raw_payload = row.get("raw_payload") or {}
+        self.occurred_at = row.get("occurred_at")
+
+
+def _hf_device_event_needs_backfill(row: dict, force: bool = False) -> bool:
+    if force:
+        return True
+
+    missing_values = [
+        row.get("compiled_insight_title"),
+        row.get("compiled_insight_summary"),
+        row.get("recommended_homeowner_action"),
+        row.get("match_status"),
+    ]
+
+    if any(value is None or str(value).strip() == "" for value in missing_values):
+        return True
+
+    if str(row.get("match_status") or "").strip().lower() in {"", "unmatched"}:
+        return True
+
+    return False
+
+
+def _hf_device_backfill_event_row(row: dict, force: bool = False):
+    event_id = row.get("id")
+
+    if not event_id:
+        return {
+            "ok": False,
+            "error": "missing_event_id",
+            "event_id": None,
+        }
+
+    if not _hf_device_event_needs_backfill(row, force=force):
+        return {
+            "ok": True,
+            "skipped": True,
+            "event_id": event_id,
+            "reason": "already_has_intelligence",
+        }
+
+    payload = _HFDeviceEventBackfillShim(row)
+
+    record_id = _hf_device_normalize(payload.record_id)
+    capability = _hf_device_infer_capability(payload)
+    system_name = _hf_device_infer_system(capability, payload)
+    severity = _hf_device_lower(payload.severity) or "info"
+
+    matched_plan, confidence, match_reason = _hf_device_find_matching_plan(record_id, capability, system_name)
+    related_issue_ids = _hf_device_find_related_issue_ids(record_id, capability, system_name)
+
+    monitoring_plan_id = matched_plan.get("id") if matched_plan else row.get("monitoring_plan_id")
+    source_issue_id = (
+        matched_plan.get("source_issue_id")
+        if matched_plan
+        else row.get("source_issue_id") or (related_issue_ids[0] if related_issue_ids else None)
+    )
+
+    if matched_plan:
+        match_status = "auto_matched"
+    elif related_issue_ids:
+        match_status = "auto_matched"
+        confidence = max(confidence, 0.65)
+        if match_reason == "No matching monitoring plan found.":
+            match_reason = "Matched to related verified issue by rules engine."
+    else:
+        match_status = "unmatched"
+        confidence = 0.0
+
+    homeowner_confirmation_status = row.get("homeowner_confirmation_status")
+
+    if not homeowner_confirmation_status:
+        homeowner_confirmation_status = (
+            "pending"
+            if severity in {"high", "critical"} or confidence < 0.75
+            else "not_required"
+        )
+
+    event_lifecycle_status = row.get("event_lifecycle_status") or "compiled"
+    alert_status = row.get("alert_status") or ("ready" if severity in {"high", "critical"} else "not_sent")
+
+    compiled_title, compiled_summary, recommended_action = _hf_device_compile_insight(
+        payload,
+        capability,
+        system_name,
+        matched_plan,
+        confidence,
+        related_issue_ids,
+    )
+
+    if not compiled_summary and row.get("summary"):
+        compiled_summary = row.get("summary")
+
+    matched_issue_ids_json = _hf_device_json_dumps(related_issue_ids)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE integration_events
+                SET
+                    monitoring_plan_id = %s,
+                    source_issue_id = %s,
+                    capability = %s,
+                    `system` = %s,
+                    match_status = %s,
+                    match_confidence = %s,
+                    matched_by = %s,
+                    match_reason = %s,
+                    matched_issue_ids_json = CAST(%s AS JSON),
+                    homeowner_confirmation_status = %s,
+                    event_lifecycle_status = %s,
+                    alert_status = %s,
+                    compiled_insight_title = %s,
+                    compiled_insight_summary = %s,
+                    recommended_homeowner_action = %s
+                WHERE id = %s
+                """,
+                (
+                    monitoring_plan_id,
+                    source_issue_id,
+                    capability,
+                    system_name,
+                    match_status,
+                    confidence,
+                    "rules_engine",
+                    match_reason,
+                    matched_issue_ids_json,
+                    homeowner_confirmation_status,
+                    event_lifecycle_status,
+                    alert_status,
+                    compiled_title,
+                    compiled_summary,
+                    recommended_action,
+                    event_id,
+                ),
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM integration_events
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (event_id,),
+            )
+            updated = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "ok": True,
+            "skipped": False,
+            "event_id": event_id,
+            "provider": row.get("provider"),
+            "capability": capability,
+            "match_status": match_status,
+            "match_confidence": float(confidence),
+            "monitoring_plan_id": monitoring_plan_id,
+            "source_issue_id": source_issue_id,
+            "matched_issue_ids": related_issue_ids,
+            "compiled_insight_title": compiled_title,
+            "updated_event": updated,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        return {
+            "ok": False,
+            "skipped": False,
+            "event_id": event_id,
+            "error": str(exc),
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/device-events/{record_id}/backfill-intelligence")
+def backfill_device_event_intelligence_for_record(record_id: str, payload: _HFDeviceEventBackfillPayload = _HFDeviceEventBackfillPayload()):
+    """
+    Backfill compiled HomeFax intelligence fields for existing integration_events rows.
+
+    This is useful for events created before Device Event Intelligence Backend Pass 1.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_ensure_intelligence_schema()
+
+    limit = int(payload.limit or 100)
+
+    if limit < 1:
+        limit = 1
+
+    if limit > 500:
+        limit = 500
+
+    events = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM integration_events
+        WHERE record_id = %s
+        ORDER BY id ASC
+        LIMIT %s
+        """,
+        (_hf_mon_one_line(record_id), limit),
+    )
+
+    results = []
+    updated_count = 0
+    skipped_count = 0
+    failed_count = 0
+
+    for row in events:
+        result = _hf_device_backfill_event_row(row, force=bool(payload.force))
+        results.append(result)
+
+        if result.get("ok") and result.get("skipped"):
+            skipped_count += 1
+        elif result.get("ok"):
+            updated_count += 1
+        else:
+            failed_count += 1
+
+    return {
+        "success": failed_count == 0,
+        "record_id": record_id,
+        "checked_count": len(events),
+        "updated_count": updated_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "results": results,
+    }
+
+
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():
     table_checks = {}

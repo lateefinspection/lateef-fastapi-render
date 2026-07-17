@@ -18522,6 +18522,172 @@ def sync_weather_provider_for_record(record_id: str, payload: _HFWeatherProvider
             },
         )
 
+
+
+# ============================================================
+# Weather Provider Duplicate Cleanup Pass 1
+#
+# Purpose:
+# - Archive duplicate weather provider events created before adapter idempotency.
+# - Keep the earliest row for each provider_event_id.
+# - Mark later rows as duplicate/archived instead of hard-deleting production data.
+#
+# New endpoint:
+# POST /weather-provider/{record_id}/cleanup-duplicates
+# ============================================================
+
+class _HFWeatherProviderDuplicateCleanupPayload(BaseModel):
+    dry_run: bool | None = True
+    provider: str | None = "weather"
+
+
+def _hf_weather_provider_duplicate_groups(record_id: str, provider: str = "weather"):
+    rows = _hf_mon_fetch_all(
+        """
+        SELECT
+            provider_event_id,
+            COUNT(*) AS duplicate_count,
+            MIN(id) AS keep_id
+        FROM integration_events
+        WHERE record_id = %s
+          AND provider = %s
+          AND provider_event_id IS NOT NULL
+          AND provider_event_id <> ''
+        GROUP BY provider_event_id
+        HAVING COUNT(*) > 1
+        ORDER BY provider_event_id ASC
+        """,
+        (_hf_mon_one_line(record_id), provider),
+    )
+
+    return rows
+
+
+def _hf_weather_provider_duplicate_rows(record_id: str, provider: str, provider_event_id: str, keep_id: int):
+    rows = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM integration_events
+        WHERE record_id = %s
+          AND provider = %s
+          AND provider_event_id = %s
+          AND id <> %s
+        ORDER BY id ASC
+        """,
+        (_hf_mon_one_line(record_id), provider, provider_event_id, keep_id),
+    )
+
+    return rows
+
+
+@app.post("/weather-provider/{record_id}/cleanup-duplicates")
+def cleanup_weather_provider_duplicates(record_id: str, payload: _HFWeatherProviderDuplicateCleanupPayload = _HFWeatherProviderDuplicateCleanupPayload()):
+    """
+    Archive duplicate weather provider events.
+
+    Keeps the earliest event id per provider_event_id and marks later duplicates
+    as archived duplicate rows. Use dry_run=true first.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_ensure_intelligence_schema()
+
+    provider = _hf_device_lower(payload.provider) or "weather"
+    dry_run = bool(payload.dry_run)
+
+    groups = _hf_weather_provider_duplicate_groups(record_id, provider)
+
+    cleanup_results = []
+    archived_count = 0
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        for group in groups:
+            provider_event_id = group.get("provider_event_id")
+            keep_id = int(group.get("keep_id"))
+
+            duplicate_rows = _hf_weather_provider_duplicate_rows(
+                record_id,
+                provider,
+                provider_event_id,
+                keep_id,
+            )
+
+            duplicate_ids = [row.get("id") for row in duplicate_rows]
+
+            cleanup_results.append({
+                "provider_event_id": provider_event_id,
+                "duplicate_count": int(group.get("duplicate_count") or 0),
+                "keep_id": keep_id,
+                "duplicate_ids_to_archive": duplicate_ids,
+            })
+
+            if dry_run or not duplicate_ids:
+                continue
+
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE integration_events
+                    SET
+                        event_lifecycle_status = 'archived_duplicate',
+                        homeowner_confirmation_status = 'not_relevant',
+                        alert_status = 'archived',
+                        event_status = 'archived_duplicate',
+                        match_reason = CONCAT(
+                            COALESCE(match_reason, ''),
+                            CASE
+                                WHEN COALESCE(match_reason, '') = '' THEN ''
+                                ELSE ' | '
+                            END,
+                            'Archived duplicate weather provider event; kept event id {keep_id}.'
+                        )
+                    WHERE id IN ({", ".join(["%s"] * len(duplicate_ids))})
+                    """,
+                    duplicate_ids,
+                )
+
+            archived_count += len(duplicate_ids)
+
+        if not dry_run:
+            conn.commit()
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "provider": provider,
+            "dry_run": dry_run,
+            "duplicate_group_count": len(groups),
+            "archived_count": archived_count,
+            "results": cleanup_results,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "weather_provider_duplicate_cleanup_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():
     table_checks = {}

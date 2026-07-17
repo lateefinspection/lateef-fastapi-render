@@ -18280,9 +18280,12 @@ def _hf_weather_provider_update_connection_after_sync(record_id: str, payload: _
 
     update_result = update_device_connection_status(
         int(connection_id),
+        # Weather Connection Health Status Fix Pass 1
+        # A successful provider sync is healthy even when all candidate events
+        # were skipped because they already existed.
         _HFDeviceConnectionStatusPayload(
             connection_status="connected",
-            health_status="healthy" if created_count else "warning",
+            health_status="healthy",
             last_sync_at=sync_time,
             last_event_at=last_event_at or sync_time,
             device_count=1,

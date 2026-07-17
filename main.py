@@ -18696,6 +18696,330 @@ def cleanup_weather_provider_duplicates(record_id: str, payload: _HFWeatherProvi
             pass
 
 
+
+
+# ============================================================
+# Device Connection Health Automation Pass 1
+#
+# Purpose:
+# - Automatically evaluate provider/device connection health.
+# - Use last_sync_at, last_event_at, provider type, and connection_status.
+# - Update device_connections.health_status without touching event history.
+#
+# New endpoint:
+# POST /device-connections/{record_id}/health-check
+# ============================================================
+
+class _HFDeviceConnectionHealthCheckPayload(BaseModel):
+    dry_run: bool | None = True
+
+
+def _hf_connection_parse_datetime(value):
+    if not value:
+        return None
+
+    try:
+        from datetime import datetime
+
+        if hasattr(value, "isoformat"):
+            return value
+
+        raw = str(value).strip()
+
+        if not raw:
+            return None
+
+        # MySQL often returns "YYYY-MM-DD HH:MM:SS"; API rows may use ISO format.
+        normalized = raw.replace("T", " ").replace("Z", "").split(".")[0]
+
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(normalized, fmt)
+            except Exception:
+                pass
+
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    except Exception:
+        return None
+
+
+def _hf_connection_age_hours(value):
+    from datetime import datetime
+
+    parsed = _hf_connection_parse_datetime(value)
+
+    if not parsed:
+        return None
+
+    try:
+        return max(0, (datetime.utcnow() - parsed).total_seconds() / 3600)
+    except Exception:
+        return None
+
+
+def _hf_connection_best_activity_age_hours(connection):
+    sync_age = _hf_connection_age_hours(connection.get("last_sync_at"))
+    event_age = _hf_connection_age_hours(connection.get("last_event_at"))
+
+    ages = [age for age in [sync_age, event_age] if age is not None]
+
+    if not ages:
+        return None
+
+    return min(ages)
+
+
+def _hf_connection_expected_policy(provider: str):
+    provider_key = _hf_connection_allowed_provider(provider)
+
+    policies = {
+        "weather": {
+            "healthy_hours": 24,
+            "stale_hours": 48,
+            "warning_hours": 72,
+            "no_activity_health": "warning",
+            "reason": "Weather sources should sync at least daily.",
+        },
+        "ting": {
+            "healthy_hours": 168,
+            "stale_hours": 336,
+            "warning_hours": 720,
+            "no_activity_health": "stale",
+            "reason": "Electrical monitors may not emit frequent events, but should check in periodically.",
+        },
+        "ecobee": {
+            "healthy_hours": 48,
+            "stale_hours": 168,
+            "warning_hours": 336,
+            "no_activity_health": "stale",
+            "reason": "Thermostat integrations should sync every 1-2 days.",
+        },
+        "smartthings": {
+            "healthy_hours": 72,
+            "stale_hours": 168,
+            "warning_hours": 336,
+            "no_activity_health": "stale",
+            "reason": "Hub/device integrations should sync periodically.",
+        },
+        "home_assistant": {
+            "healthy_hours": 72,
+            "stale_hours": 168,
+            "warning_hours": 336,
+            "no_activity_health": "stale",
+            "reason": "Local hub integrations should sync periodically.",
+        },
+        "mock-leak-sensor": {
+            "healthy_hours": None,
+            "stale_hours": None,
+            "warning_hours": None,
+            "no_activity_health": "healthy",
+            "reason": "Mock sensors are test/manual sources and may not sync on a schedule.",
+        },
+        "manual_upload": {
+            "healthy_hours": None,
+            "stale_hours": None,
+            "warning_hours": None,
+            "no_activity_health": "healthy",
+            "reason": "Manual upload sources do not require automated sync.",
+        },
+        "email_alert": {
+            "healthy_hours": None,
+            "stale_hours": None,
+            "warning_hours": None,
+            "no_activity_health": "healthy",
+            "reason": "Email alert sources are passive and do not require frequent sync.",
+        },
+    }
+
+    return policies.get(provider_key, {
+        "healthy_hours": 168,
+        "stale_hours": 336,
+        "warning_hours": 720,
+        "no_activity_health": "unknown",
+        "reason": "Generic provider policy applied.",
+    })
+
+
+def _hf_connection_calculate_health(connection):
+    provider = _hf_connection_allowed_provider(connection.get("provider") or "")
+    connection_status = _hf_device_lower(connection.get("connection_status") or "")
+
+    if connection_status in {"disconnected", "disabled", "needs_reauth", "error"}:
+        mapped = {
+            "disconnected": "stale",
+            "disabled": "unknown",
+            "needs_reauth": "warning",
+            "error": "error",
+        }
+
+        return {
+            "provider": provider,
+            "connection_status": connection_status,
+            "current_health_status": connection.get("health_status"),
+            "recommended_health_status": mapped.get(connection_status, "warning"),
+            "activity_age_hours": _hf_connection_best_activity_age_hours(connection),
+            "reason": f"Connection status is {connection_status}.",
+        }
+
+    policy = _hf_connection_expected_policy(provider)
+    age_hours = _hf_connection_best_activity_age_hours(connection)
+
+    if age_hours is None:
+        return {
+            "provider": provider,
+            "connection_status": connection_status or "connected",
+            "current_health_status": connection.get("health_status"),
+            "recommended_health_status": policy["no_activity_health"],
+            "activity_age_hours": None,
+            "reason": policy["reason"] + " No sync or event timestamp is saved yet.",
+        }
+
+    healthy_hours = policy.get("healthy_hours")
+    stale_hours = policy.get("stale_hours")
+    warning_hours = policy.get("warning_hours")
+
+    if healthy_hours is None:
+        recommended = "healthy"
+    elif age_hours <= healthy_hours:
+        recommended = "healthy"
+    elif stale_hours is not None and age_hours <= stale_hours:
+        recommended = "stale"
+    elif warning_hours is not None and age_hours <= warning_hours:
+        recommended = "warning"
+    else:
+        recommended = "error"
+
+    return {
+        "provider": provider,
+        "connection_status": connection_status or "connected",
+        "current_health_status": connection.get("health_status"),
+        "recommended_health_status": recommended,
+        "activity_age_hours": round(age_hours, 2),
+        "reason": policy["reason"],
+    }
+
+
+@app.post("/device-connections/{record_id}/health-check")
+def health_check_device_connections_for_record(record_id: str, payload: _HFDeviceConnectionHealthCheckPayload = _HFDeviceConnectionHealthCheckPayload()):
+    """
+    Evaluate device/weather connection health for a record.
+
+    dry_run=true returns recommendations only.
+    dry_run=false updates health_status and notes.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_connection_ensure_schema()
+
+    dry_run = bool(payload.dry_run)
+
+    rows = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM device_connections
+        WHERE record_id = %s
+        ORDER BY provider ASC, id ASC
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    results = []
+    update_count = 0
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        for row in rows:
+            assessment = _hf_connection_calculate_health(row)
+
+            current_health = _hf_device_lower(row.get("health_status") or "")
+            recommended_health = _hf_device_lower(assessment.get("recommended_health_status") or "unknown")
+            changed = current_health != recommended_health
+
+            result = {
+                "id": row.get("id"),
+                "provider": row.get("provider"),
+                "connection_label": row.get("connection_label"),
+                "connection_status": row.get("connection_status"),
+                "current_health_status": row.get("health_status"),
+                "recommended_health_status": recommended_health,
+                "changed": changed,
+                "dry_run": dry_run,
+                "last_sync_at": str(row.get("last_sync_at") or ""),
+                "last_event_at": str(row.get("last_event_at") or ""),
+                "activity_age_hours": assessment.get("activity_age_hours"),
+                "reason": assessment.get("reason"),
+            }
+
+            results.append(result)
+
+            if dry_run or not changed:
+                continue
+
+            note = (
+                f"Automated health check set health_status to {recommended_health}. "
+                f"{assessment.get('reason') or ''}"
+            ).strip()
+
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE device_connections
+                    SET
+                        health_status = %s,
+                        notes = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        recommended_health,
+                        note,
+                        row.get("id"),
+                    ),
+                )
+
+            update_count += 1
+
+        if not dry_run:
+            conn.commit()
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "dry_run": dry_run,
+            "count": len(results),
+            "update_count": update_count,
+            "results": results,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "device_connection_health_check_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():
     table_checks = {}

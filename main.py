@@ -17975,6 +17975,403 @@ def update_device_connection_status(connection_id: int, payload: _HFDeviceConnec
             pass
 
 
+
+
+# ============================================================
+# Weather Provider Adapter Pass 1
+#
+# Purpose:
+# - Convert provider-style weather sync payloads into HomeFax weather events.
+# - Reuse the existing Weather Event Intelligence pipeline.
+# - Update the weather device connection registry after sync.
+# - Keep this provider-neutral so OpenWeather, NOAA, Tomorrow.io, WeatherAPI,
+#   or any future provider can plug in later.
+#
+# New endpoint:
+# POST /weather-provider/{record_id}/sync
+# ============================================================
+
+class _HFWeatherProviderSyncPayload(BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_id: str | None = ""
+    property_address: str | None = ""
+    homeowner_email: str | None = ""
+    provider: str | None = "weather"
+    provider_account_id: str | None = ""
+    forecast_window: str | None = "Provider sync"
+    occurred_at: str | None = None
+
+    rainfall_inches: float | None = None
+    wind_mph: float | None = None
+    temperature_f: float | None = None
+    humidity_percent: float | None = None
+    dry_days: int | None = None
+
+    raw_payload: dict | list | str | None = None
+
+    create_low_risk_events: bool | None = False
+
+
+def _hf_weather_provider_severity_for_rain(rainfall_inches):
+    if rainfall_inches is None:
+        return None
+
+    try:
+        rain = float(rainfall_inches)
+    except Exception:
+        return None
+
+    if rain >= 1.0:
+        return "high"
+
+    if rain >= 0.5:
+        return "medium"
+
+    if rain > 0:
+        return "info"
+
+    return None
+
+
+def _hf_weather_provider_severity_for_wind(wind_mph):
+    if wind_mph is None:
+        return None
+
+    try:
+        wind = float(wind_mph)
+    except Exception:
+        return None
+
+    if wind >= 58:
+        return "high"
+
+    if wind >= 40:
+        return "medium"
+
+    if wind >= 25:
+        return "info"
+
+    return None
+
+
+def _hf_weather_provider_severity_for_temperature(temperature_f):
+    if temperature_f is None:
+        return None, None
+
+    try:
+        temp = float(temperature_f)
+    except Exception:
+        return None, None
+
+    if temp <= 20:
+        return "freeze", "high"
+
+    if temp <= 32:
+        return "freeze", "medium"
+
+    if temp >= 100:
+        return "heat", "high"
+
+    if temp >= 90:
+        return "heat", "medium"
+
+    return None, None
+
+
+def _hf_weather_provider_severity_for_humidity(humidity_percent):
+    if humidity_percent is None:
+        return None
+
+    try:
+        humidity = float(humidity_percent)
+    except Exception:
+        return None
+
+    if humidity >= 75:
+        return "high"
+
+    if humidity >= 65:
+        return "medium"
+
+    if humidity >= 55:
+        return "info"
+
+    return None
+
+
+def _hf_weather_provider_severity_for_drought(dry_days):
+    if dry_days is None:
+        return None
+
+    try:
+        days = int(dry_days)
+    except Exception:
+        return None
+
+    if days >= 21:
+        return "high"
+
+    if days >= 14:
+        return "medium"
+
+    if days >= 7:
+        return "info"
+
+    return None
+
+
+def _hf_weather_provider_make_raw_payload(payload: _HFWeatherProviderSyncPayload, event_type: str):
+    return {
+        "adapter": "homefax_weather_provider_adapter_pass_1",
+        "provider": payload.provider or "weather",
+        "provider_account_id": payload.provider_account_id or "",
+        "event_type": event_type,
+        "forecast_window": payload.forecast_window or "",
+        "rainfall_inches": payload.rainfall_inches,
+        "wind_mph": payload.wind_mph,
+        "temperature_f": payload.temperature_f,
+        "humidity_percent": payload.humidity_percent,
+        "dry_days": payload.dry_days,
+        "source_payload": payload.raw_payload or {},
+    }
+
+
+def _hf_weather_provider_build_candidate_events(record_id: str, payload: _HFWeatherProviderSyncPayload):
+    candidates = []
+
+    rain_severity = _hf_weather_provider_severity_for_rain(payload.rainfall_inches)
+    if rain_severity and (rain_severity != "info" or payload.create_low_risk_events):
+        candidates.append({
+            "weather_event_type": "heavy_rain" if rain_severity in {"medium", "high"} else "rain",
+            "severity": rain_severity,
+            "title": "Heavy rain risk near monitored home conditions" if rain_severity in {"medium", "high"} else "Rain event near monitored home conditions",
+            "summary": f"Weather provider sync detected {payload.rainfall_inches} inches of rain for this property.",
+        })
+
+    wind_severity = _hf_weather_provider_severity_for_wind(payload.wind_mph)
+    if wind_severity and (wind_severity != "info" or payload.create_low_risk_events):
+        candidates.append({
+            "weather_event_type": "high_wind",
+            "severity": wind_severity,
+            "title": "High wind risk near monitored exterior and roof conditions",
+            "summary": f"Weather provider sync detected wind near {payload.wind_mph} mph for this property.",
+        })
+
+    temp_event_type, temp_severity = _hf_weather_provider_severity_for_temperature(payload.temperature_f)
+    if temp_event_type and temp_severity and (temp_severity != "info" or payload.create_low_risk_events):
+        if temp_event_type == "freeze":
+            title = "Freeze risk near monitored home systems"
+            summary = f"Weather provider sync detected freezing temperature near {payload.temperature_f}°F."
+        else:
+            title = "Heat risk near monitored home systems"
+            summary = f"Weather provider sync detected high temperature near {payload.temperature_f}°F."
+
+        candidates.append({
+            "weather_event_type": temp_event_type,
+            "severity": temp_severity,
+            "title": title,
+            "summary": summary,
+        })
+
+    humidity_severity = _hf_weather_provider_severity_for_humidity(payload.humidity_percent)
+    if humidity_severity and (humidity_severity != "info" or payload.create_low_risk_events):
+        candidates.append({
+            "weather_event_type": "humidity",
+            "severity": humidity_severity,
+            "title": "Humidity risk near monitored indoor air conditions",
+            "summary": f"Weather provider sync detected humidity near {payload.humidity_percent}% for this property.",
+        })
+
+    drought_severity = _hf_weather_provider_severity_for_drought(payload.dry_days)
+    if drought_severity and (drought_severity != "info" or payload.create_low_risk_events):
+        candidates.append({
+            "weather_event_type": "drought",
+            "severity": drought_severity,
+            "title": "Drought or extended dry period risk near monitored foundation conditions",
+            "summary": f"Weather provider sync detected an extended dry period of {payload.dry_days} days.",
+        })
+
+    return candidates
+
+
+def _hf_weather_provider_find_weather_connection(record_id: str, provider_account_id: str = ""):
+    _hf_device_connection_ensure_schema()
+
+    provider_account_id = _hf_device_normalize(provider_account_id)
+
+    if provider_account_id:
+        rows = _hf_mon_fetch_all(
+            """
+            SELECT *
+            FROM device_connections
+            WHERE record_id = %s
+              AND provider = 'weather'
+              AND COALESCE(provider_account_id, '') = %s
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (_hf_mon_one_line(record_id), provider_account_id),
+        )
+
+        if rows:
+            return rows[0]
+
+    rows = _hf_mon_fetch_all(
+        """
+        SELECT *
+        FROM device_connections
+        WHERE record_id = %s
+          AND provider = 'weather'
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (_hf_mon_one_line(record_id),),
+    )
+
+    return rows[0] if rows else None
+
+
+def _hf_weather_provider_update_connection_after_sync(record_id: str, payload: _HFWeatherProviderSyncPayload, last_event_at: str | None, created_count: int):
+    _hf_device_connection_ensure_schema()
+
+    connection = _hf_weather_provider_find_weather_connection(
+        record_id,
+        payload.provider_account_id or "",
+    )
+
+    # If the weather connection does not exist yet, create it.
+    if not connection:
+        register_result = register_device_connection(
+            _HFDeviceConnectionRegisterPayload(
+                tenant_id=payload.tenant_id or "lateef-home-inspection",
+                property_id=payload.property_id or "",
+                record_id=record_id,
+                homeowner_email=payload.homeowner_email or "",
+                provider="weather",
+                provider_account_id=payload.provider_account_id or f"weather-{record_id}",
+                connection_label="HomeFax Weather Intelligence",
+                connection_status="connected",
+                device_count=1,
+                health_status="healthy",
+                notes="Weather connection auto-created by Weather Provider Adapter Pass 1.",
+            )
+        )
+        connection = (register_result or {}).get("connection") or {}
+
+    connection_id = connection.get("id")
+
+    if not connection_id:
+        return {
+            "updated": False,
+            "reason": "missing_connection_id",
+            "connection": connection,
+        }
+
+    sync_time = payload.occurred_at or last_event_at
+
+    if not sync_time:
+        from datetime import datetime
+        sync_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    update_result = update_device_connection_status(
+        int(connection_id),
+        _HFDeviceConnectionStatusPayload(
+            connection_status="connected",
+            health_status="healthy" if created_count else "warning",
+            last_sync_at=sync_time,
+            last_event_at=last_event_at or sync_time,
+            device_count=1,
+            notes=(
+                f"Weather provider adapter sync completed. "
+                f"Created {created_count} HomeFax weather event(s)."
+            ),
+        ),
+    )
+
+    return {
+        "updated": True,
+        "connection": (update_result or {}).get("connection"),
+    }
+
+
+@app.post("/weather-provider/{record_id}/sync")
+def sync_weather_provider_for_record(record_id: str, payload: _HFWeatherProviderSyncPayload):
+    """
+    Provider-neutral weather adapter sync.
+
+    This does not call a live weather API yet. It accepts provider-style weather
+    values, decides which HomeFax weather events should be created, sends them
+    through the existing Weather Event Intelligence pipeline, and updates the
+    device connection registry.
+    """
+    _hf_mon_ensure_schema()
+    _hf_device_ensure_intelligence_schema()
+    _hf_device_connection_ensure_schema()
+
+    clean_record_id = _hf_device_normalize(record_id)
+
+    if not clean_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "record_id_required",
+                "message": "record_id is required.",
+            },
+        )
+
+    candidates = _hf_weather_provider_build_candidate_events(clean_record_id, payload)
+
+    created_results = []
+    last_event_at = None
+
+    for candidate in candidates:
+        weather_payload = _HFWeatherEventIngestPayload(
+            tenant_id=payload.tenant_id or "lateef-home-inspection",
+            property_id=payload.property_id or "",
+            record_id=clean_record_id,
+            property_address=payload.property_address or "",
+            weather_event_type=candidate["weather_event_type"],
+            severity=candidate["severity"],
+            title=candidate["title"],
+            summary=candidate["summary"],
+            occurred_at=payload.occurred_at,
+            forecast_window=payload.forecast_window or "Provider sync",
+            rainfall_inches=payload.rainfall_inches,
+            wind_mph=payload.wind_mph,
+            temperature_f=payload.temperature_f,
+            humidity_percent=payload.humidity_percent,
+            raw_payload=_hf_weather_provider_make_raw_payload(
+                payload,
+                candidate["weather_event_type"],
+            ),
+        )
+
+        result = ingest_weather_event(weather_payload)
+        created_results.append(result)
+
+        event_row = (result or {}).get("event") or {}
+        if event_row.get("occurred_at"):
+            last_event_at = event_row.get("occurred_at")
+
+    connection_update = _hf_weather_provider_update_connection_after_sync(
+        clean_record_id,
+        payload,
+        last_event_at,
+        len(created_results),
+    )
+
+    return {
+        "success": True,
+        "message": "Weather provider adapter sync completed.",
+        "record_id": clean_record_id,
+        "candidate_count": len(candidates),
+        "created_count": len(created_results),
+        "created_events": created_results,
+        "connection_update": connection_update,
+    }
+
+
 @app.get("/monitoring-lifecycle-health")
 def monitoring_lifecycle_health():
     table_checks = {}

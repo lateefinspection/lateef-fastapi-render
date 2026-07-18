@@ -17759,6 +17759,94 @@ def register_device_connection(payload: _HFDeviceConnectionRegisterPayload):
             pass
 
 
+
+
+# Multi-record Scheduled Health Check Pass 2
+@app.get("/device-connections/active-records")
+def device_connection_active_records(
+    tenant_id: str | None = None,
+    include_test_records: bool = True,
+    limit: int = 500,
+):
+    """
+    Return record_ids that have active HomeFax device/weather connections.
+
+    Used by n8n scheduled health-check workflows so the schedule can fan out
+    across all active monitoring records instead of hardcoding one record.
+    """
+    _hf_mon_ensure_schema()
+
+    safe_limit = max(1, min(int(limit or 500), 1000))
+
+    where_parts = [
+        "COALESCE(record_id, '') <> ''",
+        "COALESCE(connection_status, '') NOT IN ('deleted', 'removed')",
+    ]
+    params = []
+
+    if tenant_id:
+        where_parts.append("tenant_id = %s")
+        params.append(_hf_mon_one_line(tenant_id))
+
+    if not include_test_records:
+        where_parts.append("LOWER(record_id) NOT LIKE %s")
+        params.append("%test%")
+        where_parts.append("LOWER(record_id) NOT LIKE %s")
+        params.append("%smoke%")
+        where_parts.append("LOWER(record_id) NOT LIKE %s")
+        params.append("%dev%")
+        where_parts.append("LOWER(record_id) NOT LIKE %s")
+        params.append("%qa%")
+
+    params.append(safe_limit)
+
+    rows = _hf_mon_fetch_all(
+        f"""
+        SELECT
+          record_id,
+          MIN(tenant_id) AS tenant_id,
+          MIN(homeowner_email) AS homeowner_email,
+          COUNT(*) AS connection_count,
+          SUM(CASE WHEN connection_status = 'connected' THEN 1 ELSE 0 END) AS connected_count,
+          SUM(CASE WHEN health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy_count,
+          SUM(CASE WHEN health_status = 'stale' THEN 1 ELSE 0 END) AS stale_count,
+          SUM(CASE WHEN health_status IN ('warning', 'needs_attention', 'error') THEN 1 ELSE 0 END) AS warning_count,
+          MAX(COALESCE(last_sync_at, last_event_at, updated_at, created_at)) AS latest_activity_at
+        FROM user_integrations
+        WHERE {" AND ".join(where_parts)}
+        GROUP BY record_id
+        ORDER BY latest_activity_at DESC, record_id ASC
+        LIMIT %s
+        """,
+        tuple(params),
+    )
+
+    records = []
+
+    for row in rows:
+        records.append({
+            "record_id": _hf_mon_one_line(row.get("record_id")),
+            "tenant_id": _hf_mon_one_line(row.get("tenant_id")),
+            "homeowner_email": _hf_mon_one_line(row.get("homeowner_email")),
+            "connection_count": int(row.get("connection_count") or 0),
+            "connected_count": int(row.get("connected_count") or 0),
+            "healthy_count": int(row.get("healthy_count") or 0),
+            "stale_count": int(row.get("stale_count") or 0),
+            "warning_count": int(row.get("warning_count") or 0),
+            "latest_activity_at": str(row.get("latest_activity_at") or ""),
+        })
+
+    return {
+        "success": True,
+        "count": len(records),
+        "tenant_id": tenant_id or "",
+        "include_test_records": include_test_records,
+        "limit": safe_limit,
+        "records": records,
+    }
+
+
+
 @app.get("/device-connections/{record_id}")
 def device_connections_for_record(record_id: str):
     """

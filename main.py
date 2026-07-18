@@ -17821,7 +17821,7 @@ def device_connection_active_records(
               last_event_at,
               updated_at,
               created_at
-            FROM user_integrations
+            FROM device_connections
             WHERE {" AND ".join(where_parts)}
             ORDER BY id DESC
             """,

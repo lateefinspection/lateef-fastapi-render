@@ -17774,7 +17774,14 @@ def device_connection_active_records(
     Used by n8n scheduled health-check workflows so the schedule can fan out
     across all active monitoring records instead of hardcoding one record.
     """
-    _hf_mon_ensure_schema()
+    try:
+        _hf_mon_ensure_schema()
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": "active_records_schema_failed",
+            "message": str(exc),
+        }
 
     safe_limit = max(1, min(int(limit or 500), 1000))
 
@@ -17801,24 +17808,32 @@ def device_connection_active_records(
     # Keep this query deliberately simple for production DB compatibility.
     # Grouping/counting is done in Python so this endpoint works across
     # MySQL/MariaDB variants and avoids datetime aggregate edge cases.
-    rows = _hf_mon_fetch_all(
-        f"""
-        SELECT
-          record_id,
-          tenant_id,
-          homeowner_email,
-          connection_status,
-          health_status,
-          last_sync_at,
-          last_event_at,
-          updated_at,
-          created_at
-        FROM user_integrations
-        WHERE {" AND ".join(where_parts)}
-        ORDER BY id DESC
-        """,
-        tuple(params),
-    )
+    try:
+        rows = _hf_mon_fetch_all(
+            f"""
+            SELECT
+              record_id,
+              tenant_id,
+              homeowner_email,
+              connection_status,
+              health_status,
+              last_sync_at,
+              last_event_at,
+              updated_at,
+              created_at
+            FROM user_integrations
+            WHERE {" AND ".join(where_parts)}
+            ORDER BY id DESC
+            """,
+            tuple(params),
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": "active_records_query_failed",
+            "message": str(exc),
+            "where_parts": where_parts,
+        }
 
     grouped = {}
 

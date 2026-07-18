@@ -17798,43 +17798,91 @@ def device_connection_active_records(
         where_parts.append("LOWER(record_id) NOT LIKE %s")
         params.append("%qa%")
 
-    params.append(safe_limit)
-
+    # Keep this query deliberately simple for production DB compatibility.
+    # Grouping/counting is done in Python so this endpoint works across
+    # MySQL/MariaDB variants and avoids datetime aggregate edge cases.
     rows = _hf_mon_fetch_all(
         f"""
         SELECT
           record_id,
-          MIN(tenant_id) AS tenant_id,
-          MIN(homeowner_email) AS homeowner_email,
-          COUNT(*) AS connection_count,
-          SUM(CASE WHEN connection_status = 'connected' THEN 1 ELSE 0 END) AS connected_count,
-          SUM(CASE WHEN health_status = 'healthy' THEN 1 ELSE 0 END) AS healthy_count,
-          SUM(CASE WHEN health_status = 'stale' THEN 1 ELSE 0 END) AS stale_count,
-          SUM(CASE WHEN health_status IN ('warning', 'needs_attention', 'error') THEN 1 ELSE 0 END) AS warning_count,
-          MAX(COALESCE(last_sync_at, last_event_at, updated_at, created_at)) AS latest_activity_at
+          tenant_id,
+          homeowner_email,
+          connection_status,
+          health_status,
+          last_sync_at,
+          last_event_at,
+          updated_at,
+          created_at
         FROM user_integrations
         WHERE {" AND ".join(where_parts)}
-        GROUP BY record_id
-        ORDER BY latest_activity_at DESC, record_id ASC
-        LIMIT %s
+        ORDER BY id DESC
         """,
         tuple(params),
     )
 
-    records = []
+    grouped = {}
 
     for row in rows:
-        records.append({
-            "record_id": _hf_mon_one_line(row.get("record_id")),
+        record_id = _hf_mon_one_line(row.get("record_id"))
+        if not record_id:
+            continue
+
+        bucket = grouped.setdefault(record_id, {
+            "record_id": record_id,
             "tenant_id": _hf_mon_one_line(row.get("tenant_id")),
             "homeowner_email": _hf_mon_one_line(row.get("homeowner_email")),
-            "connection_count": int(row.get("connection_count") or 0),
-            "connected_count": int(row.get("connected_count") or 0),
-            "healthy_count": int(row.get("healthy_count") or 0),
-            "stale_count": int(row.get("stale_count") or 0),
-            "warning_count": int(row.get("warning_count") or 0),
-            "latest_activity_at": str(row.get("latest_activity_at") or ""),
+            "connection_count": 0,
+            "connected_count": 0,
+            "healthy_count": 0,
+            "stale_count": 0,
+            "warning_count": 0,
+            "latest_activity_at": "",
         })
+
+        if not bucket.get("tenant_id"):
+            bucket["tenant_id"] = _hf_mon_one_line(row.get("tenant_id"))
+
+        if not bucket.get("homeowner_email"):
+            bucket["homeowner_email"] = _hf_mon_one_line(row.get("homeowner_email"))
+
+        connection_status = _hf_device_lower(row.get("connection_status") or "")
+        health_status = _hf_device_lower(row.get("health_status") or "")
+
+        bucket["connection_count"] += 1
+
+        if connection_status == "connected":
+            bucket["connected_count"] += 1
+
+        if health_status == "healthy":
+            bucket["healthy_count"] += 1
+        elif health_status == "stale":
+            bucket["stale_count"] += 1
+        elif health_status in {"warning", "needs_attention", "error"}:
+            bucket["warning_count"] += 1
+
+        candidate_dates = [
+            row.get("last_sync_at"),
+            row.get("last_event_at"),
+            row.get("updated_at"),
+            row.get("created_at"),
+        ]
+
+        for candidate in candidate_dates:
+            candidate_text = str(candidate or "")
+            if candidate_text and candidate_text > bucket["latest_activity_at"]:
+                bucket["latest_activity_at"] = candidate_text
+
+    records = list(grouped.values())
+
+    records.sort(
+        key=lambda item: (
+            item.get("latest_activity_at") or "",
+            item.get("record_id") or "",
+        ),
+        reverse=True,
+    )
+
+    records = records[:safe_limit]
 
     return {
         "success": True,
@@ -17844,6 +17892,7 @@ def device_connection_active_records(
         "limit": safe_limit,
         "records": records,
     }
+
 
 
 

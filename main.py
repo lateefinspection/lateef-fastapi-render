@@ -18903,6 +18903,287 @@ def _hf_connection_calculate_health(connection):
     }
 
 
+
+# Extracted Report Text Normalization Backfill Pass 1
+class _HFTextNormalizationBackfillPayload(BaseModel):
+    dry_run: bool | None = True
+    limit: int | None = 500
+
+
+def _hf_normalize_extracted_report_text(value: Any) -> str:
+    """
+    Normalize recurring extraction/OCR mojibake and spacing issues from uploaded
+    inspection reports before they appear in monitoring/device insight cards.
+    """
+    if value is None:
+        return ""
+
+    text_value = str(value)
+
+    if not text_value:
+        return ""
+
+    replacements = [
+        # Main issue seen in production homeowner live monitoring card.
+        (r"Main\s+Water\s+Shut[-\s]*O(?:ff|f|i|ì|ﬀ)\s*Valve", "Main Water Shut-Off Valve"),
+        (r"Main\s+Water\s+Shut[-\s]*Off\s*Valve", "Main Water Shut-Off Valve"),
+        (r"Main\s+Water\s+Shut\s+Off\s*Valve", "Main Water Shut-Off Valve"),
+        (r"Main\s+Water\s+Shut-Off\s*Valve", "Main Water Shut-Off Valve"),
+
+        # General shutoff variants.
+        (r"Shut[-\s]*O(?:ff|f|i|ì|ﬀ)\s*Valve", "Shut-Off Valve"),
+        (r"Shut[-\s]*Off\s*Valve", "Shut-Off Valve"),
+        (r"Shut\s+Off\s*Valve", "Shut-Off Valve"),
+        (r"Shut-Off\s*Valve", "Shut-Off Valve"),
+
+        # Common OCR ligature / accent issues already seen elsewhere.
+        (r"Quali(?:í|ﬁ|i)ed", "Qualified"),
+        (r"Gfci", "GFCI"),
+        (r"Afci", "AFCI"),
+    ]
+
+    cleaned = text_value
+
+    for pattern, replacement in replacements:
+        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    return cleaned
+
+
+def _hf_text_normalization_columns_for_table(table_name: str) -> list[str]:
+    """
+    Return candidate text columns by table. The backfill checks actual table
+    schema before attempting updates, so this list can safely include optional
+    columns that may not exist in older environments.
+    """
+    table_name = str(table_name or "").strip()
+
+    if table_name == "integration_events":
+        return [
+            "event_title",
+            "event_summary",
+            "compiled_insight_title",
+            "compiled_insight_summary",
+            "recommended_homeowner_action",
+            "match_reason",
+            "system",
+            "component",
+            "location",
+            "device_name",
+            "connection_label",
+            "provider",
+        ]
+
+    if table_name == "monitoring_plans":
+        return [
+            "plan_title",
+            "plan_summary",
+            "monitoring_summary",
+            "risk_summary",
+            "system",
+            "component",
+            "location",
+            "source_title",
+        ]
+
+    if table_name == "verified_issues":
+        return [
+            "title",
+            "system",
+            "component",
+            "location",
+            "source_text",
+            "source_report_section",
+            "standard_system",
+            "standard_component",
+            "standard_location",
+            "homefax_explanation",
+            "recommended_action",
+            "monitoring_plan",
+        ]
+
+    return []
+
+
+def _hf_existing_columns(table_name: str) -> set[str]:
+    rows = _hf_mon_fetch_all(
+        """
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+        """,
+        (table_name,),
+    )
+
+    return {str(row.get("COLUMN_NAME") or row.get("column_name") or "").strip() for row in rows}
+
+
+def _hf_text_normalization_fetch_rows(table_name: str, record_id: str, columns: list[str], limit: int) -> list[dict]:
+    selected_columns = ["id"] + columns
+    quoted_columns = ", ".join(f"`{column}`" for column in selected_columns)
+
+    return _hf_mon_fetch_all(
+        f"""
+        SELECT {quoted_columns}
+        FROM `{table_name}`
+        WHERE record_id = %s
+        ORDER BY id ASC
+        LIMIT %s
+        """,
+        (_hf_mon_one_line(record_id), int(limit or 500)),
+    )
+
+
+def _hf_text_normalization_update_row(table_name: str, row_id: Any, updates: dict[str, str]) -> None:
+    if not updates:
+        return
+
+    set_clause = ", ".join(f"`{column}` = %s" for column in updates.keys())
+    values = list(updates.values()) + [row_id]
+
+    _hf_mon_execute(
+        f"""
+        UPDATE `{table_name}`
+        SET {set_clause}
+        WHERE id = %s
+        """,
+        tuple(values),
+    )
+
+
+@app.post("/admin/text-normalization/{record_id}/backfill")
+def admin_text_normalization_backfill(
+    record_id: str,
+    payload: _HFTextNormalizationBackfillPayload | None = None,
+):
+    """
+    Dry-run or apply extracted report text normalization for a single HomeFax record.
+
+    This fixes stored OCR/report extraction variants such as:
+    - Main Water Shut-Oi Valve
+    - Main Water Shut-Oì Valve
+    - Main Water Shut-OffValve
+
+    Canonical value:
+    - Main Water Shut-Off Valve
+    """
+    _hf_mon_ensure_schema()
+
+    payload = payload or _HFTextNormalizationBackfillPayload()
+    dry_run = bool(payload.dry_run if payload.dry_run is not None else True)
+    limit = int(payload.limit or 500)
+
+    tables = ["integration_events", "monitoring_plans", "verified_issues"]
+
+    checked_rows = 0
+    changed_rows = 0
+    changed_fields = 0
+    table_results = []
+
+    for table_name in tables:
+        existing_columns = _hf_existing_columns(table_name)
+        candidate_columns = _hf_text_normalization_columns_for_table(table_name)
+        columns = [column for column in candidate_columns if column in existing_columns]
+
+        if "id" not in existing_columns or "record_id" not in existing_columns:
+            table_results.append({
+                "table": table_name,
+                "skipped": True,
+                "reason": "id or record_id column missing",
+                "columns": columns,
+                "checked_rows": 0,
+                "changed_rows": 0,
+                "changed_fields": 0,
+                "samples": [],
+            })
+            continue
+
+        if not columns:
+            table_results.append({
+                "table": table_name,
+                "skipped": True,
+                "reason": "no candidate text columns exist",
+                "columns": [],
+                "checked_rows": 0,
+                "changed_rows": 0,
+                "changed_fields": 0,
+                "samples": [],
+            })
+            continue
+
+        rows = _hf_text_normalization_fetch_rows(table_name, record_id, columns, limit)
+
+        table_checked = 0
+        table_changed_rows = 0
+        table_changed_fields = 0
+        samples = []
+
+        for row in rows:
+            table_checked += 1
+            checked_rows += 1
+
+            row_id = row.get("id")
+            updates = {}
+            field_changes = []
+
+            for column in columns:
+                before = row.get(column)
+
+                if before is None:
+                    continue
+
+                after = _hf_normalize_extracted_report_text(before)
+
+                if str(before) != str(after):
+                    updates[column] = after
+                    field_changes.append({
+                        "column": column,
+                        "before": str(before),
+                        "after": after,
+                    })
+
+            if updates:
+                table_changed_rows += 1
+                changed_rows += 1
+                table_changed_fields += len(updates)
+                changed_fields += len(updates)
+
+                if len(samples) < 10:
+                    samples.append({
+                        "id": row_id,
+                        "changes": field_changes,
+                    })
+
+                if not dry_run:
+                    _hf_text_normalization_update_row(table_name, row_id, updates)
+
+        table_results.append({
+            "table": table_name,
+            "skipped": False,
+            "columns": columns,
+            "checked_rows": table_checked,
+            "changed_rows": table_changed_rows,
+            "changed_fields": table_changed_fields,
+            "samples": samples,
+        })
+
+    return {
+        "success": True,
+        "record_id": _hf_mon_one_line(record_id),
+        "dry_run": dry_run,
+        "limit": limit,
+        "checked_rows": checked_rows,
+        "changed_rows": changed_rows,
+        "changed_fields": changed_fields,
+        "tables": table_results,
+    }
+
+
+
+
 @app.post("/device-connections/{record_id}/health-check")
 def health_check_device_connections_for_record(record_id: str, payload: _HFDeviceConnectionHealthCheckPayload = _HFDeviceConnectionHealthCheckPayload()):
     """

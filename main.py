@@ -15589,6 +15589,147 @@ def _hf_mon_try_execute(sql: str, params=None):
         }
 
 
+
+
+# OAuth Database / Schema Pass 1A
+def _hf_oauth_ensure_schema():
+    """
+    Create HomeFax provider OAuth tables.
+
+    These tables support real homeowner-authorized provider connections:
+    - provider_oauth_states: short-lived OAuth state/CSRF records
+    - provider_oauth_tokens: encrypted provider access/refresh token metadata
+    - provider_sync_runs: audit trail for provider sync attempts
+
+    This pass creates schema only. OAuth start/callback routes come next.
+    """
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS provider_oauth_states (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          state VARCHAR(255) NOT NULL UNIQUE,
+
+          tenant_id VARCHAR(255) DEFAULT '',
+          property_id VARCHAR(255) DEFAULT '',
+          record_id VARCHAR(255) DEFAULT '',
+          homeowner_email VARCHAR(255) DEFAULT '',
+
+          provider VARCHAR(128) NOT NULL,
+          redirect_after_connect TEXT NULL,
+
+          expires_at TIMESTAMP NULL,
+          consumed_at TIMESTAMP NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+          INDEX idx_provider_oauth_state_provider (provider),
+          INDEX idx_provider_oauth_state_record (record_id),
+          INDEX idx_provider_oauth_state_expires (expires_at)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS provider_oauth_tokens (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+          tenant_id VARCHAR(255) DEFAULT '',
+          property_id VARCHAR(255) DEFAULT '',
+          record_id VARCHAR(255) DEFAULT '',
+          homeowner_email VARCHAR(255) DEFAULT '',
+
+          provider VARCHAR(128) NOT NULL,
+          provider_account_id VARCHAR(255) DEFAULT '',
+          device_connection_id BIGINT NULL,
+
+          access_token_encrypted TEXT NULL,
+          refresh_token_encrypted TEXT NULL,
+          token_type VARCHAR(64) DEFAULT 'Bearer',
+          scope TEXT NULL,
+
+          access_token_expires_at TIMESTAMP NULL,
+          refresh_token_expires_at TIMESTAMP NULL,
+
+          connection_status VARCHAR(64) DEFAULT 'connected',
+          health_status VARCHAR(64) DEFAULT 'healthy',
+
+          last_refresh_at TIMESTAMP NULL,
+          last_sync_at TIMESTAMP NULL,
+          last_error TEXT NULL,
+
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+          INDEX idx_provider_oauth_record (record_id),
+          INDEX idx_provider_oauth_provider (provider),
+          INDEX idx_provider_oauth_provider_account (provider_account_id),
+          INDEX idx_provider_oauth_status (connection_status),
+          INDEX idx_provider_oauth_device_connection (device_connection_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS provider_sync_runs (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+          tenant_id VARCHAR(255) DEFAULT '',
+          property_id VARCHAR(255) DEFAULT '',
+          record_id VARCHAR(255) DEFAULT '',
+
+          provider VARCHAR(128) NOT NULL,
+          provider_account_id VARCHAR(255) DEFAULT '',
+          device_connection_id BIGINT NULL,
+
+          sync_status VARCHAR(64) DEFAULT 'started',
+
+          candidate_count INT DEFAULT 0,
+          created_count INT DEFAULT 0,
+          skipped_count INT DEFAULT 0,
+          failed_count INT DEFAULT 0,
+
+          started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          finished_at TIMESTAMP NULL,
+          error_message TEXT NULL,
+
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+          INDEX idx_provider_sync_record (record_id),
+          INDEX idx_provider_sync_provider (provider),
+          INDEX idx_provider_sync_status (sync_status),
+          INDEX idx_provider_sync_device_connection (device_connection_id),
+          INDEX idx_provider_sync_started (started_at)
+        )
+        """
+    ]
+
+    results = []
+
+    for statement in statements:
+        result = _hf_mon_try_execute(statement)
+
+        if not result.get("ok"):
+            error_text = str(result.get("error") or "")
+            if "already exists" in error_text.lower():
+                result["ok"] = True
+                result["error"] = "already_exists"
+
+        results.append(result)
+
+    failed = [item for item in results if not item.get("ok")]
+
+    if failed:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "provider_oauth_schema_failed",
+                "failed": failed,
+            },
+        )
+
+    return {
+        "success": True,
+        "created_or_confirmed": len(results),
+        "results": results,
+    }
+
+
 def _hf_mon_ensure_schema():
     """
     Create monitoring tables and add optional monitoring fields to verified_issues.
@@ -17762,6 +17903,48 @@ def register_device_connection(payload: _HFDeviceConnectionRegisterPayload):
 
 
 # Multi-record Scheduled Health Check Pass 2
+
+
+# OAuth Database / Schema Pass 1A
+@app.get("/provider-oauth/schema-health")
+def provider_oauth_schema_health():
+    """
+    Verify OAuth provider schema exists and can be queried.
+
+    This endpoint does not expose tokens or secrets.
+    """
+    _hf_oauth_ensure_schema()
+
+    tables = [
+        "provider_oauth_states",
+        "provider_oauth_tokens",
+        "provider_sync_runs",
+    ]
+
+    results = {}
+
+    for table in tables:
+        try:
+            rows = _hf_mon_fetch_all(f"SELECT COUNT(*) AS count FROM {table}")
+            results[table] = {
+                "ok": True,
+                "count": int((rows[0] or {}).get("count") or 0) if rows else 0,
+            }
+        except Exception as exc:
+            results[table] = {
+                "ok": False,
+                "error": str(exc),
+            }
+
+    all_ok = all(item.get("ok") is True for item in results.values())
+
+    return {
+        "success": all_ok,
+        "schema": "provider_oauth",
+        "tables": results,
+    }
+
+
 @app.get("/device-connections/active-records")
 def device_connection_active_records(
     tenant_id: str | None = None,

@@ -18160,6 +18160,397 @@ def _hf_oauth_consume_state(state: str, provider: str):
     )
 
 
+
+
+# First Provider Adapter Pass 1C - Tempest
+import os as _hf_tempest_os
+import requests as _hf_tempest_requests
+
+
+def _hf_tempest_env(name: str, default: str = "") -> str:
+    return str(_hf_tempest_os.getenv(name, default) or "").strip()
+
+
+def _hf_tempest_config():
+    """
+    WeatherFlow Tempest provider adapter configuration.
+
+    Secrets are intentionally never returned directly by public endpoints.
+    """
+    client_id = _hf_tempest_env("TEMPEST_CLIENT_ID")
+    client_secret = _hf_tempest_env("TEMPEST_CLIENT_SECRET")
+    redirect_uri = _hf_tempest_env(
+        "TEMPEST_REDIRECT_URI",
+        "https://lateef-fastapi-docker.onrender.com/provider-oauth/tempest/callback",
+    )
+
+    authorize_url = _hf_tempest_env(
+        "TEMPEST_AUTHORIZE_URL",
+        "https://tempestwx.com/authorize.html",
+    )
+
+    token_url = _hf_tempest_env(
+        "TEMPEST_TOKEN_URL",
+        "https://swd.weatherflow.com/id/oauth2/token",
+    )
+
+    api_base_url = _hf_tempest_env(
+        "TEMPEST_API_BASE_URL",
+        "https://swd.weatherflow.com/swd/rest",
+    )
+
+    return {
+        "provider": "tempest",
+        "display_name": "WeatherFlow Tempest",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "authorize_url": authorize_url,
+        "token_url": token_url,
+        "api_base_url": api_base_url,
+        "configured": bool(client_id and client_secret and redirect_uri),
+        "has_client_id": bool(client_id),
+        "has_client_secret": bool(client_secret),
+        "has_redirect_uri": bool(redirect_uri),
+    }
+
+
+def _hf_tempest_public_config():
+    config = _hf_tempest_config()
+
+    return {
+        "provider": config["provider"],
+        "display_name": config["display_name"],
+        "configured": config["configured"],
+        "has_client_id": config["has_client_id"],
+        "has_client_secret": config["has_client_secret"],
+        "has_redirect_uri": config["has_redirect_uri"],
+        "redirect_uri": config["redirect_uri"],
+        "authorize_url": config["authorize_url"],
+        "token_url": config["token_url"],
+        "api_base_url": config["api_base_url"],
+        "capabilities": [
+            "WEATHER_RAIN",
+            "WEATHER_WIND",
+            "WEATHER_FREEZE",
+            "WEATHER_HEAT",
+            "HUMIDITY",
+            "TEMPERATURE",
+            "LIGHTNING",
+        ],
+    }
+
+
+def _hf_tempest_build_authorization_url(state: str, redirect_after_connect: str = "") -> str:
+    """
+    Build the real Tempest OAuth authorization URL when credentials are configured.
+
+    Tempest OAuth uses authorization code grant:
+      authorize endpoint: https://tempestwx.com/authorize.html
+      response_type: code
+    """
+    config = _hf_tempest_config()
+
+    query = {
+        "client_id": config["client_id"],
+        "response_type": "code",
+        "redirect_uri": config["redirect_uri"],
+        "state": state,
+    }
+
+    # Internal HomeFax dashboard return URL is not a Tempest OAuth parameter.
+    # We keep it in our provider_oauth_states row, not in the provider request.
+    return "{}?{}".format(
+        config["authorize_url"],
+        _hf_oauth_urlparse.urlencode(query),
+    )
+
+
+def _hf_tempest_exchange_code_for_tokens(code: str):
+    """
+    Exchange Tempest authorization code for tokens.
+
+    This helper is ready for the provider callback pass, but will only run
+    once real TEMPEST_CLIENT_ID / TEMPEST_CLIENT_SECRET are configured.
+    """
+    config = _hf_tempest_config()
+
+    if not config["configured"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "tempest_not_configured",
+                "message": "Tempest client credentials are not configured.",
+            },
+        )
+
+    response = _hf_tempest_requests.post(
+        config["token_url"],
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+            "redirect_uri": config["redirect_uri"],
+        },
+        timeout=20,
+    )
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {
+            "raw": response.text,
+        }
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "tempest_token_exchange_failed",
+                "status_code": response.status_code,
+                "provider_response": payload,
+            },
+        )
+
+    return payload
+
+
+def _hf_tempest_refresh_access_token(refresh_token: str):
+    """
+    Refresh a Tempest access token.
+
+    Exact provider behavior can be adjusted after first live credential test.
+    """
+    config = _hf_tempest_config()
+
+    if not config["configured"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "tempest_not_configured",
+                "message": "Tempest client credentials are not configured.",
+            },
+        )
+
+    response = _hf_tempest_requests.post(
+        config["token_url"],
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+        },
+        timeout=20,
+    )
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {
+            "raw": response.text,
+        }
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "tempest_token_refresh_failed",
+                "status_code": response.status_code,
+                "provider_response": payload,
+            },
+        )
+
+    return payload
+
+
+def _hf_tempest_observation_to_events(
+    *,
+    record_id: str,
+    tenant_id: str,
+    provider_account_id: str,
+    station_id: str,
+    device_id: str,
+    observation: dict,
+):
+    """
+    Convert a Tempest observation payload into HomeFax normalized events.
+
+    This is intentionally defensive because Tempest observation payload shapes
+    can differ by endpoint/device type. Scheduled sync will refine this once
+    a live station payload is captured.
+    """
+    events = []
+
+    obs = observation or {}
+    metrics = {}
+
+    # Support both direct dict payloads and simple named fields.
+    for key, value in obs.items():
+        metrics[str(key).lower()] = value
+
+    def add_event(capability, event_type, severity, title, summary, system, raw_value=None):
+        events.append({
+            "tenant_id": tenant_id or "lateef-home-inspection",
+            "record_id": record_id or "",
+            "provider": "tempest",
+            "provider_account_id": provider_account_id or "",
+            "provider_event_id": "{}:{}:{}:{}".format(
+                provider_account_id or station_id or "tempest",
+                device_id or "device",
+                capability,
+                _hf_mon_now_string(),
+            ),
+            "device_id": str(device_id or ""),
+            "device_name": "WeatherFlow Tempest",
+            "capability": capability,
+            "event_type": event_type,
+            "severity": severity,
+            "system": system,
+            "summary": summary,
+            "title": title,
+            "occurred_at": _hf_mon_now_string(),
+            "raw_value": raw_value,
+            "raw_payload": obs,
+        })
+
+    rain = metrics.get("rain") or metrics.get("precip") or metrics.get("precip_accum_local_day")
+    wind = metrics.get("wind_gust") or metrics.get("wind_avg") or metrics.get("wind_speed")
+    temp = metrics.get("air_temperature") or metrics.get("temperature")
+    humidity = metrics.get("relative_humidity") or metrics.get("humidity")
+    lightning = metrics.get("lightning_strike_count") or metrics.get("strike_count")
+
+    try:
+        rain_value = float(rain)
+        if rain_value >= 1.0:
+            add_event(
+                "WEATHER_RAIN",
+                "heavy_rain",
+                "high",
+                "Heavy rain detected by Tempest station",
+                f"Tempest reported rainfall near {rain_value}.",
+                "Weather",
+                rain_value,
+            )
+    except Exception:
+        pass
+
+    try:
+        wind_value = float(wind)
+        if wind_value >= 40:
+            add_event(
+                "WEATHER_WIND",
+                "high_wind",
+                "medium",
+                "High wind detected by Tempest station",
+                f"Tempest reported wind near {wind_value}.",
+                "Weather",
+                wind_value,
+            )
+    except Exception:
+        pass
+
+    try:
+        temp_value = float(temp)
+        if temp_value <= 32:
+            add_event(
+                "WEATHER_FREEZE",
+                "freeze",
+                "medium",
+                "Freeze condition detected by Tempest station",
+                f"Tempest reported temperature near {temp_value}.",
+                "Weather",
+                temp_value,
+            )
+        elif temp_value >= 90:
+            add_event(
+                "WEATHER_HEAT",
+                "heat",
+                "medium",
+                "High heat detected by Tempest station",
+                f"Tempest reported temperature near {temp_value}.",
+                "Weather",
+                temp_value,
+            )
+    except Exception:
+        pass
+
+    try:
+        humidity_value = float(humidity)
+        if humidity_value >= 65:
+            add_event(
+                "HUMIDITY",
+                "high_humidity",
+                "medium",
+                "High humidity detected by Tempest station",
+                f"Tempest reported humidity near {humidity_value}%.",
+                "Indoor Air Quality",
+                humidity_value,
+            )
+    except Exception:
+        pass
+
+    try:
+        lightning_value = float(lightning)
+        if lightning_value > 0:
+            add_event(
+                "LIGHTNING",
+                "lightning_detected",
+                "medium",
+                "Lightning activity detected by Tempest station",
+                f"Tempest reported {lightning_value} lightning strike(s).",
+                "Weather",
+                lightning_value,
+            )
+    except Exception:
+        pass
+
+    return events
+
+
+@app.get("/provider-adapters/tempest/health")
+def provider_adapter_tempest_health():
+    """
+    Verify Tempest adapter configuration without exposing secrets.
+    """
+    return {
+        "success": True,
+        "adapter": "tempest",
+        "mode": "adapter_skeleton",
+        "config": _hf_tempest_public_config(),
+        "next_step": "Set Tempest client credentials, then wire callback token exchange.",
+    }
+
+
+@app.post("/provider-adapters/tempest/normalize-sample")
+def provider_adapter_tempest_normalize_sample(payload: dict):
+    """
+    Normalize a sample Tempest-like observation payload into HomeFax events.
+
+    This is a safe test endpoint. It does not write integration_events.
+    """
+    events = _hf_tempest_observation_to_events(
+        record_id=str(payload.get("record_id") or "sample-record"),
+        tenant_id=str(payload.get("tenant_id") or "lateef-home-inspection"),
+        provider_account_id=str(payload.get("provider_account_id") or "sample-tempest-account"),
+        station_id=str(payload.get("station_id") or "sample-station"),
+        device_id=str(payload.get("device_id") or "sample-device"),
+        observation=payload.get("observation") or payload,
+    )
+
+    return {
+        "success": True,
+        "adapter": "tempest",
+        "input_mode": "sample_normalization",
+        "events_count": len(events),
+        "events": events,
+    }
+
+
 @app.get("/provider-oauth/supported-providers")
 def provider_oauth_supported_providers():
     """
@@ -18206,18 +18597,26 @@ def provider_oauth_start(
 
     state_record = _hf_oauth_create_state_record(config["provider"], payload)
 
-    authorization_url = _hf_oauth_placeholder_authorization_url(
-        config["provider"],
-        state_record["state"],
-        redirect_after_connect,
-    )
+    if config["provider"] == "tempest" and _hf_tempest_config().get("configured"):
+        authorization_url = _hf_tempest_build_authorization_url(
+            state_record["state"],
+            redirect_after_connect,
+        )
+        oauth_ready = True
+    else:
+        authorization_url = _hf_oauth_placeholder_authorization_url(
+            config["provider"],
+            state_record["state"],
+            redirect_after_connect,
+        )
+        oauth_ready = False
 
     return {
         "success": True,
         "provider": config["provider"],
         "display_name": config["display_name"],
-        "oauth_ready": False,
-        "mode": "skeleton",
+        "oauth_ready": oauth_ready,
+        "mode": "adapter_ready" if oauth_ready else "skeleton",
         "state": state_record["state"],
         "expires_at": state_record["expires_at"],
         "authorization_url": authorization_url,

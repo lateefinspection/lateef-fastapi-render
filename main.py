@@ -17906,6 +17906,459 @@ def register_device_connection(payload: _HFDeviceConnectionRegisterPayload):
 
 
 # OAuth Database / Schema Pass 1A
+
+
+# Provider OAuth Backend Skeleton Pass 1B
+import secrets as _hf_oauth_secrets
+import urllib.parse as _hf_oauth_urlparse
+from datetime import datetime as _hf_oauth_datetime
+from datetime import timedelta as _hf_oauth_timedelta
+from pydantic import BaseModel as _hf_oauth_BaseModel
+
+
+HF_SUPPORTED_OAUTH_PROVIDERS = {
+    "tempest": {
+        "provider": "tempest",
+        "display_name": "WeatherFlow Tempest",
+        "category": "weather_station",
+        "status": "planned",
+        "oauth_ready": False,
+        "description": "Homeowner weather station connection for rain, wind, heat, freeze, humidity, and weather-envelope monitoring.",
+        "capabilities": [
+            "WEATHER_RAIN",
+            "WEATHER_WIND",
+            "WEATHER_FREEZE",
+            "WEATHER_HEAT",
+            "HUMIDITY",
+        ],
+    },
+    "smartthings": {
+        "provider": "smartthings",
+        "display_name": "Samsung SmartThings",
+        "category": "smart_home_bridge",
+        "status": "planned",
+        "oauth_ready": False,
+        "description": "Smart-home bridge connection for leak sensors, moisture sensors, temperature, humidity, and device status events.",
+        "capabilities": [
+            "WATER_LEAK",
+            "MOISTURE",
+            "TEMPERATURE",
+            "HUMIDITY",
+            "ELECTRICAL_LOAD",
+            "MANUAL_CHECK",
+        ],
+    },
+    "ecobee": {
+        "provider": "ecobee",
+        "display_name": "Ecobee",
+        "category": "thermostat",
+        "status": "planned",
+        "oauth_ready": False,
+        "description": "Thermostat and HVAC connection for temperature, humidity, comfort, HVAC runtime, and indoor climate monitoring.",
+        "capabilities": [
+            "TEMPERATURE",
+            "HUMIDITY",
+            "HVAC_RUNTIME",
+            "AIR_QUALITY",
+        ],
+    },
+}
+
+
+class _HFProviderOAuthStartPayload(_hf_oauth_BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_id: str | None = ""
+    record_id: str | None = ""
+    homeowner_email: str | None = ""
+    redirect_after_connect: str | None = ""
+
+
+class _HFProviderOAuthDisconnectPayload(_hf_oauth_BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_id: str | None = ""
+    record_id: str | None = ""
+    homeowner_email: str | None = ""
+    provider_account_id: str | None = ""
+    disconnect_reason: str | None = "homeowner_requested"
+
+
+def _hf_oauth_clean_provider(provider: str) -> str:
+    return _hf_mon_one_line(provider).lower().replace(" ", "_").replace("-", "_")
+
+
+def _hf_oauth_get_provider_config(provider: str):
+    provider_key = _hf_oauth_clean_provider(provider)
+    config = HF_SUPPORTED_OAUTH_PROVIDERS.get(provider_key)
+
+    if not config:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "success": False,
+                "error": "unsupported_provider",
+                "provider": provider,
+                "supported_providers": sorted(HF_SUPPORTED_OAUTH_PROVIDERS.keys()),
+            },
+        )
+
+    return config
+
+
+def _hf_oauth_new_state() -> str:
+    return _hf_oauth_secrets.token_urlsafe(32)
+
+
+def _hf_oauth_state_expires_at(minutes: int = 15) -> str:
+    return (_hf_oauth_datetime.utcnow() + _hf_oauth_timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hf_oauth_now_string() -> str:
+    return _hf_oauth_datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hf_oauth_placeholder_authorization_url(provider: str, state: str, redirect_after_connect: str = "") -> str:
+    """
+    Placeholder authorization URL.
+
+    Real provider adapters will replace this with provider-specific OAuth URLs.
+    Keeping this URL internal makes the skeleton safe to test in production
+    without accidentally sending homeowners to a real provider consent page.
+    """
+    query = {
+        "provider": provider,
+        "state": state,
+    }
+
+    if redirect_after_connect:
+        query["redirect_after_connect"] = redirect_after_connect
+
+    return "/provider-oauth/{}/callback?{}".format(
+        provider,
+        _hf_oauth_urlparse.urlencode(query),
+    )
+
+
+def _hf_oauth_create_state_record(provider: str, payload: _HFProviderOAuthStartPayload):
+    _hf_oauth_ensure_schema()
+
+    provider_key = _hf_oauth_clean_provider(provider)
+    state = _hf_oauth_new_state()
+    expires_at = _hf_oauth_state_expires_at(15)
+
+    _hf_mon_execute(
+        """
+        INSERT INTO provider_oauth_states (
+          state,
+          tenant_id,
+          property_id,
+          record_id,
+          homeowner_email,
+          provider,
+          redirect_after_connect,
+          expires_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            state,
+            _hf_mon_one_line(payload.tenant_id or "lateef-home-inspection"),
+            _hf_mon_one_line(payload.property_id or ""),
+            _hf_mon_one_line(payload.record_id or ""),
+            _hf_mon_one_line(payload.homeowner_email or ""),
+            provider_key,
+            _hf_mon_safe_text(payload.redirect_after_connect or ""),
+            expires_at,
+        ),
+    )
+
+    return {
+        "state": state,
+        "expires_at": expires_at,
+    }
+
+
+def _hf_oauth_load_state(state: str, provider: str):
+    _hf_oauth_ensure_schema()
+
+    provider_key = _hf_oauth_clean_provider(provider)
+
+    row = _hf_mon_fetch_one(
+        """
+        SELECT *
+        FROM provider_oauth_states
+        WHERE state = %s
+          AND provider = %s
+        LIMIT 1
+        """,
+        (
+            _hf_mon_one_line(state),
+            provider_key,
+        ),
+    )
+
+    if not row:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "oauth_state_not_found",
+                "provider": provider_key,
+            },
+        )
+
+    consumed_at = row.get("consumed_at")
+    if consumed_at:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "oauth_state_already_consumed",
+                "provider": provider_key,
+            },
+        )
+
+    expires_at = row.get("expires_at")
+    if expires_at:
+        expires_text = str(expires_at).replace("T", " ").split(".")[0]
+        try:
+            expires_dt = _hf_oauth_datetime.strptime(expires_text, "%Y-%m-%d %H:%M:%S")
+            if expires_dt < _hf_oauth_datetime.utcnow():
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "success": False,
+                        "error": "oauth_state_expired",
+                        "provider": provider_key,
+                        "expires_at": str(expires_at),
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            # If the DB driver returns a non-standard date shape, do not fail the callback skeleton.
+            pass
+
+    return row
+
+
+def _hf_oauth_consume_state(state: str, provider: str):
+    provider_key = _hf_oauth_clean_provider(provider)
+
+    _hf_mon_execute(
+        """
+        UPDATE provider_oauth_states
+        SET consumed_at = %s
+        WHERE state = %s
+          AND provider = %s
+          AND consumed_at IS NULL
+        """,
+        (
+            _hf_oauth_now_string(),
+            _hf_mon_one_line(state),
+            provider_key,
+        ),
+    )
+
+
+@app.get("/provider-oauth/supported-providers")
+def provider_oauth_supported_providers():
+    """
+    Return provider registry for the dashboard connection UI.
+
+    No secrets or tokens are exposed.
+    """
+    _hf_oauth_ensure_schema()
+
+    providers = list(HF_SUPPORTED_OAUTH_PROVIDERS.values())
+
+    return {
+        "success": True,
+        "count": len(providers),
+        "providers": providers,
+        "next_step": "Use /provider-oauth/{provider}/start to create an OAuth state.",
+    }
+
+
+@app.get("/provider-oauth/{provider}/start")
+def provider_oauth_start(
+    provider: str,
+    record_id: str = "",
+    tenant_id: str = "lateef-home-inspection",
+    property_id: str = "",
+    homeowner_email: str = "",
+    redirect_after_connect: str = "",
+):
+    """
+    Create an OAuth state for a supported provider.
+
+    This skeleton does not redirect to a real provider yet.
+    It returns a placeholder authorization URL for safe production testing.
+    """
+    config = _hf_oauth_get_provider_config(provider)
+
+    payload = _HFProviderOAuthStartPayload(
+        tenant_id=tenant_id,
+        property_id=property_id,
+        record_id=record_id,
+        homeowner_email=homeowner_email,
+        redirect_after_connect=redirect_after_connect,
+    )
+
+    state_record = _hf_oauth_create_state_record(config["provider"], payload)
+
+    authorization_url = _hf_oauth_placeholder_authorization_url(
+        config["provider"],
+        state_record["state"],
+        redirect_after_connect,
+    )
+
+    return {
+        "success": True,
+        "provider": config["provider"],
+        "display_name": config["display_name"],
+        "oauth_ready": False,
+        "mode": "skeleton",
+        "state": state_record["state"],
+        "expires_at": state_record["expires_at"],
+        "authorization_url": authorization_url,
+        "message": "OAuth state created. Real provider authorization URL will be added in the provider adapter pass.",
+    }
+
+
+@app.get("/provider-oauth/{provider}/callback")
+def provider_oauth_callback(
+    provider: str,
+    state: str = "",
+    code: str = "",
+    error: str = "",
+):
+    """
+    Validate and consume OAuth state.
+
+    This skeleton intentionally does not exchange provider code for tokens yet.
+    """
+    config = _hf_oauth_get_provider_config(provider)
+
+    if not state:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_state",
+                "provider": config["provider"],
+            },
+        )
+
+    state_row = _hf_oauth_load_state(state, config["provider"])
+
+    if error:
+        _hf_oauth_consume_state(state, config["provider"])
+        return {
+            "success": False,
+            "provider": config["provider"],
+            "error": "provider_returned_error",
+            "provider_error": error,
+            "state_consumed": True,
+            "record_id": state_row.get("record_id") or "",
+        }
+
+    _hf_oauth_consume_state(state, config["provider"])
+
+    return {
+        "success": True,
+        "provider": config["provider"],
+        "mode": "skeleton",
+        "state_consumed": True,
+        "record_id": state_row.get("record_id") or "",
+        "tenant_id": state_row.get("tenant_id") or "",
+        "homeowner_email": state_row.get("homeowner_email") or "",
+        "has_code": bool(code),
+        "token_exchange_completed": False,
+        "message": "OAuth callback state validated and consumed. Token exchange will be added in the provider adapter pass.",
+    }
+
+
+@app.post("/provider-oauth/{provider}/disconnect")
+def provider_oauth_disconnect(provider: str, payload: _HFProviderOAuthDisconnectPayload):
+    """
+    Placeholder disconnect endpoint.
+
+    Future provider adapter pass will revoke provider tokens when supported.
+    This skeleton marks matching OAuth token rows and device connection rows disconnected
+    if they already exist.
+    """
+    config = _hf_oauth_get_provider_config(provider)
+    _hf_oauth_ensure_schema()
+
+    record_id = _hf_mon_one_line(payload.record_id or "")
+    provider_account_id = _hf_mon_one_line(payload.provider_account_id or "")
+    tenant_id = _hf_mon_one_line(payload.tenant_id or "lateef-home-inspection")
+
+    token_params = [config["provider"]]
+    token_where = ["provider = %s"]
+
+    if record_id:
+        token_where.append("record_id = %s")
+        token_params.append(record_id)
+
+    if provider_account_id:
+        token_where.append("provider_account_id = %s")
+        token_params.append(provider_account_id)
+
+    if tenant_id:
+        token_where.append("tenant_id = %s")
+        token_params.append(tenant_id)
+
+    _hf_mon_execute(
+        f"""
+        UPDATE provider_oauth_tokens
+        SET connection_status = 'disconnected',
+            health_status = 'disconnected',
+            last_error = %s
+        WHERE {' AND '.join(token_where)}
+        """,
+        (
+            _hf_mon_one_line(payload.disconnect_reason or "homeowner_requested"),
+            *token_params,
+        ),
+    )
+
+    # device_connections may exist from previous monitoring/provider registry work.
+    device_params = [config["provider"]]
+    device_where = ["provider = %s"]
+
+    if record_id:
+        device_where.append("record_id = %s")
+        device_params.append(record_id)
+
+    if provider_account_id:
+        device_where.append("provider_account_id = %s")
+        device_params.append(provider_account_id)
+
+    _hf_mon_try_execute(
+        f"""
+        UPDATE device_connections
+        SET connection_status = 'disconnected',
+            health_status = 'disconnected',
+            notes = %s
+        WHERE {' AND '.join(device_where)}
+        """,
+        (
+            "Provider disconnected through OAuth skeleton endpoint.",
+            *device_params,
+        ),
+    )
+
+    return {
+        "success": True,
+        "provider": config["provider"],
+        "mode": "skeleton",
+        "record_id": record_id,
+        "provider_account_id": provider_account_id,
+        "message": "Disconnect request accepted. Provider token revocation will be added in the provider adapter pass.",
+    }
+
+
 @app.get("/provider-oauth/schema-health")
 def provider_oauth_schema_health():
     """

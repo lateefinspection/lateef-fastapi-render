@@ -18512,6 +18512,295 @@ def _hf_tempest_observation_to_events(
     return events
 
 
+
+
+# Provider Scheduled Sync Pass 1E
+class _HFProviderSyncPayload(_hf_oauth_BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_id: str | None = ""
+    homeowner_email: str | None = ""
+    provider_account_id: str | None = ""
+    dry_run: bool | None = False
+
+
+def _hf_provider_sync_create_run(
+    *,
+    provider: str,
+    record_id: str,
+    tenant_id: str = "lateef-home-inspection",
+    property_id: str = "",
+    provider_account_id: str = "",
+    device_connection_id=None,
+):
+    _hf_oauth_ensure_schema()
+
+    _hf_mon_execute(
+        """
+        INSERT INTO provider_sync_runs (
+          tenant_id,
+          property_id,
+          record_id,
+          provider,
+          provider_account_id,
+          device_connection_id,
+          sync_status,
+          candidate_count,
+          created_count,
+          skipped_count,
+          failed_count,
+          started_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, 'started', 0, 0, 0, 0, %s)
+        """,
+        (
+            _hf_mon_one_line(tenant_id or "lateef-home-inspection"),
+            _hf_mon_one_line(property_id or ""),
+            _hf_mon_one_line(record_id or ""),
+            _hf_mon_one_line(provider or ""),
+            _hf_mon_one_line(provider_account_id or ""),
+            device_connection_id,
+            _hf_mon_now_string(),
+        ),
+    )
+
+    row = _hf_mon_fetch_one(
+        """
+        SELECT id
+        FROM provider_sync_runs
+        WHERE provider = %s
+          AND record_id = %s
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            _hf_mon_one_line(provider or ""),
+            _hf_mon_one_line(record_id or ""),
+        ),
+    )
+
+    return int((row or {}).get("id") or 0)
+
+
+def _hf_provider_sync_finish_run(
+    *,
+    sync_run_id,
+    sync_status: str,
+    candidate_count: int = 0,
+    created_count: int = 0,
+    skipped_count: int = 0,
+    failed_count: int = 0,
+    error_message: str = "",
+):
+    if not sync_run_id:
+        return
+
+    _hf_mon_execute(
+        """
+        UPDATE provider_sync_runs
+        SET sync_status = %s,
+            candidate_count = %s,
+            created_count = %s,
+            skipped_count = %s,
+            failed_count = %s,
+            finished_at = %s,
+            error_message = %s
+        WHERE id = %s
+        """,
+        (
+            _hf_mon_one_line(sync_status or "unknown"),
+            int(candidate_count or 0),
+            int(created_count or 0),
+            int(skipped_count or 0),
+            int(failed_count or 0),
+            _hf_mon_now_string(),
+            _hf_mon_safe_text(error_message or ""),
+            int(sync_run_id),
+        ),
+    )
+
+
+def _hf_provider_sync_find_token(
+    *,
+    provider: str,
+    record_id: str,
+    tenant_id: str = "lateef-home-inspection",
+    provider_account_id: str = "",
+):
+    _hf_oauth_ensure_schema()
+
+    params = [
+        _hf_mon_one_line(provider or ""),
+        _hf_mon_one_line(record_id or ""),
+        _hf_mon_one_line(tenant_id or "lateef-home-inspection"),
+    ]
+
+    where = [
+        "provider = %s",
+        "record_id = %s",
+        "tenant_id = %s",
+        "COALESCE(connection_status, '') IN ('connected', 'active')",
+    ]
+
+    if provider_account_id:
+        where.append("provider_account_id = %s")
+        params.append(_hf_mon_one_line(provider_account_id))
+
+    return _hf_mon_fetch_one(
+        f"""
+        SELECT
+          id,
+          tenant_id,
+          property_id,
+          record_id,
+          homeowner_email,
+          provider,
+          provider_account_id,
+          device_connection_id,
+          token_type,
+          scope,
+          access_token_expires_at,
+          refresh_token_expires_at,
+          connection_status,
+          health_status,
+          last_refresh_at,
+          last_sync_at,
+          last_error
+        FROM provider_oauth_tokens
+        WHERE {' AND '.join(where)}
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        tuple(params),
+    )
+
+
+@app.post("/provider-sync/tempest/{record_id}")
+def provider_sync_tempest(record_id: str, payload: _HFProviderSyncPayload):
+    """
+    Scheduled Tempest provider sync foundation.
+
+    Current production-safe behavior:
+    - Creates provider_sync_runs audit row
+    - Looks for an active Tempest OAuth token
+    - Returns skipped_no_token when homeowner has not connected Tempest yet
+    - Does not insert fake integration_events
+
+    Future provider adapter pass will:
+    - Refresh token when needed
+    - Pull station/device observations from Tempest
+    - Normalize events
+    - Insert integration_events
+    - Update device_connections
+    """
+    _hf_oauth_ensure_schema()
+
+    clean_record_id = _hf_mon_one_line(record_id or "")
+    tenant_id = _hf_mon_one_line(payload.tenant_id or "lateef-home-inspection")
+    property_id = _hf_mon_one_line(payload.property_id or "")
+    provider_account_id = _hf_mon_one_line(payload.provider_account_id or "")
+    dry_run = bool(payload.dry_run)
+
+    if not clean_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+            },
+        )
+
+    sync_run_id = 0
+
+    if not dry_run:
+        sync_run_id = _hf_provider_sync_create_run(
+            provider="tempest",
+            record_id=clean_record_id,
+            tenant_id=tenant_id,
+            property_id=property_id,
+            provider_account_id=provider_account_id,
+        )
+
+    token = _hf_provider_sync_find_token(
+        provider="tempest",
+        record_id=clean_record_id,
+        tenant_id=tenant_id,
+        provider_account_id=provider_account_id,
+    )
+
+    if not token:
+        status = "skipped_no_token"
+        message = (
+            "No active Tempest OAuth token exists for this record yet. "
+            "Homeowner provider connection is required before scheduled sync can pull station data."
+        )
+
+        if not dry_run:
+            _hf_provider_sync_finish_run(
+                sync_run_id=sync_run_id,
+                sync_status=status,
+                candidate_count=0,
+                created_count=0,
+                skipped_count=1,
+                failed_count=0,
+                error_message=message,
+            )
+
+        return {
+            "success": True,
+            "provider": "tempest",
+            "record_id": clean_record_id,
+            "tenant_id": tenant_id,
+            "dry_run": dry_run,
+            "sync_run_id": sync_run_id,
+            "sync_status": status,
+            "token_found": False,
+            "candidate_count": 0,
+            "created_count": 0,
+            "skipped_count": 1,
+            "failed_count": 0,
+            "message": message,
+            "next_step": "Complete real Tempest OAuth callback token exchange, then scheduled sync can pull station observations.",
+        }
+
+    # Token exists, but live Tempest station pulling is intentionally deferred.
+    # This protects production from partially implemented provider writes.
+    status = "adapter_pending"
+    message = (
+        "A Tempest token row exists, but live station sync is not enabled yet. "
+        "Next pass will add token refresh, station fetch, normalization, and integration_events writes."
+    )
+
+    if not dry_run:
+        _hf_provider_sync_finish_run(
+            sync_run_id=sync_run_id,
+            sync_status=status,
+            candidate_count=0,
+            created_count=0,
+            skipped_count=1,
+            failed_count=0,
+            error_message=message,
+        )
+
+    return {
+        "success": True,
+        "provider": "tempest",
+        "record_id": clean_record_id,
+        "tenant_id": tenant_id,
+        "dry_run": dry_run,
+        "sync_run_id": sync_run_id,
+        "sync_status": status,
+        "token_found": True,
+        "token_id": token.get("id"),
+        "provider_account_id": token.get("provider_account_id") or "",
+        "device_connection_id": token.get("device_connection_id"),
+        "candidate_count": 0,
+        "created_count": 0,
+        "skipped_count": 1,
+        "failed_count": 0,
+        "message": message,
+    }
+
+
 @app.get("/provider-adapters/tempest/health")
 def provider_adapter_tempest_health():
     """

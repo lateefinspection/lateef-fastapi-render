@@ -19994,16 +19994,36 @@ def _hf_insert_default_weather_connection(
             },
         )
 
-    placeholders = ", ".join(["%s"] * len(insert_cols))
+    # Default Weather Auto-Provisioning JSON Insert Fix Pass
+    placeholders = []
+
+    for col in insert_cols:
+        if col == "capabilities_json":
+            placeholders.append("CAST(%s AS JSON)")
+        else:
+            placeholders.append("%s")
+
+    placeholders_sql = ", ".join(placeholders)
     col_sql = ", ".join(insert_cols)
 
-    _hf_mon_execute(
-        f"""
-        INSERT INTO device_connections ({col_sql})
-        VALUES ({placeholders})
-        """,
-        tuple(insert_vals),
-    )
+    try:
+        _hf_mon_execute(
+            f"""
+            INSERT INTO device_connections ({col_sql})
+            VALUES ({placeholders_sql})
+            """,
+            tuple(insert_vals),
+        )
+    except Exception as insert_error:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "default_weather_connection_insert_failed",
+                "message": str(insert_error),
+                "insert_columns": insert_cols,
+            },
+        )
 
     return _hf_find_default_weather_connection(
         record_id=record_id,

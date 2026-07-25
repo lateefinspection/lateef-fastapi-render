@@ -19839,8 +19839,312 @@ def _hf_weather_provider_make_provider_event_id(record_id: str, weather_event_ty
     return f"weather-{record_id}-{_hf_weather_event_type(weather_event_type)}-{clean_time}"
 
 
+
+
+# Default Weather Auto-Provisioning Per Uploaded Report Pass
+class _HFDefaultWeatherSourcePayload(_hf_oauth_BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_address: str | None = ""
+    homeowner_email: str | None = ""
+    property_id: str | None = ""
+    dry_run: bool | None = False
+
+
+def _hf_table_columns(table_name: str):
+    """
+    Return database columns for a table.
+
+    This helper keeps this pass safe against small schema differences between
+    local, Render, and prior migration states.
+    """
+    try:
+        rows = _hf_mon_fetch_all(f"SHOW COLUMNS FROM {table_name}", ())
+        columns = []
+
+        for row in rows or []:
+            field = row.get("Field") or row.get("field") or row.get("COLUMN_NAME") or row.get("column_name")
+            if field:
+                columns.append(str(field))
+
+        return columns
+    except Exception:
+        return []
+
+
+def _hf_first_existing_column(columns, candidates):
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def _hf_default_weather_capabilities_json():
+    return _hf_oauth_json.dumps(
+        [
+            "WEATHER_RAIN",
+            "WEATHER_WIND",
+            "WEATHER_FREEZE",
+            "WEATHER_HEAT",
+            "WEATHER_DROUGHT",
+            "HUMIDITY",
+        ]
+    )
+
+
+def _hf_find_default_weather_connection(record_id: str, tenant_id: str = "lateef-home-inspection"):
+    columns = _hf_table_columns("device_connections")
+
+    if not columns:
+        return None
+
+    record_col = _hf_first_existing_column(columns, ["record_id"])
+    tenant_col = _hf_first_existing_column(columns, ["tenant_id"])
+    provider_col = _hf_first_existing_column(columns, ["provider"])
+    label_col = _hf_first_existing_column(columns, ["connection_label", "label", "source_label", "name"])
+
+    if not record_col or not provider_col:
+        return None
+
+    where = [
+        f"{record_col} = %s",
+        f"{provider_col} = %s",
+    ]
+    params = [
+        _hf_mon_one_line(record_id or ""),
+        "weather",
+    ]
+
+    if tenant_col:
+        where.append(f"{tenant_col} = %s")
+        params.append(_hf_mon_one_line(tenant_id or "lateef-home-inspection"))
+
+    if label_col:
+        where.append(f"{label_col} = %s")
+        params.append("HomeFax Weather Intelligence")
+
+    return _hf_mon_fetch_one(
+        f"""
+        SELECT *
+        FROM device_connections
+        WHERE {' AND '.join(where)}
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        tuple(params),
+    )
+
+
+def _hf_insert_default_weather_connection(
+    *,
+    record_id: str,
+    tenant_id: str = "lateef-home-inspection",
+    property_address: str = "",
+    homeowner_email: str = "",
+    property_id: str = "",
+):
+    """
+    Create the included HomeFax Weather Intelligence connection for a property.
+
+    This is platform-managed weather, not a homeowner-owned weather station.
+    """
+    columns = _hf_table_columns("device_connections")
+
+    if not columns:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "device_connections_schema_unavailable",
+            },
+        )
+
+    now_value = _hf_mon_now_string()
+
+    desired = {
+        "tenant_id": _hf_mon_one_line(tenant_id or "lateef-home-inspection"),
+        "property_id": _hf_mon_one_line(property_id or ""),
+        "record_id": _hf_mon_one_line(record_id or ""),
+        "homeowner_email": _hf_mon_one_line(homeowner_email or ""),
+        "provider": "weather",
+        "provider_account_id": "weather-" + _hf_mon_one_line(record_id or ""),
+        "connection_label": "HomeFax Weather Intelligence",
+        "label": "HomeFax Weather Intelligence",
+        "source_label": "HomeFax Weather Intelligence",
+        "name": "HomeFax Weather Intelligence",
+        "connection_status": "connected",
+        "health_status": "healthy",
+        "current_health_status": "healthy",
+        "source_type": "property_location_weather",
+        "connection_type": "platform_managed",
+        "managed_by": "homefax",
+        "platform_managed": 1,
+        "is_platform_managed": 1,
+        "device_count": 1,
+        "capabilities": _hf_default_weather_capabilities_json(),
+        "notes": (
+            "HomeFax Weather Intelligence is included with this property. "
+            "Weather is based on the report/property location and does not require homeowner hardware."
+        ),
+        "connection_notes": (
+            "HomeFax Weather Intelligence is included with this property. "
+            "Weather is based on the report/property location and does not require homeowner hardware."
+        ),
+        "property_address": _hf_mon_safe_text(property_address or ""),
+        "last_sync_at": now_value,
+        "last_event_at": now_value,
+        "created_at": now_value,
+        "updated_at": now_value,
+    }
+
+    insert_cols = []
+    insert_vals = []
+
+    for col, val in desired.items():
+        if col in columns:
+            insert_cols.append(col)
+            insert_vals.append(val)
+
+    if not insert_cols:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "device_connections_no_matching_columns",
+            },
+        )
+
+    placeholders = ", ".join(["%s"] * len(insert_cols))
+    col_sql = ", ".join(insert_cols)
+
+    _hf_mon_execute(
+        f"""
+        INSERT INTO device_connections ({col_sql})
+        VALUES ({placeholders})
+        """,
+        tuple(insert_vals),
+    )
+
+    return _hf_find_default_weather_connection(
+        record_id=record_id,
+        tenant_id=tenant_id,
+    )
+
+
+def _hf_ensure_default_weather_connection(
+    *,
+    record_id: str,
+    tenant_id: str = "lateef-home-inspection",
+    property_address: str = "",
+    homeowner_email: str = "",
+    property_id: str = "",
+    dry_run: bool = False,
+):
+    clean_record_id = _hf_mon_one_line(record_id or "")
+    clean_tenant_id = _hf_mon_one_line(tenant_id or "lateef-home-inspection")
+
+    if not clean_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+            },
+        )
+
+    existing = _hf_find_default_weather_connection(
+        record_id=clean_record_id,
+        tenant_id=clean_tenant_id,
+    )
+
+    if existing:
+        return {
+            "success": True,
+            "record_id": clean_record_id,
+            "tenant_id": clean_tenant_id,
+            "source": "HomeFax Weather Intelligence",
+            "provider": "weather",
+            "created": False,
+            "dry_run": bool(dry_run),
+            "connection_id": existing.get("id"),
+            "connection_status": existing.get("connection_status") or existing.get("status") or "",
+            "health_status": existing.get("health_status") or existing.get("current_health_status") or "",
+            "message": "Default HomeFax Weather Intelligence source already exists for this record.",
+        }
+
+    if dry_run:
+        return {
+            "success": True,
+            "record_id": clean_record_id,
+            "tenant_id": clean_tenant_id,
+            "source": "HomeFax Weather Intelligence",
+            "provider": "weather",
+            "created": False,
+            "dry_run": True,
+            "connection_id": None,
+            "message": "Default HomeFax Weather Intelligence source would be created for this record.",
+        }
+
+    created = _hf_insert_default_weather_connection(
+        record_id=clean_record_id,
+        tenant_id=clean_tenant_id,
+        property_address=property_address or "",
+        homeowner_email=homeowner_email or "",
+        property_id=property_id or "",
+    )
+
+    return {
+        "success": True,
+        "record_id": clean_record_id,
+        "tenant_id": clean_tenant_id,
+        "source": "HomeFax Weather Intelligence",
+        "provider": "weather",
+        "created": True,
+        "dry_run": False,
+        "connection_id": (created or {}).get("id"),
+        "connection_status": (created or {}).get("connection_status") or (created or {}).get("status") or "connected",
+        "health_status": (created or {}).get("health_status") or (created or {}).get("current_health_status") or "healthy",
+        "message": "Default HomeFax Weather Intelligence source created for this record.",
+    }
+
+
+@app.post("/weather-intelligence/{record_id}/ensure-default-source")
+def ensure_default_weather_source(record_id: str, payload: _HFDefaultWeatherSourcePayload):
+    """
+    Ensure every HomeFax report/property has included weather intelligence.
+
+    This is the included SaaS weather layer:
+    - based on the report/property location
+    - platform-managed by HomeFax
+    - no Tempest or homeowner-owned weather station required
+    """
+    return _hf_ensure_default_weather_connection(
+        record_id=record_id,
+        tenant_id=payload.tenant_id or "lateef-home-inspection",
+        property_address=payload.property_address or "",
+        homeowner_email=payload.homeowner_email or "",
+        property_id=payload.property_id or "",
+        dry_run=bool(payload.dry_run),
+    )
+
+
 @app.post("/weather-provider/{record_id}/sync")
 def sync_weather_provider_for_record(record_id: str, payload: _HFWeatherProviderSyncPayload):
+    # Default Weather Auto-Provisioning call inside weather sync
+    try:
+        payload_tenant_id = getattr(payload, "tenant_id", "lateef-home-inspection") if "payload" in locals() else "lateef-home-inspection"
+        payload_property_address = getattr(payload, "property_address", "") if "payload" in locals() else ""
+        payload_homeowner_email = getattr(payload, "homeowner_email", "") if "payload" in locals() else ""
+
+        _hf_ensure_default_weather_connection(
+            record_id=record_id,
+            tenant_id=payload_tenant_id or "lateef-home-inspection",
+            property_address=payload_property_address or "",
+            homeowner_email=payload_homeowner_email or "",
+            dry_run=False,
+        )
+    except Exception as weather_source_error:
+        print("Default weather source ensure failed:", str(weather_source_error))
+
     """
     Provider-neutral weather adapter sync.
 

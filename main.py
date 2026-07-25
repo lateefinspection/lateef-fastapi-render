@@ -19878,8 +19878,9 @@ def _hf_first_existing_column(columns, candidates):
     return None
 
 
+# Default Weather Auto-Provisioning Crash Safe Pass
 def _hf_default_weather_capabilities_json():
-    return _hf_oauth_json.dumps(
+    return json.dumps(
         [
             "WEATHER_RAIN",
             "WEATHER_WIND",
@@ -19973,7 +19974,7 @@ def _hf_insert_default_weather_connection(
         "notes": (
             "HomeFax Weather Intelligence is included with this property. "
             "Weather is based on the report/property location and does not require homeowner hardware. "
-            "Property address: " + _hf_mon_safe_text(property_address or "")
+            "Property address: " + _hf_mon_one_line(property_address or "")
         ),
     }
 
@@ -20145,14 +20146,28 @@ def ensure_default_weather_source(record_id: str, payload: _HFDefaultWeatherSour
     - platform-managed by HomeFax
     - no Tempest or homeowner-owned weather station required
     """
-    return _hf_ensure_default_weather_connection(
-        record_id=record_id,
-        tenant_id=payload.tenant_id or "lateef-home-inspection",
-        property_address=payload.property_address or "",
-        homeowner_email=payload.homeowner_email or "",
-        property_id=payload.property_id or "",
-        dry_run=bool(payload.dry_run),
-    )
+    try:
+        return _hf_ensure_default_weather_connection(
+            record_id=record_id,
+            tenant_id=payload.tenant_id or "lateef-home-inspection",
+            property_address=payload.property_address or "",
+            homeowner_email=payload.homeowner_email or "",
+            property_id=payload.property_id or "",
+            dry_run=bool(payload.dry_run),
+        )
+    except HTTPException:
+        raise
+    except Exception as ensure_error:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "default_weather_ensure_unhandled_error",
+                "message": str(ensure_error),
+                "error_type": type(ensure_error).__name__,
+                "record_id": record_id,
+            },
+        )
 
 
 @app.post("/weather-provider/{record_id}/sync")

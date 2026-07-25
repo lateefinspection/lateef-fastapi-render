@@ -19958,8 +19958,6 @@ def _hf_insert_default_weather_connection(
             },
         )
 
-    now_value = _hf_mon_now_string()
-
     desired = {
         "tenant_id": _hf_mon_one_line(tenant_id or "lateef-home-inspection"),
         "property_id": _hf_mon_one_line(property_id or ""),
@@ -19968,32 +19966,15 @@ def _hf_insert_default_weather_connection(
         "provider": "weather",
         "provider_account_id": "weather-" + _hf_mon_one_line(record_id or ""),
         "connection_label": "HomeFax Weather Intelligence",
-        "label": "HomeFax Weather Intelligence",
-        "source_label": "HomeFax Weather Intelligence",
-        "name": "HomeFax Weather Intelligence",
         "connection_status": "connected",
-        "health_status": "healthy",
-        "current_health_status": "healthy",
-        "source_type": "property_location_weather",
-        "connection_type": "platform_managed",
-        "managed_by": "homefax",
-        "platform_managed": 1,
-        "is_platform_managed": 1,
+        "capabilities_json": _hf_default_weather_capabilities_json(),
         "device_count": 1,
-        "capabilities": _hf_default_weather_capabilities_json(),
+        "health_status": "healthy",
         "notes": (
             "HomeFax Weather Intelligence is included with this property. "
-            "Weather is based on the report/property location and does not require homeowner hardware."
+            "Weather is based on the report/property location and does not require homeowner hardware. "
+            "Property address: " + _hf_mon_safe_text(property_address or "")
         ),
-        "connection_notes": (
-            "HomeFax Weather Intelligence is included with this property. "
-            "Weather is based on the report/property location and does not require homeowner hardware."
-        ),
-        "property_address": _hf_mon_safe_text(property_address or ""),
-        "last_sync_at": now_value,
-        "last_event_at": now_value,
-        "created_at": now_value,
-        "updated_at": now_value,
     }
 
     insert_cols = []

@@ -21833,16 +21833,31 @@ def create_mock_integration_event(request: _HFMonMockEventRequest):
     )
 
     recurrence_detection = {"checked": False, "reason": "not_run", "updated_count": 0}
+    recurrence_conn = None
 
     try:
-        recurrence_detection = _hf_repair_mark_recurrence_for_event(
-            record_id=record_id,
-            source_issue_id=source_issue_id,
-            monitoring_plan_id=monitoring_plan_id,
-            integration_event_id=event_id,
-            occurred_at=request.occurred_at or None,
-        )
+        _hf_repair_ensure_schema()
+        recurrence_conn = _hf_mon_get_connection()
+
+        with recurrence_conn.cursor() as recurrence_cursor:
+            recurrence_detection = _hf_repair_mark_recurrence_for_event(
+                recurrence_cursor,
+                record_id=record_id,
+                source_issue_id=source_issue_id,
+                monitoring_plan_id=monitoring_plan_id,
+                integration_event_id=event_id,
+                occurred_at=request.occurred_at or None,
+            )
+
+        recurrence_conn.commit()
+
     except Exception as recurrence_exc:
+        try:
+            if recurrence_conn:
+                recurrence_conn.rollback()
+        except Exception:
+            pass
+
         recurrence_detection = {
             "checked": False,
             "reason": "recurrence_check_failed",
@@ -21850,6 +21865,13 @@ def create_mock_integration_event(request: _HFMonMockEventRequest):
             "updated_count": 0,
             "repair_event_ids": [],
         }
+
+    finally:
+        try:
+            if recurrence_conn:
+                recurrence_conn.close()
+        except Exception:
+            pass
 
     event = _hf_mon_fetch_one(
         "SELECT * FROM integration_events WHERE id = %s LIMIT 1",

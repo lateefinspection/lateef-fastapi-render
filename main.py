@@ -21399,6 +21399,11 @@ def review_monitoring_event(event_id: int, payload: _HFMonitoringEventReviewPayl
         "reviewed_by = %s",
         "reviewed_at = NOW()",
         "followup_required = %s",
+        # Event Acknowledgment Consistency Patch
+        # Keep dashboard/source-of-truth acknowledgement fields aligned
+        # whenever a homeowner/admin reviews a monitoring event.
+        "homeowner_acknowledged = %s",
+        "homeowner_note = %s",
     ]
 
     params = [
@@ -21407,6 +21412,8 @@ def review_monitoring_event(event_id: int, payload: _HFMonitoringEventReviewPayl
         review_note,
         reviewed_by,
         1 if followup_required else 0,
+        "yes",
+        review_note,
     ]
 
     if event_status == "resolved":

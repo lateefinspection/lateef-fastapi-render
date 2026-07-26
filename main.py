@@ -9104,6 +9104,448 @@ def refresh_report_source_urls(record_id: str):
     }
 
 
+# ============================================================
+# HomeFax Repair Event Tracking + Recurrence History
+# Phase 27 / Pass 1
+# ============================================================
+
+class _HFRepairEventPayload(_hf_oauth_BaseModel):
+    tenant_id: str | None = "lateef-home-inspection"
+    property_id: str | None = ""
+    record_id: str
+    source_issue_id: int
+    monitoring_plan_id: int | None = None
+
+    repair_status: str | None = "reported"
+    repair_type: str | None = "homeowner_reported"
+    repair_summary: str | None = ""
+    repair_note: str | None = ""
+
+    repaired_by: str | None = ""
+    contractor_name: str | None = ""
+    contractor_trade: str | None = ""
+    contractor_phone: str | None = ""
+    contractor_email: str | None = ""
+
+    repair_cost: float | None = None
+    repair_completed_at: str | None = None
+    reported_by: str | None = "homeowner"
+    evidence_url: str | None = ""
+    evidence_note: str | None = ""
+
+    post_repair_watch_required: bool | None = True
+    recurrence_watch_days: int | None = 90
+
+
+def _hf_repair_ensure_schema():
+    """
+    Creates repair_events table if it does not exist.
+    This table tracks homeowner/admin/contractor repair history
+    linked to verified issues and monitoring plans.
+    """
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS repair_events (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+
+                    tenant_id VARCHAR(255) NULL,
+                    property_id VARCHAR(255) NULL,
+                    record_id VARCHAR(255) NOT NULL,
+                    source_issue_id BIGINT NOT NULL,
+                    monitoring_plan_id BIGINT NULL,
+
+                    repair_status VARCHAR(128) DEFAULT 'reported',
+                    repair_type VARCHAR(128) DEFAULT 'homeowner_reported',
+                    repair_summary TEXT NULL,
+                    repair_note TEXT NULL,
+
+                    repaired_by VARCHAR(255) NULL,
+                    contractor_name VARCHAR(255) NULL,
+                    contractor_trade VARCHAR(255) NULL,
+                    contractor_phone VARCHAR(128) NULL,
+                    contractor_email VARCHAR(255) NULL,
+
+                    repair_cost DECIMAL(12,2) NULL,
+                    repair_completed_at DATETIME NULL,
+                    reported_by VARCHAR(255) NULL,
+
+                    evidence_url TEXT NULL,
+                    evidence_note TEXT NULL,
+
+                    post_repair_watch_required VARCHAR(16) DEFAULT 'yes',
+                    recurrence_watch_days INT DEFAULT 90,
+
+                    recurrence_status VARCHAR(128) DEFAULT 'watching',
+                    recurrence_event_count INT DEFAULT 0,
+                    latest_recurrence_event_id BIGINT NULL,
+                    latest_recurrence_at DATETIME NULL,
+
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+                    INDEX idx_repair_events_record_id (record_id),
+                    INDEX idx_repair_events_source_issue_id (source_issue_id),
+                    INDEX idx_repair_events_monitoring_plan_id (monitoring_plan_id),
+                    INDEX idx_repair_events_repair_status (repair_status),
+                    INDEX idx_repair_events_recurrence_status (recurrence_status)
+                )
+                """
+            )
+
+        conn.commit()
+
+    except Exception:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        raise
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_repair_normalize_status(value: str | None) -> str:
+    status = str(value or "").strip().lower()
+
+    allowed = {
+        "reported",
+        "scheduled",
+        "in_progress",
+        "completed",
+        "verified",
+        "failed",
+        "cancelled",
+        "watching",
+    }
+
+    if not status:
+        return "reported"
+
+    if status in allowed:
+        return status
+
+    if status in {"done", "fixed", "repaired", "complete"}:
+        return "completed"
+
+    if status in {"confirmed", "approved"}:
+        return "verified"
+
+    return "reported"
+
+
+def _hf_repair_bool_yes(value) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+
+    normalized = str(value or "").strip().lower()
+    return "yes" if normalized in {"yes", "true", "1", "y", "on"} else "no"
+
+
+def _hf_repair_parse_datetime(value: str | None):
+    """
+    Returns a MySQL-safe datetime string or None.
+    Keeps this endpoint tolerant of plain ISO strings from the dashboard.
+    """
+    raw = str(value or "").strip()
+
+    if not raw:
+        return None
+
+    try:
+        from datetime import datetime
+
+        cleaned = raw.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(cleaned)
+
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+@app.post("/repair-events")
+def create_repair_event(payload: _HFRepairEventPayload):
+    """
+    Create a repair event linked to a verified issue and optional monitoring plan.
+
+    This does not delete or overwrite the inspection baseline.
+    It adds a living timeline event after the baseline has been locked.
+    """
+    _hf_mon_ensure_schema()
+    _hf_repair_ensure_schema()
+
+    record_id = str(payload.record_id or "").strip()
+    source_issue_id = int(payload.source_issue_id or 0)
+
+    if not record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    if source_issue_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_source_issue_id",
+                "message": "source_issue_id is required.",
+            },
+        )
+
+    repair_status = _hf_repair_normalize_status(payload.repair_status)
+    post_repair_watch_required = _hf_repair_bool_yes(payload.post_repair_watch_required)
+    repair_completed_at = _hf_repair_parse_datetime(payload.repair_completed_at)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO repair_events (
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    source_issue_id,
+                    monitoring_plan_id,
+                    repair_status,
+                    repair_type,
+                    repair_summary,
+                    repair_note,
+                    repaired_by,
+                    contractor_name,
+                    contractor_trade,
+                    contractor_phone,
+                    contractor_email,
+                    repair_cost,
+                    repair_completed_at,
+                    reported_by,
+                    evidence_url,
+                    evidence_note,
+                    post_repair_watch_required,
+                    recurrence_watch_days,
+                    recurrence_status
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s
+                )
+                """,
+                (
+                    str(payload.tenant_id or "lateef-home-inspection").strip(),
+                    str(payload.property_id or "").strip(),
+                    record_id,
+                    source_issue_id,
+                    payload.monitoring_plan_id,
+                    repair_status,
+                    str(payload.repair_type or "homeowner_reported").strip(),
+                    str(payload.repair_summary or "").strip(),
+                    str(payload.repair_note or "").strip(),
+                    str(payload.repaired_by or "").strip(),
+                    str(payload.contractor_name or "").strip(),
+                    str(payload.contractor_trade or "").strip(),
+                    str(payload.contractor_phone or "").strip(),
+                    str(payload.contractor_email or "").strip(),
+                    payload.repair_cost,
+                    repair_completed_at,
+                    str(payload.reported_by or "homeowner").strip(),
+                    str(payload.evidence_url or "").strip(),
+                    str(payload.evidence_note or "").strip(),
+                    post_repair_watch_required,
+                    int(payload.recurrence_watch_days or 90),
+                    "watching" if post_repair_watch_required == "yes" else "not_required",
+                ),
+            )
+
+            repair_event_id = cursor.lastrowid
+
+            if payload.monitoring_plan_id and post_repair_watch_required == "yes":
+                try:
+                    cursor.execute(
+                        """
+                        UPDATE monitoring_plans
+                        SET
+                            post_repair_monitoring_required = 'yes',
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (payload.monitoring_plan_id,),
+                    )
+                except Exception:
+                    # Do not fail repair creation if the plan table shape differs.
+                    pass
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM repair_events
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (repair_event_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Repair event created.",
+            "repair_event": row,
+        }
+
+    except HTTPException:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "repair_event_create_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/repair-events/{record_id}")
+def get_repair_events(record_id: str):
+    """
+    Return all repair events for a record.
+    """
+    _hf_repair_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM repair_events
+                WHERE record_id = %s
+                ORDER BY created_at DESC, id DESC
+                """,
+                (record_id,),
+            )
+            rows = cursor.fetchall() or []
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "repair_event_count": len(rows),
+            "repair_events": rows,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "repair_events_lookup_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/repair-events/{record_id}/issue/{issue_id}")
+def get_repair_events_for_issue(record_id: str, issue_id: int):
+    """
+    Return repair events for one verified issue.
+    """
+    _hf_repair_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM repair_events
+                WHERE record_id = %s
+                  AND source_issue_id = %s
+                ORDER BY created_at DESC, id DESC
+                """,
+                (record_id, issue_id),
+            )
+            rows = cursor.fetchall() or []
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "source_issue_id": issue_id,
+            "repair_event_count": len(rows),
+            "repair_events": rows,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "repair_issue_events_lookup_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
 
 # ============================================================
 # HomeFax Original Report Source Compatibility Patch 1

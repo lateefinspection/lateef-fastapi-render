@@ -9109,7 +9109,7 @@ def refresh_report_source_urls(record_id: str):
 # Phase 27 / Pass 1
 # ============================================================
 
-class _HFRepairEventPayload(_hf_oauth_BaseModel):
+class _HFRepairEventPayload(BaseModel):
     tenant_id: str | None = "lateef-home-inspection"
     property_id: str | None = ""
     record_id: str

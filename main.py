@@ -9274,6 +9274,102 @@ def _hf_repair_parse_datetime(value: str | None):
         return None
 
 
+def _hf_repair_mark_recurrence_for_event(
+    cursor,
+    *,
+    record_id: str,
+    source_issue_id: int | None,
+    monitoring_plan_id: int | None,
+    integration_event_id: int,
+    occurred_at=None,
+):
+    """
+    Marks active repair watch records when a new monitoring event occurs
+    after a repair event.
+
+    This turns HomeFax repair history into recurrence history.
+    """
+    safe_record_id = str(record_id or "").strip()
+    safe_issue_id = int(source_issue_id or 0)
+    safe_plan_id = int(monitoring_plan_id or 0)
+    safe_event_id = int(integration_event_id or 0)
+
+    if not safe_record_id or safe_event_id <= 0:
+        return {
+            "checked": False,
+            "reason": "missing_record_or_event_id",
+            "updated_count": 0,
+            "repair_event_ids": [],
+        }
+
+    conditions = ["record_id = %s", "post_repair_watch_required = 'yes'"]
+    params = [safe_record_id]
+
+    issue_or_plan_conditions = []
+
+    if safe_issue_id > 0:
+        issue_or_plan_conditions.append("source_issue_id = %s")
+        params.append(safe_issue_id)
+
+    if safe_plan_id > 0:
+        issue_or_plan_conditions.append("monitoring_plan_id = %s")
+        params.append(safe_plan_id)
+
+    if not issue_or_plan_conditions:
+        return {
+            "checked": False,
+            "reason": "missing_issue_and_plan",
+            "updated_count": 0,
+            "repair_event_ids": [],
+        }
+
+    conditions.append("(" + " OR ".join(issue_or_plan_conditions) + ")")
+    conditions.append("recurrence_status IN ('watching', 'recurrence_detected')")
+
+    cursor.execute(
+        f"""
+        SELECT id
+        FROM repair_events
+        WHERE {" AND ".join(conditions)}
+        ORDER BY created_at DESC, id DESC
+        """,
+        tuple(params),
+    )
+
+    rows = cursor.fetchall() or []
+    repair_event_ids = [row.get("id") for row in rows if row.get("id")]
+
+    if not repair_event_ids:
+        return {
+            "checked": True,
+            "reason": "no_matching_repair_watch",
+            "updated_count": 0,
+            "repair_event_ids": [],
+        }
+
+    placeholders = ", ".join(["%s"] * len(repair_event_ids))
+
+    cursor.execute(
+        f"""
+        UPDATE repair_events
+        SET
+            recurrence_status = 'recurrence_detected',
+            recurrence_event_count = COALESCE(recurrence_event_count, 0) + 1,
+            latest_recurrence_event_id = %s,
+            latest_recurrence_at = COALESCE(%s, NOW()),
+            updated_at = NOW()
+        WHERE id IN ({placeholders})
+        """,
+        tuple([safe_event_id, occurred_at] + repair_event_ids),
+    )
+
+    return {
+        "checked": True,
+        "reason": "recurrence_detected",
+        "updated_count": len(repair_event_ids),
+        "repair_event_ids": repair_event_ids,
+    }
+
 @app.post("/repair-events")
 def create_repair_event(payload: _HFRepairEventPayload):
     """
@@ -21736,6 +21832,25 @@ def create_mock_integration_event(request: _HFMonMockEventRequest):
         ),
     )
 
+    recurrence_detection = {"checked": False, "reason": "not_run", "updated_count": 0}
+
+    try:
+        recurrence_detection = _hf_repair_mark_recurrence_for_event(
+            record_id=record_id,
+            source_issue_id=source_issue_id,
+            monitoring_plan_id=monitoring_plan_id,
+            integration_event_id=event_id,
+            occurred_at=request.occurred_at or None,
+        )
+    except Exception as recurrence_exc:
+        recurrence_detection = {
+            "checked": False,
+            "reason": "recurrence_check_failed",
+            "error": str(recurrence_exc),
+            "updated_count": 0,
+            "repair_event_ids": [],
+        }
+
     event = _hf_mon_fetch_one(
         "SELECT * FROM integration_events WHERE id = %s LIMIT 1",
         (event_id,),
@@ -21749,6 +21864,7 @@ def create_mock_integration_event(request: _HFMonMockEventRequest):
         "message": "Mock integration event created.",
         "event": event,
         "linked_monitoring_plan": plan,
+        "recurrence_detection": recurrence_detection,
     }
 
 

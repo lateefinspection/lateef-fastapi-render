@@ -22125,3 +22125,833 @@ def monitoring_events_for_record(record_id: str):
 # HomeFax Monitoring Lifecycle Backend Pass 2
 # Final approval route auto-creates monitoring plans for monitored locked issues.
 # ============================================================
+
+# ============================================================
+# HomeFax Maintenance Task Scheduler Pass 1
+# Recurring home-care tasks such as furnace filters, gutters,
+# HVAC service, smoke detector batteries, and seasonal checks.
+# ============================================================
+
+from typing import Optional as _hf_maint_Optional, Any as _hf_maint_Any
+from datetime import datetime as _hf_maint_datetime, timedelta as _hf_maint_timedelta
+
+
+class _HFMaintenanceTaskPayload(BaseModel):
+    tenant_id: str = "lateef-home-inspection"
+    property_id: str = ""
+    record_id: str
+    source_issue_id: _hf_maint_Optional[int] = None
+    monitoring_plan_id: _hf_maint_Optional[int] = None
+
+    title: str
+    system: str = ""
+    component: str = ""
+    location: str = ""
+    task_type: str = "recurring_maintenance"
+
+    recurrence_interval_count: int = 3
+    recurrence_interval_unit: str = "months"
+
+    next_due_at: _hf_maint_Optional[str] = None
+    last_completed_at: _hf_maint_Optional[str] = None
+
+    store_category: str = "hardware_store"
+    shopping_list_json: _hf_maint_Optional[_hf_maint_Any] = None
+    instructions: str = ""
+    notes: str = ""
+    status: str = "active"
+
+
+class _HFMaintenanceCompletionPayload(BaseModel):
+    completed_by: str = "homeowner"
+    completed_at: _hf_maint_Optional[str] = None
+    note: str = ""
+    evidence_url: str = ""
+    event_status: str = "done"
+
+
+class _HFMaintenanceSchedulerRunPayload(BaseModel):
+    record_id: _hf_maint_Optional[str] = None
+    tenant_id: str = "lateef-home-inspection"
+    days_ahead: int = 14
+
+
+def _hf_maint_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_maint_text(value):
+    return str(value or "").strip()
+
+
+def _hf_maint_now():
+    return _hf_maint_datetime.utcnow()
+
+
+def _hf_maint_parse_datetime(value):
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+
+    if not raw:
+        return None
+
+    cleaned = raw.replace("Z", "").replace("T", " ")
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return _hf_maint_datetime.strptime(cleaned[:19], fmt)
+        except Exception:
+            pass
+
+    try:
+        return _hf_maint_datetime.fromisoformat(raw.replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _hf_maint_dt_string(value):
+    if not value:
+        return None
+
+    if isinstance(value, str):
+        parsed = _hf_maint_parse_datetime(value)
+        if not parsed:
+            return None
+        value = parsed
+
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hf_maint_add_months(start_dt, months):
+    month = start_dt.month - 1 + int(months)
+    year = start_dt.year + month // 12
+    month = month % 12 + 1
+
+    month_days = [
+        31,
+        29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ]
+
+    day = min(start_dt.day, month_days[month - 1])
+
+    return start_dt.replace(year=year, month=month, day=day)
+
+
+def _hf_maint_add_interval(start_dt, count, unit):
+    safe_count = max(1, int(count or 1))
+    safe_unit = _hf_maint_one_line(unit or "months").lower()
+
+    if safe_unit in {"day", "days"}:
+        return start_dt + _hf_maint_timedelta(days=safe_count)
+
+    if safe_unit in {"week", "weeks"}:
+        return start_dt + _hf_maint_timedelta(weeks=safe_count)
+
+    if safe_unit in {"month", "months"}:
+        return _hf_maint_add_months(start_dt, safe_count)
+
+    if safe_unit in {"year", "years"}:
+        return _hf_maint_add_months(start_dt, safe_count * 12)
+
+    return _hf_maint_add_months(start_dt, safe_count)
+
+
+def _hf_maint_status_for_due_date(next_due_at, days_ahead=14):
+    now = _hf_maint_now()
+
+    if not next_due_at:
+        return "unscheduled"
+
+    if isinstance(next_due_at, str):
+        next_due_at = _hf_maint_parse_datetime(next_due_at)
+
+    if not next_due_at:
+        return "unscheduled"
+
+    if next_due_at.date() < now.date():
+        return "overdue"
+
+    if next_due_at.date() == now.date():
+        return "due"
+
+    soon_cutoff = now + _hf_maint_timedelta(days=max(0, int(days_ahead or 14)))
+
+    if next_due_at <= soon_cutoff:
+        return "upcoming"
+
+    return "scheduled"
+
+
+def _hf_maint_to_json(value):
+    try:
+        return json.dumps(value if value is not None else [])
+    except Exception:
+        return "[]"
+
+
+def _hf_maint_parse_json(value, fallback=None):
+    if fallback is None:
+        fallback = []
+
+    if value is None:
+        return fallback
+
+    if isinstance(value, (list, dict)):
+        return value
+
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+
+def _hf_maint_ensure_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS maintenance_tasks (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    tenant_id VARCHAR(255) NOT NULL DEFAULT 'lateef-home-inspection',
+                    property_id VARCHAR(255) DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL,
+                    source_issue_id BIGINT NULL,
+                    monitoring_plan_id BIGINT NULL,
+
+                    title VARCHAR(500) NOT NULL,
+                    `system` VARCHAR(255) DEFAULT '',
+                    component VARCHAR(255) DEFAULT '',
+                    location VARCHAR(500) DEFAULT '',
+                    task_type VARCHAR(100) DEFAULT 'recurring_maintenance',
+
+                    recurrence_interval_count INT DEFAULT 3,
+                    recurrence_interval_unit VARCHAR(50) DEFAULT 'months',
+
+                    next_due_at DATETIME NULL,
+                    last_completed_at DATETIME NULL,
+
+                    due_status VARCHAR(50) DEFAULT 'scheduled',
+                    store_category VARCHAR(100) DEFAULT 'hardware_store',
+                    shopping_list_json JSON NULL,
+                    instructions TEXT NULL,
+                    notes TEXT NULL,
+                    status VARCHAR(50) DEFAULT 'active',
+
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+                    INDEX idx_maintenance_record_id (record_id),
+                    INDEX idx_maintenance_next_due_at (next_due_at),
+                    INDEX idx_maintenance_status (status),
+                    INDEX idx_maintenance_source_issue_id (source_issue_id),
+                    INDEX idx_maintenance_plan_id (monitoring_plan_id)
+                )
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS maintenance_events (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    maintenance_task_id BIGINT NOT NULL,
+                    tenant_id VARCHAR(255) NOT NULL DEFAULT 'lateef-home-inspection',
+                    property_id VARCHAR(255) DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL,
+                    source_issue_id BIGINT NULL,
+                    monitoring_plan_id BIGINT NULL,
+
+                    event_type VARCHAR(100) DEFAULT 'completed',
+                    event_status VARCHAR(100) DEFAULT 'done',
+                    completed_by VARCHAR(255) DEFAULT 'homeowner',
+                    completed_at DATETIME NULL,
+                    note TEXT NULL,
+                    evidence_url TEXT NULL,
+
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+                    INDEX idx_maintenance_events_task_id (maintenance_task_id),
+                    INDEX idx_maintenance_events_record_id (record_id),
+                    INDEX idx_maintenance_events_completed_at (completed_at)
+                )
+                """
+            )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Maintenance scheduler schema ready.",
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "maintenance_schema_error",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_maint_row_to_api(row):
+    if not row:
+        return None
+
+    item = dict(row)
+
+    item["shopping_list_json"] = _hf_maint_parse_json(
+        item.get("shopping_list_json"),
+        [],
+    )
+
+    item["due_status"] = _hf_maint_status_for_due_date(
+        item.get("next_due_at"),
+        14,
+    )
+
+    for field in [
+        "next_due_at",
+        "last_completed_at",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    ]:
+        if field in item and item[field] is not None:
+            try:
+                item[field] = item[field].isoformat()
+            except Exception:
+                item[field] = str(item[field])
+
+    return item
+
+
+@app.get("/maintenance-scheduler/health")
+def maintenance_scheduler_health():
+    _hf_maint_ensure_schema()
+
+    task_count = 0
+    event_count = 0
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM maintenance_tasks")
+            row = cursor.fetchone() or {}
+            task_count = row.get("count", 0)
+
+            cursor.execute("SELECT COUNT(*) AS count FROM maintenance_events")
+            row = cursor.fetchone() or {}
+            event_count = row.get("count", 0)
+
+        return {
+            "success": True,
+            "service": "homefax_maintenance_scheduler",
+            "tables": {
+                "maintenance_tasks": {
+                    "ok": True,
+                    "count": int(task_count or 0),
+                },
+                "maintenance_events": {
+                    "ok": True,
+                    "count": int(event_count or 0),
+                },
+            },
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/maintenance-tasks")
+def create_maintenance_task(payload: _HFMaintenanceTaskPayload):
+    _hf_maint_ensure_schema()
+
+    safe_record_id = _hf_maint_one_line(payload.record_id)
+    safe_title = _hf_maint_one_line(payload.title)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    if not safe_title:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_title",
+                "message": "title is required.",
+            },
+        )
+
+    interval_count = max(1, int(payload.recurrence_interval_count or 1))
+    interval_unit = _hf_maint_one_line(payload.recurrence_interval_unit or "months").lower()
+
+    supplied_next_due_at = _hf_maint_parse_datetime(payload.next_due_at)
+    supplied_last_completed_at = _hf_maint_parse_datetime(payload.last_completed_at)
+
+    base_dt = supplied_last_completed_at or _hf_maint_now()
+    next_due_at = supplied_next_due_at or _hf_maint_add_interval(
+        base_dt,
+        interval_count,
+        interval_unit,
+    )
+
+    due_status = _hf_maint_status_for_due_date(next_due_at, 14)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO maintenance_tasks (
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    source_issue_id,
+                    monitoring_plan_id,
+                    title,
+                    `system`,
+                    component,
+                    location,
+                    task_type,
+                    recurrence_interval_count,
+                    recurrence_interval_unit,
+                    next_due_at,
+                    last_completed_at,
+                    due_status,
+                    store_category,
+                    shopping_list_json,
+                    instructions,
+                    notes,
+                    status
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, CAST(%s AS JSON), %s, %s, %s
+                )
+                """,
+                (
+                    _hf_maint_one_line(payload.tenant_id or "lateef-home-inspection"),
+                    _hf_maint_one_line(payload.property_id),
+                    safe_record_id,
+                    payload.source_issue_id,
+                    payload.monitoring_plan_id,
+                    safe_title,
+                    _hf_maint_one_line(payload.system),
+                    _hf_maint_one_line(payload.component),
+                    _hf_maint_one_line(payload.location),
+                    _hf_maint_one_line(payload.task_type or "recurring_maintenance"),
+                    interval_count,
+                    interval_unit,
+                    _hf_maint_dt_string(next_due_at),
+                    _hf_maint_dt_string(supplied_last_completed_at),
+                    due_status,
+                    _hf_maint_one_line(payload.store_category or "hardware_store"),
+                    _hf_maint_to_json(payload.shopping_list_json or []),
+                    _hf_maint_text(payload.instructions),
+                    _hf_maint_text(payload.notes),
+                    _hf_maint_one_line(payload.status or "active"),
+                ),
+            )
+
+            task_id = cursor.lastrowid
+
+            cursor.execute(
+                "SELECT * FROM maintenance_tasks WHERE id = %s LIMIT 1",
+                (task_id,),
+            )
+            task = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Maintenance task created.",
+            "maintenance_task": _hf_maint_row_to_api(task),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "maintenance_task_create_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/maintenance-tasks/{record_id}")
+def get_maintenance_tasks(record_id: str):
+    _hf_maint_ensure_schema()
+
+    safe_record_id = _hf_maint_one_line(record_id)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM maintenance_tasks
+                WHERE record_id = %s
+                ORDER BY
+                    CASE
+                        WHEN next_due_at IS NULL THEN 3
+                        WHEN next_due_at < NOW() THEN 0
+                        WHEN next_due_at <= DATE_ADD(NOW(), INTERVAL 14 DAY) THEN 1
+                        ELSE 2
+                    END,
+                    next_due_at ASC,
+                    id DESC
+                """,
+                (safe_record_id,),
+            )
+            rows = cursor.fetchall() or []
+
+        tasks = [_hf_maint_row_to_api(row) for row in rows]
+
+        summary = {
+            "total": len(tasks),
+            "overdue": len([task for task in tasks if task.get("due_status") == "overdue"]),
+            "due": len([task for task in tasks if task.get("due_status") == "due"]),
+            "upcoming": len([task for task in tasks if task.get("due_status") == "upcoming"]),
+            "scheduled": len([task for task in tasks if task.get("due_status") == "scheduled"]),
+            "active": len([task for task in tasks if task.get("status") == "active"]),
+        }
+
+        return {
+            "success": True,
+            "record_id": safe_record_id,
+            "maintenance_task_count": len(tasks),
+            "summary": summary,
+            "maintenance_tasks": tasks,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/maintenance-task/{task_id}/complete")
+def complete_maintenance_task(task_id: int, payload: _HFMaintenanceCompletionPayload):
+    _hf_maint_ensure_schema()
+
+    safe_task_id = int(task_id or 0)
+
+    if safe_task_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_task_id",
+                "message": "task_id must be a positive integer.",
+            },
+        )
+
+    completed_at = _hf_maint_parse_datetime(payload.completed_at) or _hf_maint_now()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM maintenance_tasks WHERE id = %s LIMIT 1",
+                (safe_task_id,),
+            )
+            task = cursor.fetchone()
+
+            if not task:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "maintenance_task_not_found",
+                        "message": f"Maintenance task {safe_task_id} was not found.",
+                    },
+                )
+
+            interval_count = int(task.get("recurrence_interval_count") or 1)
+            interval_unit = task.get("recurrence_interval_unit") or "months"
+            next_due_at = _hf_maint_add_interval(
+                completed_at,
+                interval_count,
+                interval_unit,
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO maintenance_events (
+                    maintenance_task_id,
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    source_issue_id,
+                    monitoring_plan_id,
+                    event_type,
+                    event_status,
+                    completed_by,
+                    completed_at,
+                    note,
+                    evidence_url
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    'completed', %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    safe_task_id,
+                    task.get("tenant_id") or "lateef-home-inspection",
+                    task.get("property_id") or "",
+                    task.get("record_id") or "",
+                    task.get("source_issue_id"),
+                    task.get("monitoring_plan_id"),
+                    _hf_maint_one_line(payload.event_status or "done"),
+                    _hf_maint_one_line(payload.completed_by or "homeowner"),
+                    _hf_maint_dt_string(completed_at),
+                    _hf_maint_text(payload.note),
+                    _hf_maint_text(payload.evidence_url),
+                ),
+            )
+
+            event_id = cursor.lastrowid
+
+            cursor.execute(
+                """
+                UPDATE maintenance_tasks
+                SET
+                    last_completed_at = %s,
+                    next_due_at = %s,
+                    due_status = %s,
+                    status = 'active',
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    _hf_maint_dt_string(completed_at),
+                    _hf_maint_dt_string(next_due_at),
+                    _hf_maint_status_for_due_date(next_due_at, 14),
+                    safe_task_id,
+                ),
+            )
+
+            cursor.execute(
+                "SELECT * FROM maintenance_tasks WHERE id = %s LIMIT 1",
+                (safe_task_id,),
+            )
+            updated_task = cursor.fetchone()
+
+            cursor.execute(
+                "SELECT * FROM maintenance_events WHERE id = %s LIMIT 1",
+                (event_id,),
+            )
+            event = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Maintenance task completed and next occurrence scheduled.",
+            "maintenance_task": _hf_maint_row_to_api(updated_task),
+            "maintenance_event": _hf_maint_row_to_api(event),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "maintenance_completion_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/maintenance-scheduler/run")
+def run_maintenance_scheduler(payload: _HFMaintenanceSchedulerRunPayload):
+    _hf_maint_ensure_schema()
+
+    days_ahead = max(0, int(payload.days_ahead or 14))
+    safe_record_id = _hf_maint_one_line(payload.record_id or "")
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            params = []
+            where = ["status = 'active'"]
+
+            if safe_record_id:
+                where.append("record_id = %s")
+                params.append(safe_record_id)
+
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM maintenance_tasks
+                WHERE {" AND ".join(where)}
+                ORDER BY next_due_at ASC, id DESC
+                """,
+                tuple(params),
+            )
+
+            rows = cursor.fetchall() or []
+
+            updated = []
+
+            for row in rows:
+                due_status = _hf_maint_status_for_due_date(
+                    row.get("next_due_at"),
+                    days_ahead,
+                )
+
+                cursor.execute(
+                    """
+                    UPDATE maintenance_tasks
+                    SET due_status = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (due_status, row.get("id")),
+                )
+
+                row["due_status"] = due_status
+                updated.append(_hf_maint_row_to_api(row))
+
+        conn.commit()
+
+        summary = {
+            "checked": len(updated),
+            "overdue": len([task for task in updated if task.get("due_status") == "overdue"]),
+            "due": len([task for task in updated if task.get("due_status") == "due"]),
+            "upcoming": len([task for task in updated if task.get("due_status") == "upcoming"]),
+            "scheduled": len([task for task in updated if task.get("due_status") == "scheduled"]),
+        }
+
+        return {
+            "success": True,
+            "message": "Maintenance scheduler run completed.",
+            "record_id": safe_record_id or None,
+            "days_ahead": days_ahead,
+            "summary": summary,
+            "maintenance_tasks": updated,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "maintenance_scheduler_run_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

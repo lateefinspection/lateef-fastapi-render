@@ -22428,7 +22428,7 @@ def _hf_maint_ensure_schema():
             pass
 
 
-def _hf_maint_row_to_api(row):
+def _hf_maint_row_to_api(row, days_ahead=14, recalculate_due_status=True):
     if not row:
         return None
 
@@ -22439,10 +22439,11 @@ def _hf_maint_row_to_api(row):
         [],
     )
 
-    item["due_status"] = _hf_maint_status_for_due_date(
-        item.get("next_due_at"),
-        14,
-    )
+    if recalculate_due_status:
+        item["due_status"] = _hf_maint_status_for_due_date(
+            item.get("next_due_at"),
+            days_ahead,
+        )
 
     for field in [
         "next_due_at",
@@ -22911,7 +22912,13 @@ def run_maintenance_scheduler(payload: _HFMaintenanceSchedulerRunPayload):
                 )
 
                 row["due_status"] = due_status
-                updated.append(_hf_maint_row_to_api(row))
+                updated.append(
+                    _hf_maint_row_to_api(
+                        row,
+                        days_ahead=days_ahead,
+                        recalculate_due_status=False,
+                    )
+                )
 
         conn.commit()
 

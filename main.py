@@ -22962,3 +22962,926 @@ def run_maintenance_scheduler(payload: _HFMaintenanceSchedulerRunPayload):
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Location Alert Schema Backend Pass 1
+# Store reminders for recurring home-care maintenance tasks.
+# Pass 1 uses mock nearby-store events, not real GPS.
+# ============================================================
+
+from typing import Optional as _hf_loc_Optional
+from datetime import datetime as _hf_loc_datetime, timedelta as _hf_loc_timedelta
+
+
+class _HFLocationAlertRulePayload(BaseModel):
+    tenant_id: str = "lateef-home-inspection"
+    property_id: str = ""
+    record_id: str
+    maintenance_task_id: int
+
+    rule_type: str = "near_store"
+    store_category: str = "hardware_store"
+
+    radius_meters: int = 500
+    days_before_due: int = 120
+    cooldown_hours: int = 72
+
+    enabled: str = "yes"
+
+
+class _HFMockNearbyStorePayload(BaseModel):
+    tenant_id: str = "lateef-home-inspection"
+    property_id: str = ""
+    record_id: str
+    user_id: str = "homeowner-smoke-test"
+
+    store_name: str = "Mock Hardware Store"
+    store_category: str = "hardware_store"
+    store_place_id: str = "mock-hardware-store-001"
+    distance_meters: int = 350
+
+
+class _HFLocationAlertActionPayload(BaseModel):
+    homeowner_action: str
+    homeowner_note: str = ""
+
+
+def _hf_loc_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_loc_text(value):
+    return str(value or "").strip()
+
+
+def _hf_loc_now():
+    return _hf_loc_datetime.utcnow()
+
+
+def _hf_loc_parse_datetime(value):
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+
+    if not raw:
+        return None
+
+    cleaned = raw.replace("Z", "").replace("T", " ")
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return _hf_loc_datetime.strptime(cleaned[:19], fmt)
+        except Exception:
+            pass
+
+    try:
+        return _hf_loc_datetime.fromisoformat(raw.replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _hf_loc_dt_string(value):
+    if not value:
+        return None
+
+    if isinstance(value, str):
+        parsed = _hf_loc_parse_datetime(value)
+        if not parsed:
+            return None
+        value = parsed
+
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hf_loc_to_json(value):
+    try:
+        return json.dumps(value if value is not None else [])
+    except Exception:
+        return "[]"
+
+
+def _hf_loc_parse_json(value, fallback=None):
+    if fallback is None:
+        fallback = []
+
+    if value is None:
+        return fallback
+
+    if isinstance(value, (list, dict)):
+        return value
+
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+
+def _hf_loc_yes(value):
+    return _hf_loc_one_line(value).lower() in {"yes", "true", "1", "enabled", "active"}
+
+
+def _hf_loc_ensure_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS location_alert_rules (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+                    tenant_id VARCHAR(255) NOT NULL DEFAULT 'lateef-home-inspection',
+                    property_id VARCHAR(255) DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL,
+
+                    maintenance_task_id BIGINT NOT NULL,
+
+                    rule_type VARCHAR(100) DEFAULT 'near_store',
+                    store_category VARCHAR(100) DEFAULT 'hardware_store',
+
+                    radius_meters INT DEFAULT 500,
+                    days_before_due INT DEFAULT 120,
+                    cooldown_hours INT DEFAULT 72,
+
+                    enabled VARCHAR(20) DEFAULT 'yes',
+
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+                    INDEX idx_location_rules_record_id (record_id),
+                    INDEX idx_location_rules_task_id (maintenance_task_id),
+                    INDEX idx_location_rules_enabled (enabled),
+                    INDEX idx_location_rules_store_category (store_category)
+                )
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS location_alert_events (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+                    tenant_id VARCHAR(255) NOT NULL DEFAULT 'lateef-home-inspection',
+                    property_id VARCHAR(255) DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL,
+
+                    maintenance_task_id BIGINT NOT NULL,
+                    location_alert_rule_id BIGINT NULL,
+
+                    user_id VARCHAR(255) DEFAULT '',
+                    store_name VARCHAR(500) DEFAULT '',
+                    store_category VARCHAR(100) DEFAULT 'hardware_store',
+                    store_place_id VARCHAR(500) DEFAULT '',
+
+                    distance_meters INT NULL,
+
+                    alert_title VARCHAR(500) DEFAULT '',
+                    alert_message TEXT NULL,
+                    shopping_list_json JSON NULL,
+
+                    alert_status VARCHAR(100) DEFAULT 'created',
+                    homeowner_action VARCHAR(100) DEFAULT '',
+                    homeowner_note TEXT NULL,
+
+                    triggered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    acknowledged_at DATETIME NULL,
+
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+                    INDEX idx_location_events_record_id (record_id),
+                    INDEX idx_location_events_task_id (maintenance_task_id),
+                    INDEX idx_location_events_rule_id (location_alert_rule_id),
+                    INDEX idx_location_events_status (alert_status),
+                    INDEX idx_location_events_triggered_at (triggered_at),
+                    INDEX idx_location_events_store_category (store_category)
+                )
+                """
+            )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Location alert schema ready.",
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "location_alert_schema_error",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_loc_row_to_api(row):
+    if not row:
+        return None
+
+    item = dict(row)
+
+    if "shopping_list_json" in item:
+        item["shopping_list_json"] = _hf_loc_parse_json(
+            item.get("shopping_list_json"),
+            [],
+        )
+
+    for field in [
+        "created_at",
+        "updated_at",
+        "triggered_at",
+        "acknowledged_at",
+        "next_due_at",
+        "last_completed_at",
+    ]:
+        if field in item and item[field] is not None:
+            try:
+                item[field] = item[field].isoformat()
+            except Exception:
+                item[field] = str(item[field])
+
+    return item
+
+
+def _hf_loc_build_alert_message(task, store_name):
+    shopping_list = _hf_loc_parse_json(task.get("shopping_list_json"), [])
+
+    lines = [
+        f"You are near {store_name or 'a relevant store'}.",
+        "",
+        "Upcoming HomeFax maintenance:",
+        _hf_loc_one_line(task.get("title") or "Maintenance task"),
+        "",
+    ]
+
+    if shopping_list:
+        lines.append("Bring or buy:")
+        for item in shopping_list:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if task.get("next_due_at"):
+        due_dt = _hf_loc_parse_datetime(task.get("next_due_at"))
+        if due_dt:
+            lines.append(f"Next due: {due_dt.date().isoformat()}")
+        else:
+            lines.append(f"Next due: {task.get('next_due_at')}")
+
+    return "\n".join(lines).strip()
+
+
+def _hf_loc_task_within_due_window(task, days_before_due):
+    next_due_at = _hf_loc_parse_datetime(task.get("next_due_at"))
+
+    if not next_due_at:
+        return False
+
+    cutoff = _hf_loc_now() + _hf_loc_timedelta(days=max(0, int(days_before_due or 0)))
+
+    return next_due_at <= cutoff
+
+
+def _hf_loc_recent_alert_exists(cursor, rule_id, task_id, store_place_id, cooldown_hours):
+    cooldown = max(0, int(cooldown_hours or 0))
+
+    if cooldown <= 0:
+        return False
+
+    cursor.execute(
+        """
+        SELECT id
+        FROM location_alert_events
+        WHERE location_alert_rule_id = %s
+          AND maintenance_task_id = %s
+          AND store_place_id = %s
+          AND triggered_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            rule_id,
+            task_id,
+            _hf_loc_one_line(store_place_id),
+            cooldown,
+        ),
+    )
+
+    return bool(cursor.fetchone())
+
+
+@app.get("/location-alerts/health")
+def location_alerts_health():
+    _hf_loc_ensure_schema()
+
+    rule_count = 0
+    event_count = 0
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM location_alert_rules")
+            row = cursor.fetchone() or {}
+            rule_count = row.get("count", 0)
+
+            cursor.execute("SELECT COUNT(*) AS count FROM location_alert_events")
+            row = cursor.fetchone() or {}
+            event_count = row.get("count", 0)
+
+        return {
+            "success": True,
+            "service": "homefax_location_alerts",
+            "tables": {
+                "location_alert_rules": {
+                    "ok": True,
+                    "count": int(rule_count or 0),
+                },
+                "location_alert_events": {
+                    "ok": True,
+                    "count": int(event_count or 0),
+                },
+            },
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/location-alert-rules")
+def create_location_alert_rule(payload: _HFLocationAlertRulePayload):
+    _hf_loc_ensure_schema()
+
+    safe_record_id = _hf_loc_one_line(payload.record_id)
+    safe_task_id = int(payload.maintenance_task_id or 0)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    if safe_task_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_maintenance_task_id",
+                "message": "maintenance_task_id must be a positive integer.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, record_id, title, store_category, status
+                FROM maintenance_tasks
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_task_id,),
+            )
+            task = cursor.fetchone()
+
+            if not task:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "maintenance_task_not_found",
+                        "message": f"Maintenance task {safe_task_id} was not found.",
+                    },
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO location_alert_rules (
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    maintenance_task_id,
+                    rule_type,
+                    store_category,
+                    radius_meters,
+                    days_before_due,
+                    cooldown_hours,
+                    enabled
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    _hf_loc_one_line(payload.tenant_id or "lateef-home-inspection"),
+                    _hf_loc_one_line(payload.property_id),
+                    safe_record_id,
+                    safe_task_id,
+                    _hf_loc_one_line(payload.rule_type or "near_store"),
+                    _hf_loc_one_line(payload.store_category or task.get("store_category") or "hardware_store"),
+                    max(1, int(payload.radius_meters or 500)),
+                    max(0, int(payload.days_before_due or 120)),
+                    max(0, int(payload.cooldown_hours or 72)),
+                    "yes" if _hf_loc_yes(payload.enabled) else "no",
+                ),
+            )
+
+            rule_id = cursor.lastrowid
+
+            cursor.execute(
+                "SELECT * FROM location_alert_rules WHERE id = %s LIMIT 1",
+                (rule_id,),
+            )
+            rule = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Location alert rule created.",
+            "location_alert_rule": _hf_loc_row_to_api(rule),
+            "maintenance_task": _hf_loc_row_to_api(task),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "location_alert_rule_create_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/location-alert-rules/{record_id}")
+def get_location_alert_rules(record_id: str):
+    _hf_loc_ensure_schema()
+
+    safe_record_id = _hf_loc_one_line(record_id)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    lar.*,
+                    mt.title AS maintenance_task_title,
+                    mt.`system` AS maintenance_task_system,
+                    mt.component AS maintenance_task_component,
+                    mt.next_due_at AS maintenance_task_next_due_at,
+                    mt.status AS maintenance_task_status
+                FROM location_alert_rules lar
+                LEFT JOIN maintenance_tasks mt
+                    ON mt.id = lar.maintenance_task_id
+                WHERE lar.record_id = %s
+                ORDER BY lar.id DESC
+                """,
+                (safe_record_id,),
+            )
+            rows = cursor.fetchall() or []
+
+        rules = [_hf_loc_row_to_api(row) for row in rows]
+
+        return {
+            "success": True,
+            "record_id": safe_record_id,
+            "location_alert_rule_count": len(rules),
+            "location_alert_rules": rules,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/location-alerts/mock-nearby-store")
+def mock_nearby_store_location_alert(payload: _HFMockNearbyStorePayload):
+    _hf_loc_ensure_schema()
+
+    safe_record_id = _hf_loc_one_line(payload.record_id)
+    safe_store_category = _hf_loc_one_line(payload.store_category or "hardware_store")
+    safe_distance = int(payload.distance_meters or 0)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        created_events = []
+        skipped = []
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    lar.*,
+                    mt.title,
+                    mt.`system`,
+                    mt.component,
+                    mt.location,
+                    mt.next_due_at,
+                    mt.last_completed_at,
+                    mt.store_category AS task_store_category,
+                    mt.shopping_list_json,
+                    mt.instructions,
+                    mt.status AS task_status
+                FROM location_alert_rules lar
+                INNER JOIN maintenance_tasks mt
+                    ON mt.id = lar.maintenance_task_id
+                WHERE lar.record_id = %s
+                  AND lar.enabled IN ('yes', 'true', '1', 'active', 'enabled')
+                  AND lar.store_category = %s
+                  AND mt.status = 'active'
+                ORDER BY lar.id DESC
+                """,
+                (
+                    safe_record_id,
+                    safe_store_category,
+                ),
+            )
+
+            rules = cursor.fetchall() or []
+
+            for rule in rules:
+                rule_id = int(rule.get("id") or 0)
+                task_id = int(rule.get("maintenance_task_id") or 0)
+                radius_meters = int(rule.get("radius_meters") or 500)
+                days_before_due = int(rule.get("days_before_due") or 120)
+                cooldown_hours = int(rule.get("cooldown_hours") or 72)
+
+                if safe_distance > radius_meters:
+                    skipped.append({
+                        "maintenance_task_id": task_id,
+                        "location_alert_rule_id": rule_id,
+                        "reason": "outside_radius",
+                    })
+                    continue
+
+                if not _hf_loc_task_within_due_window(rule, days_before_due):
+                    skipped.append({
+                        "maintenance_task_id": task_id,
+                        "location_alert_rule_id": rule_id,
+                        "reason": "outside_due_window",
+                    })
+                    continue
+
+                if _hf_loc_recent_alert_exists(
+                    cursor,
+                    rule_id,
+                    task_id,
+                    payload.store_place_id,
+                    cooldown_hours,
+                ):
+                    skipped.append({
+                        "maintenance_task_id": task_id,
+                        "location_alert_rule_id": rule_id,
+                        "reason": "cooldown_active",
+                    })
+                    continue
+
+                shopping_list = _hf_loc_parse_json(rule.get("shopping_list_json"), [])
+                alert_title = f"HomeFax maintenance reminder near {_hf_loc_one_line(payload.store_name)}"
+                alert_message = _hf_loc_build_alert_message(rule, payload.store_name)
+
+                cursor.execute(
+                    """
+                    INSERT INTO location_alert_events (
+                        tenant_id,
+                        property_id,
+                        record_id,
+                        maintenance_task_id,
+                        location_alert_rule_id,
+                        user_id,
+                        store_name,
+                        store_category,
+                        store_place_id,
+                        distance_meters,
+                        alert_title,
+                        alert_message,
+                        shopping_list_json,
+                        alert_status,
+                        homeowner_action,
+                        homeowner_note,
+                        triggered_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, CAST(%s AS JSON),
+                        'created', '', '', NOW()
+                    )
+                    """,
+                    (
+                        _hf_loc_one_line(payload.tenant_id or rule.get("tenant_id") or "lateef-home-inspection"),
+                        _hf_loc_one_line(payload.property_id or rule.get("property_id") or ""),
+                        safe_record_id,
+                        task_id,
+                        rule_id,
+                        _hf_loc_one_line(payload.user_id),
+                        _hf_loc_one_line(payload.store_name),
+                        safe_store_category,
+                        _hf_loc_one_line(payload.store_place_id),
+                        safe_distance,
+                        alert_title,
+                        alert_message,
+                        _hf_loc_to_json(shopping_list),
+                    ),
+                )
+
+                event_id = cursor.lastrowid
+
+                cursor.execute(
+                    "SELECT * FROM location_alert_events WHERE id = %s LIMIT 1",
+                    (event_id,),
+                )
+                created_events.append(_hf_loc_row_to_api(cursor.fetchone()))
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Mock nearby-store location alert run completed.",
+            "record_id": safe_record_id,
+            "store_name": _hf_loc_one_line(payload.store_name),
+            "store_category": safe_store_category,
+            "distance_meters": safe_distance,
+            "matched_rule_count": len(created_events) + len(skipped),
+            "created_alert_count": len(created_events),
+            "skipped_count": len(skipped),
+            "skipped": skipped,
+            "location_alert_events": created_events,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "mock_nearby_store_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/location-alert-events/{record_id}")
+def get_location_alert_events(record_id: str):
+    _hf_loc_ensure_schema()
+
+    safe_record_id = _hf_loc_one_line(record_id)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    lae.*,
+                    mt.title AS maintenance_task_title,
+                    mt.`system` AS maintenance_task_system,
+                    mt.component AS maintenance_task_component,
+                    mt.next_due_at AS maintenance_task_next_due_at
+                FROM location_alert_events lae
+                LEFT JOIN maintenance_tasks mt
+                    ON mt.id = lae.maintenance_task_id
+                WHERE lae.record_id = %s
+                ORDER BY lae.triggered_at DESC, lae.id DESC
+                """,
+                (safe_record_id,),
+            )
+            rows = cursor.fetchall() or []
+
+        events = [_hf_loc_row_to_api(row) for row in rows]
+
+        summary = {
+            "total": len(events),
+            "created": len([event for event in events if event.get("alert_status") == "created"]),
+            "acknowledged": len([event for event in events if event.get("alert_status") == "acknowledged"]),
+            "snoozed": len([event for event in events if event.get("homeowner_action") == "snoozed"]),
+            "not_relevant": len([event for event in events if event.get("homeowner_action") == "not_relevant"]),
+            "bought_items": len([event for event in events if event.get("homeowner_action") == "bought_items"]),
+            "completed_task": len([event for event in events if event.get("homeowner_action") == "completed_task"]),
+        }
+
+        return {
+            "success": True,
+            "record_id": safe_record_id,
+            "location_alert_event_count": len(events),
+            "summary": summary,
+            "location_alert_events": events,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/location-alert-event/{event_id}/action")
+def update_location_alert_event_action(event_id: int, payload: _HFLocationAlertActionPayload):
+    _hf_loc_ensure_schema()
+
+    safe_event_id = int(event_id or 0)
+    action = _hf_loc_one_line(payload.homeowner_action).lower()
+
+    allowed_actions = {
+        "bought_items",
+        "snoozed",
+        "not_relevant",
+        "completed_task",
+    }
+
+    if safe_event_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_event_id",
+                "message": "event_id must be a positive integer.",
+            },
+        )
+
+    if action not in allowed_actions:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_homeowner_action",
+                "message": f"homeowner_action must be one of: {sorted(allowed_actions)}",
+            },
+        )
+
+    alert_status = "acknowledged"
+
+    if action == "snoozed":
+        alert_status = "snoozed"
+
+    if action == "not_relevant":
+        alert_status = "dismissed"
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM location_alert_events WHERE id = %s LIMIT 1",
+                (safe_event_id,),
+            )
+            existing = cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "location_alert_event_not_found",
+                        "message": f"Location alert event {safe_event_id} was not found.",
+                    },
+                )
+
+            cursor.execute(
+                """
+                UPDATE location_alert_events
+                SET
+                    alert_status = %s,
+                    homeowner_action = %s,
+                    homeowner_note = %s,
+                    acknowledged_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    alert_status,
+                    action,
+                    _hf_loc_text(payload.homeowner_note),
+                    safe_event_id,
+                ),
+            )
+
+            cursor.execute(
+                "SELECT * FROM location_alert_events WHERE id = %s LIMIT 1",
+                (safe_event_id,),
+            )
+            updated = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Location alert homeowner action saved.",
+            "location_alert_event": _hf_loc_row_to_api(updated),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "location_alert_action_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

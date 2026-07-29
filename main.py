@@ -25607,3 +25607,572 @@ def archive_home_care_shopping_item(
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Shopping Items + Store Reminder Match Pass 1
+# Match nearby-store signals against home-care shopping items
+# and maintenance task shopping lists.
+# ============================================================
+
+import json as _hf_match_json
+from datetime import datetime as _hf_match_datetime
+from datetime import timedelta as _hf_match_timedelta
+from typing import Optional as _hf_match_Optional
+
+
+class _HFShoppingStoreMatchPayload(BaseModel):
+    tenant_id: str = "lateef-home-inspection"
+    property_id: str = ""
+    record_id: str
+    user_id: str = "homeowner-smoke-test"
+
+    store_name: str = "Mock Store"
+    store_category: str = "hardware_store"
+    store_place_id: str = ""
+    distance_meters: int = 350
+
+    max_distance_meters: int = 1000
+    include_shopping_items: str = "yes"
+    include_maintenance_tasks: str = "yes"
+
+    dry_run: str = "no"
+
+
+def _hf_match_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_match_yes(value):
+    return _hf_match_one_line(value).lower() in {"yes", "true", "1", "enabled", "active"}
+
+
+def _hf_match_safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _hf_match_store_categories(store_category):
+    """
+    Returns compatible categories for nearby-store matching.
+
+    big_box_store is treated as broad coverage.
+    hardware_store and grocery_store can both be covered by big-box stores.
+    """
+    normalized = _hf_match_one_line(store_category).lower() or "hardware_store"
+
+    if normalized == "big_box_store":
+        return [
+            "big_box_store",
+            "hardware_store",
+            "grocery_store",
+            "home_goods_store",
+            "pharmacy",
+        ]
+
+    categories = [normalized]
+
+    if normalized in {"hardware_store", "grocery_store", "home_goods_store"}:
+        categories.append("big_box_store")
+
+    return list(dict.fromkeys(categories))
+
+
+def _hf_match_parse_dt(value):
+    if not value:
+        return None
+
+    raw = str(value).strip()
+
+    if not raw:
+        return None
+
+    cleaned = raw.replace("Z", "").replace("T", " ")
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return _hf_match_datetime.strptime(cleaned[:19], fmt)
+        except Exception:
+            pass
+
+    try:
+        return _hf_match_datetime.fromisoformat(raw.replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _hf_match_needed_by_status(needed_by, reminder_window_days=14):
+    parsed = _hf_match_parse_dt(needed_by)
+
+    if not parsed:
+        return "unscheduled"
+
+    now = _hf_match_datetime.utcnow()
+
+    if parsed < now:
+        return "overdue"
+
+    if parsed.date() == now.date():
+        return "due_today"
+
+    try:
+        window_days = max(0, int(reminder_window_days or 14))
+    except Exception:
+        window_days = 14
+
+    if parsed <= now + _hf_match_timedelta(days=window_days):
+        return "needed_soon"
+
+    return "scheduled"
+
+
+def _hf_match_json_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return value
+
+    raw = str(value or "").strip()
+
+    if not raw:
+        return []
+
+    try:
+        parsed = _hf_match_json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+
+    return []
+
+
+def _hf_match_should_include_shopping_item(item):
+    status = _hf_match_one_line(item.get("item_status")).lower()
+    urgency = _hf_match_one_line(item.get("urgency")).lower()
+
+    if status != "needed":
+        return False
+
+    needed_by_status = _hf_match_needed_by_status(
+        item.get("needed_by"),
+        item.get("reminder_window_days"),
+    )
+
+    if urgency in {"urgent", "soon"}:
+        return True
+
+    if needed_by_status in {"overdue", "due_today", "needed_soon"}:
+        return True
+
+    if not item.get("needed_by"):
+        return True
+
+    return False
+
+
+def _hf_match_row_dt_to_iso(row):
+    item = dict(row or {})
+
+    for field in [
+        "needed_by",
+        "next_due_at",
+        "last_completed_at",
+        "created_at",
+        "updated_at",
+    ]:
+        if field in item and item[field] is not None:
+            try:
+                item[field] = item[field].isoformat()
+            except Exception:
+                item[field] = str(item[field])
+
+    return item
+
+
+def _hf_match_alert_message(store_name, shopping_matches, maintenance_matches):
+    lines = []
+
+    lines.append(f"You are near {store_name}.")
+
+    if shopping_matches:
+        lines.append("")
+        lines.append("Home-care items needed soon:")
+
+        for match in shopping_matches:
+            quantity = _hf_match_one_line(match.get("quantity"))
+            item_name = _hf_match_one_line(match.get("item_name"))
+            needed_by = _hf_match_one_line(match.get("needed_by"))
+
+            label = item_name
+            if quantity:
+                label = f"{quantity} {item_name}"
+
+            if needed_by:
+                label = f"{label} — needed by {needed_by[:10]}"
+
+            lines.append(f"- {label}")
+
+    if maintenance_matches:
+        lines.append("")
+        lines.append("Upcoming maintenance shopping lists:")
+
+        for task in maintenance_matches:
+            task_title = _hf_match_one_line(task.get("title") or "Maintenance task")
+            lines.append(f"- {task_title}")
+
+            for item in _hf_match_json_list(task.get("shopping_list_json")):
+                lines.append(f"  - {item}")
+
+    return "\n".join(lines).strip()
+
+
+def _hf_match_get_existing_columns(cursor, table_name):
+    try:
+        cursor.execute(f"SHOW COLUMNS FROM {table_name}")
+        rows = cursor.fetchall() or []
+        return {str(row.get("Field")) for row in rows if row.get("Field")}
+    except Exception:
+        return set()
+
+
+def _hf_match_insert_location_alert_event(cursor, event_data):
+    """
+    Dynamically inserts only columns that exist in location_alert_events.
+    This keeps the pass compatible with the current location-alert schema.
+    """
+    columns = _hf_match_get_existing_columns(cursor, "location_alert_events")
+
+    if not columns:
+        raise RuntimeError("location_alert_events table columns could not be read.")
+
+    insert_data = {}
+
+    for key, value in event_data.items():
+        if key in columns:
+            insert_data[key] = value
+
+    if "created_at" in columns and "created_at" not in insert_data:
+        insert_data["created_at"] = _hf_match_datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    if "updated_at" in columns and "updated_at" not in insert_data:
+        insert_data["updated_at"] = _hf_match_datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    if not insert_data:
+        raise RuntimeError("No compatible insert columns found for location_alert_events.")
+
+    names = list(insert_data.keys())
+    placeholders = ", ".join(["%s"] * len(names))
+
+    cursor.execute(
+        f"""
+        INSERT INTO location_alert_events ({", ".join(names)})
+        VALUES ({placeholders})
+        """,
+        tuple(insert_data[name] for name in names),
+    )
+
+    event_id = cursor.lastrowid
+
+    cursor.execute(
+        "SELECT * FROM location_alert_events WHERE id = %s LIMIT 1",
+        (event_id,),
+    )
+
+    return cursor.fetchone()
+
+
+@app.post("/location-alerts/shopping-match")
+def create_location_alert_from_shopping_match(payload: _HFShoppingStoreMatchPayload):
+    """
+    Production-shaped Pass 1 endpoint.
+
+    It receives a nearby-store signal, finds matching home-care shopping items
+    and maintenance task shopping lists, and creates a location alert event
+    that the dashboard can display in Store Reminders.
+    """
+    safe_record_id = _hf_match_one_line(payload.record_id)
+    safe_store_name = _hf_match_one_line(payload.store_name or "Mock Store")
+    safe_store_category = _hf_match_one_line(payload.store_category or "hardware_store").lower()
+    safe_distance = _hf_match_safe_int(payload.distance_meters, 0)
+    safe_max_distance = _hf_match_safe_int(payload.max_distance_meters, 1000)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    if safe_distance > safe_max_distance:
+        return {
+            "success": True,
+            "created": False,
+            "reason": "store_too_far",
+            "record_id": safe_record_id,
+            "store_name": safe_store_name,
+            "store_category": safe_store_category,
+            "distance_meters": safe_distance,
+            "max_distance_meters": safe_max_distance,
+            "shopping_matches": [],
+            "maintenance_matches": [],
+        }
+
+    conn = None
+
+    try:
+        # Reuse existing schema ensure helpers when available.
+        if "_hf_shop_ensure_schema" in globals():
+            _hf_shop_ensure_schema()
+
+        if "_hf_maint_ensure_schema" in globals():
+            _hf_maint_ensure_schema()
+
+        if "_hf_loc_ensure_schema" in globals():
+            _hf_loc_ensure_schema()
+
+        conn = _hf_mon_get_connection()
+
+        compatible_categories = _hf_match_store_categories(safe_store_category)
+
+        shopping_matches = []
+        maintenance_matches = []
+
+        with conn.cursor() as cursor:
+            if _hf_match_yes(payload.include_shopping_items):
+                category_placeholders = ", ".join(["%s"] * len(compatible_categories))
+
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM home_care_shopping_items
+                    WHERE record_id = %s
+                      AND item_status = 'needed'
+                      AND store_category IN ({category_placeholders})
+                    ORDER BY
+                        CASE
+                            WHEN urgency = 'urgent' THEN 0
+                            WHEN urgency = 'soon' THEN 1
+                            WHEN urgency = 'normal' THEN 2
+                            WHEN urgency = 'low' THEN 3
+                            ELSE 4
+                        END,
+                        CASE WHEN needed_by IS NULL THEN 1 ELSE 0 END,
+                        needed_by ASC,
+                        id DESC
+                    """,
+                    tuple([safe_record_id] + compatible_categories),
+                )
+
+                rows = cursor.fetchall() or []
+
+                for row in rows:
+                    item = _hf_match_row_dt_to_iso(row)
+
+                    item["needed_by_status"] = _hf_match_needed_by_status(
+                        item.get("needed_by"),
+                        item.get("reminder_window_days"),
+                    )
+
+                    if _hf_match_should_include_shopping_item(item):
+                        item["match_type"] = "shopping_item"
+                        item["match_reason"] = "store_category_and_needed_by_or_urgency"
+                        shopping_matches.append(item)
+
+            if _hf_match_yes(payload.include_maintenance_tasks):
+                category_placeholders = ", ".join(["%s"] * len(compatible_categories))
+
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM maintenance_tasks
+                    WHERE record_id = %s
+                      AND status = 'active'
+                      AND store_category IN ({category_placeholders})
+                    ORDER BY
+                        CASE
+                            WHEN due_status = 'overdue' THEN 0
+                            WHEN due_status = 'due' THEN 1
+                            WHEN due_status = 'upcoming' THEN 2
+                            WHEN due_status = 'scheduled' THEN 3
+                            ELSE 4
+                        END,
+                        next_due_at ASC,
+                        id DESC
+                    """,
+                    tuple([safe_record_id] + compatible_categories),
+                )
+
+                task_rows = cursor.fetchall() or []
+
+                for row in task_rows:
+                    task = _hf_match_row_dt_to_iso(row)
+                    task["shopping_list"] = _hf_match_json_list(task.get("shopping_list_json"))
+                    task["match_type"] = "maintenance_task"
+                    task["match_reason"] = "store_category_matches_active_task"
+                    maintenance_matches.append(task)
+
+            # Avoid creating an empty event.
+            if not shopping_matches and not maintenance_matches:
+                conn.rollback()
+                return {
+                    "success": True,
+                    "created": False,
+                    "reason": "no_matching_items_or_tasks",
+                    "record_id": safe_record_id,
+                    "store_name": safe_store_name,
+                    "store_category": safe_store_category,
+                    "compatible_categories": compatible_categories,
+                    "shopping_matches": [],
+                    "maintenance_matches": [],
+                }
+
+            shopping_list = []
+
+            for item in shopping_matches:
+                quantity = _hf_match_one_line(item.get("quantity"))
+                item_name = _hf_match_one_line(item.get("item_name"))
+
+                if quantity:
+                    shopping_list.append(f"{quantity} {item_name}".strip())
+                else:
+                    shopping_list.append(item_name)
+
+            for task in maintenance_matches:
+                for entry in task.get("shopping_list") or []:
+                    if entry not in shopping_list:
+                        shopping_list.append(entry)
+
+            alert_message = _hf_match_alert_message(
+                safe_store_name,
+                shopping_matches,
+                maintenance_matches,
+            )
+
+            primary_task_id = None
+            primary_task_title = ""
+
+            if maintenance_matches:
+                primary_task_id = maintenance_matches[0].get("id")
+                primary_task_title = maintenance_matches[0].get("title") or ""
+
+            elif shopping_matches:
+                primary_task_id = shopping_matches[0].get("maintenance_task_id")
+                primary_task_title = shopping_matches[0].get("maintenance_task_title") or "Home-care shopping items"
+
+            now_sql = _hf_match_datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+            event_data = {
+                "tenant_id": _hf_match_one_line(payload.tenant_id or "lateef-home-inspection"),
+                "property_id": _hf_match_one_line(payload.property_id),
+                "record_id": safe_record_id,
+                "user_id": _hf_match_one_line(payload.user_id),
+
+                "maintenance_task_id": primary_task_id,
+                "task_title": primary_task_title,
+                "title": primary_task_title or "Home-care shopping reminder",
+
+                "store_name": safe_store_name,
+                "store_category": safe_store_category,
+                "store_place_id": _hf_match_one_line(payload.store_place_id),
+                "distance_meters": safe_distance,
+
+                "shopping_list_json": _hf_match_json.dumps(shopping_list),
+                "matched_items_json": _hf_match_json.dumps(shopping_matches, default=str),
+                "matched_tasks_json": _hf_match_json.dumps(maintenance_matches, default=str),
+
+                "alert_message": alert_message,
+                "alert_status": "created",
+                "homeowner_action": "",
+                "homeowner_note": "",
+
+                "source_type": "shopping_items_store_match",
+                "match_source": "home_care_shopping_items_and_maintenance_tasks",
+                "triggered_at": now_sql,
+                "created_at": now_sql,
+                "updated_at": now_sql,
+            }
+
+            if _hf_match_yes(payload.dry_run):
+                conn.rollback()
+                return {
+                    "success": True,
+                    "created": False,
+                    "dry_run": True,
+                    "reason": "dry_run",
+                    "record_id": safe_record_id,
+                    "store_name": safe_store_name,
+                    "store_category": safe_store_category,
+                    "compatible_categories": compatible_categories,
+                    "shopping_match_count": len(shopping_matches),
+                    "maintenance_match_count": len(maintenance_matches),
+                    "shopping_matches": shopping_matches,
+                    "maintenance_matches": maintenance_matches,
+                    "shopping_list": shopping_list,
+                    "alert_message": alert_message,
+                }
+
+            created_event = _hf_match_insert_location_alert_event(cursor, event_data)
+
+        conn.commit()
+
+        created_event_api = dict(created_event or {})
+
+        for field in ["triggered_at", "created_at", "updated_at"]:
+            if field in created_event_api and created_event_api[field] is not None:
+                try:
+                    created_event_api[field] = created_event_api[field].isoformat()
+                except Exception:
+                    created_event_api[field] = str(created_event_api[field])
+
+        return {
+            "success": True,
+            "created": True,
+            "message": "Shopping items matched to nearby store and location alert was created.",
+            "record_id": safe_record_id,
+            "store_name": safe_store_name,
+            "store_category": safe_store_category,
+            "compatible_categories": compatible_categories,
+            "shopping_match_count": len(shopping_matches),
+            "maintenance_match_count": len(maintenance_matches),
+            "shopping_matches": shopping_matches,
+            "maintenance_matches": maintenance_matches,
+            "location_alert_event": created_event_api,
+            "alert_message": alert_message,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "shopping_store_match_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

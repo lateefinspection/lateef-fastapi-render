@@ -23885,3 +23885,780 @@ def update_location_alert_event_action(event_id: int, payload: _HFLocationAlertA
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Location Permission Backend Pass 1
+# Permission preferences for optional location-based store reminders.
+# This stores homeowner consent state, not GPS history.
+# ============================================================
+
+from typing import Optional as _hf_perm_Optional
+
+
+class _HFLocationPermissionPayload(BaseModel):
+    tenant_id: str = "lateef-home-inspection"
+    property_id: str = ""
+    record_id: str
+    user_id: str = "homeowner-smoke-test"
+
+    permission_feature: str = "store_reminders"
+    permission_status: str = "not_configured"
+    browser_permission_status: str = ""
+    location_mode: str = "nearby_store_only"
+
+    consent_version: str = "location-store-reminders-v1"
+    consent_text: str = ""
+
+    enabled: str = "no"
+    paused: str = "no"
+
+
+class _HFLocationPermissionDisablePayload(BaseModel):
+    user_id: str = "homeowner-smoke-test"
+    reason: str = "homeowner_disabled"
+
+
+class _HFLocationPermissionPausePayload(BaseModel):
+    user_id: str = "homeowner-smoke-test"
+    paused: str = "yes"
+
+
+def _hf_perm_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_perm_text(value):
+    return str(value or "").strip()
+
+
+def _hf_perm_yes(value):
+    return _hf_perm_one_line(value).lower() in {"yes", "true", "1", "enabled", "active", "granted"}
+
+
+def _hf_perm_row_to_api(row):
+    if not row:
+        return None
+
+    item = dict(row)
+
+    for field in [
+        "last_prompted_at",
+        "enabled_at",
+        "disabled_at",
+        "updated_at",
+        "created_at",
+    ]:
+        if field in item and item[field] is not None:
+            try:
+                item[field] = item[field].isoformat()
+            except Exception:
+                item[field] = str(item[field])
+
+    return item
+
+
+def _hf_perm_default_consent_text():
+    return (
+        "Location reminders are optional. HomeFax can remind you when you are near "
+        "a useful store for an active home-care task. HomeFax does not need your "
+        "full movement history and does not create a continuous location trail. "
+        "You can turn this off anytime."
+    )
+
+
+def _hf_perm_ensure_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS location_permission_preferences (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+                    tenant_id VARCHAR(255) NOT NULL DEFAULT 'lateef-home-inspection',
+                    property_id VARCHAR(255) DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL,
+                    user_id VARCHAR(255) DEFAULT '',
+
+                    permission_feature VARCHAR(100) DEFAULT 'store_reminders',
+
+                    permission_status VARCHAR(100) DEFAULT 'not_configured',
+                    browser_permission_status VARCHAR(100) DEFAULT '',
+                    location_mode VARCHAR(100) DEFAULT 'nearby_store_only',
+
+                    consent_version VARCHAR(100) DEFAULT 'location-store-reminders-v1',
+                    consent_text TEXT NULL,
+
+                    enabled VARCHAR(20) DEFAULT 'no',
+                    paused VARCHAR(20) DEFAULT 'no',
+
+                    last_prompted_at DATETIME NULL,
+                    enabled_at DATETIME NULL,
+                    disabled_at DATETIME NULL,
+
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+                    INDEX idx_location_permission_record_id (record_id),
+                    INDEX idx_location_permission_user_id (user_id),
+                    INDEX idx_location_permission_status (permission_status),
+                    INDEX idx_location_permission_enabled (enabled),
+                    INDEX idx_location_permission_feature (permission_feature)
+                )
+                """
+            )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Location permission schema ready.",
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "location_permission_schema_error",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/location-permissions/health")
+def location_permissions_health():
+    _hf_perm_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM location_permission_preferences")
+            row = cursor.fetchone() or {}
+            count = int(row.get("count") or 0)
+
+        return {
+            "success": True,
+            "service": "homefax_location_permissions",
+            "tables": {
+                "location_permission_preferences": {
+                    "ok": True,
+                    "count": count,
+                },
+            },
+            "privacy_contract": {
+                "stores_permission_state": True,
+                "stores_continuous_location_history": False,
+                "location_mode": "nearby_store_only",
+            },
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/location-permissions/{record_id}")
+def get_location_permission(record_id: str, user_id: str = "homeowner-smoke-test"):
+    _hf_perm_ensure_schema()
+
+    safe_record_id = _hf_perm_one_line(record_id)
+    safe_user_id = _hf_perm_one_line(user_id)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM location_permission_preferences
+                WHERE record_id = %s
+                  AND permission_feature = 'store_reminders'
+                  AND (user_id = %s OR user_id = '')
+                ORDER BY
+                    CASE WHEN user_id = %s THEN 0 ELSE 1 END,
+                    id DESC
+                LIMIT 1
+                """,
+                (
+                    safe_record_id,
+                    safe_user_id,
+                    safe_user_id,
+                ),
+            )
+            row = cursor.fetchone()
+
+        permission = _hf_perm_row_to_api(row)
+
+        if not permission:
+            permission = {
+                "id": None,
+                "tenant_id": "lateef-home-inspection",
+                "property_id": "",
+                "record_id": safe_record_id,
+                "user_id": safe_user_id,
+                "permission_feature": "store_reminders",
+                "permission_status": "not_configured",
+                "browser_permission_status": "",
+                "location_mode": "nearby_store_only",
+                "consent_version": "location-store-reminders-v1",
+                "consent_text": _hf_perm_default_consent_text(),
+                "enabled": "no",
+                "paused": "no",
+                "last_prompted_at": None,
+                "enabled_at": None,
+                "disabled_at": None,
+            }
+
+        return {
+            "success": True,
+            "record_id": safe_record_id,
+            "user_id": safe_user_id,
+            "permission": permission,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/location-permissions")
+def save_location_permission(payload: _HFLocationPermissionPayload):
+    _hf_perm_ensure_schema()
+
+    safe_record_id = _hf_perm_one_line(payload.record_id)
+    safe_user_id = _hf_perm_one_line(payload.user_id)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    permission_status = _hf_perm_one_line(payload.permission_status or "not_configured").lower()
+    browser_status = _hf_perm_one_line(payload.browser_permission_status).lower()
+    enabled = "yes" if _hf_perm_yes(payload.enabled) or permission_status == "enabled" else "no"
+    paused = "yes" if _hf_perm_yes(payload.paused) else "no"
+
+    if enabled == "yes":
+        permission_status = "enabled"
+
+    allowed_statuses = {
+        "not_configured",
+        "explainer_accepted",
+        "enabled",
+        "disabled",
+        "denied",
+        "paused",
+        "unsupported",
+    }
+
+    if permission_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_permission_status",
+                "message": f"permission_status must be one of: {sorted(allowed_statuses)}",
+            },
+        )
+
+    consent_text = _hf_perm_text(payload.consent_text) or _hf_perm_default_consent_text()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM location_permission_preferences
+                WHERE record_id = %s
+                  AND user_id = %s
+                  AND permission_feature = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    safe_record_id,
+                    safe_user_id,
+                    _hf_perm_one_line(payload.permission_feature or "store_reminders"),
+                ),
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                permission_id = int(existing.get("id"))
+
+                cursor.execute(
+                    """
+                    UPDATE location_permission_preferences
+                    SET
+                        tenant_id = %s,
+                        property_id = %s,
+                        permission_status = %s,
+                        browser_permission_status = %s,
+                        location_mode = %s,
+                        consent_version = %s,
+                        consent_text = %s,
+                        enabled = %s,
+                        paused = %s,
+                        last_prompted_at = NOW(),
+                        enabled_at = CASE
+                            WHEN %s = 'yes' AND enabled_at IS NULL THEN NOW()
+                            WHEN %s = 'yes' THEN enabled_at
+                            ELSE enabled_at
+                        END,
+                        disabled_at = CASE
+                            WHEN %s = 'no' AND enabled = 'yes' THEN NOW()
+                            ELSE disabled_at
+                        END,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        _hf_perm_one_line(payload.tenant_id or "lateef-home-inspection"),
+                        _hf_perm_one_line(payload.property_id),
+                        permission_status,
+                        browser_status,
+                        _hf_perm_one_line(payload.location_mode or "nearby_store_only"),
+                        _hf_perm_one_line(payload.consent_version or "location-store-reminders-v1"),
+                        consent_text,
+                        enabled,
+                        paused,
+                        enabled,
+                        enabled,
+                        enabled,
+                        permission_id,
+                    ),
+                )
+
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO location_permission_preferences (
+                        tenant_id,
+                        property_id,
+                        record_id,
+                        user_id,
+                        permission_feature,
+                        permission_status,
+                        browser_permission_status,
+                        location_mode,
+                        consent_version,
+                        consent_text,
+                        enabled,
+                        paused,
+                        last_prompted_at,
+                        enabled_at,
+                        disabled_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        NOW(),
+                        CASE WHEN %s = 'yes' THEN NOW() ELSE NULL END,
+                        CASE WHEN %s = 'no' AND %s = 'disabled' THEN NOW() ELSE NULL END
+                    )
+                    """,
+                    (
+                        _hf_perm_one_line(payload.tenant_id or "lateef-home-inspection"),
+                        _hf_perm_one_line(payload.property_id),
+                        safe_record_id,
+                        safe_user_id,
+                        _hf_perm_one_line(payload.permission_feature or "store_reminders"),
+                        permission_status,
+                        browser_status,
+                        _hf_perm_one_line(payload.location_mode or "nearby_store_only"),
+                        _hf_perm_one_line(payload.consent_version or "location-store-reminders-v1"),
+                        consent_text,
+                        enabled,
+                        paused,
+                        enabled,
+                        enabled,
+                        permission_status,
+                    ),
+                )
+
+                permission_id = cursor.lastrowid
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM location_permission_preferences
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (permission_id,),
+            )
+            permission = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Location permission preference saved.",
+            "permission": _hf_perm_row_to_api(permission),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "location_permission_save_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/location-permissions/{record_id}/disable")
+def disable_location_permission(record_id: str, payload: _HFLocationPermissionDisablePayload):
+    _hf_perm_ensure_schema()
+
+    safe_record_id = _hf_perm_one_line(record_id)
+    safe_user_id = _hf_perm_one_line(payload.user_id)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM location_permission_preferences
+                WHERE record_id = %s
+                  AND user_id = %s
+                  AND permission_feature = 'store_reminders'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    safe_record_id,
+                    safe_user_id,
+                ),
+            )
+            existing = cursor.fetchone()
+
+            reason_text = _hf_perm_one_line(payload.reason or "homeowner_disabled")
+            consent_text = _hf_perm_default_consent_text() + f" Disable reason: {reason_text}."
+
+            if existing:
+                permission_id = int(existing.get("id"))
+
+                cursor.execute(
+                    """
+                    UPDATE location_permission_preferences
+                    SET
+                        permission_status = 'disabled',
+                        enabled = 'no',
+                        paused = 'no',
+                        consent_text = %s,
+                        disabled_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        consent_text,
+                        permission_id,
+                    ),
+                )
+
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO location_permission_preferences (
+                        tenant_id,
+                        property_id,
+                        record_id,
+                        user_id,
+                        permission_feature,
+                        permission_status,
+                        browser_permission_status,
+                        location_mode,
+                        consent_version,
+                        consent_text,
+                        enabled,
+                        paused,
+                        disabled_at
+                    )
+                    VALUES (
+                        'lateef-home-inspection',
+                        '',
+                        %s,
+                        %s,
+                        'store_reminders',
+                        'disabled',
+                        '',
+                        'nearby_store_only',
+                        'location-store-reminders-v1',
+                        %s,
+                        'no',
+                        'no',
+                        NOW()
+                    )
+                    """,
+                    (
+                        safe_record_id,
+                        safe_user_id,
+                        consent_text,
+                    ),
+                )
+
+                permission_id = cursor.lastrowid
+
+            cursor.execute(
+                "SELECT * FROM location_permission_preferences WHERE id = %s LIMIT 1",
+                (permission_id,),
+            )
+            permission = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Location store reminders disabled.",
+            "permission": _hf_perm_row_to_api(permission),
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "location_permission_disable_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/location-permissions/{record_id}/pause")
+def pause_location_permission(record_id: str, payload: _HFLocationPermissionPausePayload):
+    _hf_perm_ensure_schema()
+
+    safe_record_id = _hf_perm_one_line(record_id)
+    safe_user_id = _hf_perm_one_line(payload.user_id)
+    paused = "yes" if _hf_perm_yes(payload.paused) else "no"
+    permission_status = "paused" if paused == "yes" else "enabled"
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM location_permission_preferences
+                WHERE record_id = %s
+                  AND user_id = %s
+                  AND permission_feature = 'store_reminders'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    safe_record_id,
+                    safe_user_id,
+                ),
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                permission_id = int(existing.get("id"))
+
+                cursor.execute(
+                    """
+                    UPDATE location_permission_preferences
+                    SET
+                        permission_status = %s,
+                        enabled = 'yes',
+                        paused = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        permission_status,
+                        paused,
+                        permission_id,
+                    ),
+                )
+
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO location_permission_preferences (
+                        tenant_id,
+                        property_id,
+                        record_id,
+                        user_id,
+                        permission_feature,
+                        permission_status,
+                        browser_permission_status,
+                        location_mode,
+                        consent_version,
+                        consent_text,
+                        enabled,
+                        paused,
+                        enabled_at
+                    )
+                    VALUES (
+                        'lateef-home-inspection',
+                        '',
+                        %s,
+                        %s,
+                        'store_reminders',
+                        %s,
+                        '',
+                        'nearby_store_only',
+                        'location-store-reminders-v1',
+                        %s,
+                        'yes',
+                        %s,
+                        NOW()
+                    )
+                    """,
+                    (
+                        safe_record_id,
+                        safe_user_id,
+                        permission_status,
+                        _hf_perm_default_consent_text(),
+                        paused,
+                    ),
+                )
+
+                permission_id = cursor.lastrowid
+
+            cursor.execute(
+                "SELECT * FROM location_permission_preferences WHERE id = %s LIMIT 1",
+                (permission_id,),
+            )
+            permission = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Location store reminder pause state saved.",
+            "permission": _hf_perm_row_to_api(permission),
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "location_permission_pause_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

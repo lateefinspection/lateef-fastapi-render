@@ -26058,15 +26058,15 @@ def create_location_alert_from_shopping_match(payload: _HFShoppingStoreMatchPayl
                 maintenance_matches,
             )
 
-            primary_task_id = None
-            primary_task_title = ""
+            primary_task_id = 0
+            primary_task_title = "Home-care shopping items"
 
             if maintenance_matches:
-                primary_task_id = maintenance_matches[0].get("id")
-                primary_task_title = maintenance_matches[0].get("title") or ""
+                primary_task_id = maintenance_matches[0].get("id") or 0
+                primary_task_title = maintenance_matches[0].get("title") or "Maintenance task"
 
             elif shopping_matches:
-                primary_task_id = shopping_matches[0].get("maintenance_task_id")
+                primary_task_id = shopping_matches[0].get("maintenance_task_id") or 0
                 primary_task_title = shopping_matches[0].get("maintenance_task_title") or "Home-care shopping items"
 
             now_sql = _hf_match_datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")

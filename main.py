@@ -24744,12 +24744,12 @@ def _hf_shop_parse_datetime(value):
         "%Y-%m-%d",
     ):
         try:
-            return datetime.strptime(cleaned[:19], fmt)
+            return _hf_loc_datetime.strptime(cleaned[:19], fmt)
         except Exception:
             pass
 
     try:
-        return datetime.fromisoformat(raw.replace("Z", ""))
+        return _hf_loc_datetime.fromisoformat(raw.replace("Z", ""))
     except Exception:
         return None
 
@@ -24823,7 +24823,7 @@ def _hf_shop_status_for_needed_by(needed_by, reminder_window_days=14):
     if not parsed:
         return "unscheduled"
 
-    now = datetime.utcnow()
+    now = _hf_loc_datetime.utcnow()
 
     if parsed < now:
         return "overdue"
@@ -24836,7 +24836,7 @@ def _hf_shop_status_for_needed_by(needed_by, reminder_window_days=14):
     except Exception:
         window_days = 14
 
-    if parsed <= now + timedelta(days=window_days):
+    if parsed <= now + _hf_loc_timedelta(days=window_days):
         return "needed_soon"
 
     return "scheduled"

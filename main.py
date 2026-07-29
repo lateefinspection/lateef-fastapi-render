@@ -26176,3 +26176,352 @@ def create_location_alert_from_shopping_match(payload: _HFShoppingStoreMatchPayl
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Shopping Item Correction + List Split Pass 1
+# Converts maintenance task shopping_list_json into editable
+# home_care_shopping_items records.
+# ============================================================
+
+import json as _hf_split_json
+from typing import Optional as _hf_split_Optional
+
+
+class _HFShoppingListSplitPayload(BaseModel):
+    user_id: str = "homeowner-smoke-test"
+    default_needed_days_before_task: int = 7
+    default_store_category: str = ""
+    force_create_duplicates: str = "no"
+
+
+def _hf_split_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_split_yes(value):
+    return _hf_split_one_line(value).lower() in {"yes", "true", "1"}
+
+
+def _hf_split_json_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return value
+
+    raw = str(value or "").strip()
+
+    if not raw:
+        return []
+
+    try:
+        parsed = _hf_split_json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+
+    return []
+
+
+def _hf_split_guess_store_category(item_name, fallback="hardware_store"):
+    text = _hf_split_one_line(item_name).lower()
+
+    grocery_keywords = [
+        "bleach",
+        "trash bag",
+        "garbage bag",
+        "paper towel",
+        "cleaner",
+        "soap",
+        "detergent",
+        "mop",
+        "bucket",
+    ]
+
+    hardware_keywords = [
+        "filter",
+        "caulk",
+        "sealant",
+        "tape",
+        "sensor",
+        "battery",
+        "marker",
+        "screw",
+        "valve",
+        "hose",
+    ]
+
+    for keyword in grocery_keywords:
+        if keyword in text:
+            return "grocery_store"
+
+    for keyword in hardware_keywords:
+        if keyword in text:
+            return "hardware_store"
+
+    return fallback or "hardware_store"
+
+
+def _hf_split_needed_by_from_task(task_next_due_at, days_before):
+    parsed = None
+
+    try:
+        parsed = _hf_shop_parse_datetime(task_next_due_at)
+    except Exception:
+        parsed = None
+
+    if not parsed:
+        return None
+
+    try:
+        days = max(0, int(days_before or 7))
+    except Exception:
+        days = 7
+
+    try:
+        return (parsed - _hf_loc_timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        try:
+            return (parsed - _hf_match_timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+
+@app.post("/home-care-shopping-items/from-maintenance-task/{task_id}")
+def split_maintenance_task_shopping_list(
+    task_id: int,
+    payload: _HFShoppingListSplitPayload,
+):
+    """
+    Takes a maintenance task shopping_list_json and converts each list entry
+    into an editable home_care_shopping_items row.
+
+    This lets homeowners correct item-level needed-by dates, urgency,
+    store category, and purchase status separately from the maintenance task.
+    """
+    if "_hf_shop_ensure_schema" in globals():
+        _hf_shop_ensure_schema()
+
+    if "_hf_maint_ensure_schema" in globals():
+        _hf_maint_ensure_schema()
+
+    safe_task_id = int(task_id or 0)
+
+    if safe_task_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_task_id",
+                "message": "task_id must be a positive integer.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM maintenance_tasks
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_task_id,),
+            )
+            task = cursor.fetchone()
+
+            if not task:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "maintenance_task_not_found",
+                        "message": f"Maintenance task {safe_task_id} was not found.",
+                    },
+                )
+
+            shopping_list = _hf_split_json_list(task.get("shopping_list_json"))
+
+            if not shopping_list:
+                return {
+                    "success": True,
+                    "created_count": 0,
+                    "skipped_count": 0,
+                    "message": "Maintenance task has no shopping_list_json items to split.",
+                    "maintenance_task": {
+                        "id": task.get("id"),
+                        "record_id": task.get("record_id"),
+                        "title": task.get("title"),
+                    },
+                    "created_items": [],
+                    "skipped_items": [],
+                }
+
+            record_id = _hf_split_one_line(task.get("record_id"))
+            tenant_id = _hf_split_one_line(task.get("tenant_id") or "lateef-home-inspection")
+            property_id = _hf_split_one_line(task.get("property_id"))
+            source_issue_id = task.get("source_issue_id")
+            default_store_category = _hf_split_one_line(
+                payload.default_store_category or task.get("store_category") or "hardware_store"
+            )
+            needed_by_sql = _hf_split_needed_by_from_task(
+                task.get("next_due_at"),
+                payload.default_needed_days_before_task,
+            )
+
+            created_items = []
+            skipped_items = []
+
+            for raw_item in shopping_list:
+                item_name = _hf_split_one_line(raw_item)
+
+                if not item_name:
+                    continue
+
+                store_category = _hf_split_guess_store_category(item_name, default_store_category)
+
+                if not _hf_split_yes(payload.force_create_duplicates):
+                    cursor.execute(
+                        """
+                        SELECT *
+                        FROM home_care_shopping_items
+                        WHERE record_id = %s
+                          AND maintenance_task_id = %s
+                          AND LOWER(item_name) = LOWER(%s)
+                          AND item_status != 'archived'
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (
+                            record_id,
+                            safe_task_id,
+                            item_name,
+                        ),
+                    )
+                    existing = cursor.fetchone()
+
+                    if existing:
+                        item_api = _hf_shop_row_to_api(existing)
+                        item_api["needed_by_status"] = _hf_shop_status_for_needed_by(
+                            item_api.get("needed_by"),
+                            item_api.get("reminder_window_days"),
+                        )
+                        skipped_items.append(item_api)
+                        continue
+
+                cursor.execute(
+                    """
+                    INSERT INTO home_care_shopping_items (
+                        tenant_id,
+                        property_id,
+                        record_id,
+                        user_id,
+                        maintenance_task_id,
+                        source_issue_id,
+                        location_alert_event_id,
+                        item_name,
+                        quantity,
+                        store_category,
+                        needed_by,
+                        reminder_window_days,
+                        urgency,
+                        item_status,
+                        notes,
+                        source_type
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, NULL,
+                        %s, %s, %s,
+                        %s, %s, %s,
+                        'needed',
+                        %s,
+                        'maintenance_task_split'
+                    )
+                    """,
+                    (
+                        tenant_id,
+                        property_id,
+                        record_id,
+                        _hf_split_one_line(payload.user_id),
+                        safe_task_id,
+                        source_issue_id,
+                        item_name,
+                        "",
+                        store_category,
+                        needed_by_sql,
+                        30,
+                        "normal",
+                        f"Created from maintenance task shopping list: {task.get('title') or 'Maintenance task'}.",
+                    ),
+                )
+
+                item_id = cursor.lastrowid
+
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM home_care_shopping_items
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (item_id,),
+                )
+                created = cursor.fetchone()
+
+                item_api = _hf_shop_row_to_api(created)
+                item_api["needed_by_status"] = _hf_shop_status_for_needed_by(
+                    item_api.get("needed_by"),
+                    item_api.get("reminder_window_days"),
+                )
+                created_items.append(item_api)
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Maintenance task shopping list split into editable shopping items.",
+            "maintenance_task": {
+                "id": task.get("id"),
+                "record_id": task.get("record_id"),
+                "title": task.get("title"),
+                "next_due_at": str(task.get("next_due_at") or ""),
+                "store_category": task.get("store_category"),
+            },
+            "created_count": len(created_items),
+            "skipped_count": len(skipped_items),
+            "created_items": created_items,
+            "skipped_items": skipped_items,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "shopping_list_split_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

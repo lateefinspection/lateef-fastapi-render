@@ -24662,3 +24662,948 @@ def pause_location_permission(record_id: str, payload: _HFLocationPermissionPaus
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Home-Care Shopping Item Input Backend Pass 1
+# Separate shopping supplies from recurring maintenance schedules.
+# Allows homeowner to add items like bleach, garbage bags, batteries,
+# furnace filters, caulk, leak sensors, cleaning supplies, etc.
+# ============================================================
+
+from typing import Optional as _hf_shop_Optional
+
+
+class _HFHomeCareShoppingItemPayload(BaseModel):
+    tenant_id: str = "lateef-home-inspection"
+    property_id: str = ""
+    record_id: str
+    user_id: str = "homeowner-smoke-test"
+
+    maintenance_task_id: _hf_shop_Optional[int] = None
+    source_issue_id: _hf_shop_Optional[int] = None
+    location_alert_event_id: _hf_shop_Optional[int] = None
+
+    item_name: str
+    quantity: str = ""
+    store_category: str = "hardware_store"
+
+    needed_by: str = ""
+    reminder_window_days: int = 14
+    urgency: str = "normal"
+
+    item_status: str = "needed"
+    notes: str = ""
+    source_type: str = "manual"
+
+
+class _HFHomeCareShoppingItemUpdatePayload(BaseModel):
+    item_name: _hf_shop_Optional[str] = None
+    quantity: _hf_shop_Optional[str] = None
+    store_category: _hf_shop_Optional[str] = None
+
+    needed_by: _hf_shop_Optional[str] = None
+    reminder_window_days: _hf_shop_Optional[int] = None
+    urgency: _hf_shop_Optional[str] = None
+
+    item_status: _hf_shop_Optional[str] = None
+    notes: _hf_shop_Optional[str] = None
+
+
+class _HFHomeCareShoppingItemPurchasePayload(BaseModel):
+    purchased_by: str = "homeowner-smoke-test"
+    purchase_note: str = ""
+
+
+class _HFHomeCareShoppingItemArchivePayload(BaseModel):
+    archived_by: str = "homeowner-smoke-test"
+    archive_reason: str = "homeowner_archived"
+
+
+def _hf_shop_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_shop_text(value):
+    return str(value or "").strip()
+
+
+def _hf_shop_parse_datetime(value):
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+
+    if not raw:
+        return None
+
+    cleaned = raw.replace("Z", "").replace("T", " ")
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(cleaned[:19], fmt)
+        except Exception:
+            pass
+
+    try:
+        return datetime.fromisoformat(raw.replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _hf_shop_dt_sql(value):
+    parsed = _hf_shop_parse_datetime(value)
+
+    if not parsed:
+        return None
+
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hf_shop_row_to_api(row):
+    if not row:
+        return None
+
+    item = dict(row)
+
+    for field in [
+        "needed_by",
+        "purchased_at",
+        "archived_at",
+        "created_at",
+        "updated_at",
+    ]:
+        if field in item and item[field] is not None:
+            try:
+                item[field] = item[field].isoformat()
+            except Exception:
+                item[field] = str(item[field])
+
+    return item
+
+
+def _hf_shop_normalize_status(value):
+    raw = _hf_shop_one_line(value).lower()
+
+    allowed = {
+        "needed",
+        "purchased",
+        "archived",
+        "not_needed",
+    }
+
+    if raw in allowed:
+        return raw
+
+    return "needed"
+
+
+def _hf_shop_normalize_urgency(value):
+    raw = _hf_shop_one_line(value).lower()
+
+    allowed = {
+        "low",
+        "normal",
+        "soon",
+        "urgent",
+    }
+
+    if raw in allowed:
+        return raw
+
+    return "normal"
+
+
+def _hf_shop_status_for_needed_by(needed_by, reminder_window_days=14):
+    parsed = _hf_shop_parse_datetime(needed_by)
+
+    if not parsed:
+        return "unscheduled"
+
+    now = datetime.utcnow()
+
+    if parsed < now:
+        return "overdue"
+
+    if parsed.date() == now.date():
+        return "due_today"
+
+    try:
+        window_days = max(0, int(reminder_window_days or 0))
+    except Exception:
+        window_days = 14
+
+    if parsed <= now + timedelta(days=window_days):
+        return "needed_soon"
+
+    return "scheduled"
+
+
+def _hf_shop_ensure_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS home_care_shopping_items (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+                    tenant_id VARCHAR(255) NOT NULL DEFAULT 'lateef-home-inspection',
+                    property_id VARCHAR(255) DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL,
+                    user_id VARCHAR(255) DEFAULT '',
+
+                    maintenance_task_id BIGINT NULL,
+                    source_issue_id BIGINT NULL,
+                    location_alert_event_id BIGINT NULL,
+
+                    item_name VARCHAR(500) NOT NULL,
+                    quantity VARCHAR(255) DEFAULT '',
+                    store_category VARCHAR(100) DEFAULT 'hardware_store',
+
+                    needed_by DATETIME NULL,
+                    reminder_window_days INT DEFAULT 14,
+                    urgency VARCHAR(100) DEFAULT 'normal',
+
+                    item_status VARCHAR(100) DEFAULT 'needed',
+                    purchased_at DATETIME NULL,
+                    purchased_by VARCHAR(255) DEFAULT '',
+                    purchase_note TEXT NULL,
+
+                    archived_at DATETIME NULL,
+                    archived_by VARCHAR(255) DEFAULT '',
+                    archive_reason TEXT NULL,
+
+                    notes TEXT NULL,
+                    source_type VARCHAR(100) DEFAULT 'manual',
+
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+                    INDEX idx_home_care_items_record_id (record_id),
+                    INDEX idx_home_care_items_user_id (user_id),
+                    INDEX idx_home_care_items_task_id (maintenance_task_id),
+                    INDEX idx_home_care_items_issue_id (source_issue_id),
+                    INDEX idx_home_care_items_location_alert_id (location_alert_event_id),
+                    INDEX idx_home_care_items_store_category (store_category),
+                    INDEX idx_home_care_items_needed_by (needed_by),
+                    INDEX idx_home_care_items_status (item_status),
+                    INDEX idx_home_care_items_urgency (urgency)
+                )
+                """
+            )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Home-care shopping item schema ready.",
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "home_care_shopping_schema_error",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/home-care-shopping/health")
+def home_care_shopping_health():
+    _hf_shop_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM home_care_shopping_items")
+            row = cursor.fetchone() or {}
+            total_count = int(row.get("count") or 0)
+
+            cursor.execute(
+                """
+                SELECT item_status, COUNT(*) AS count
+                FROM home_care_shopping_items
+                GROUP BY item_status
+                """
+            )
+            status_rows = cursor.fetchall() or []
+
+        status_counts = {
+            str(row.get("item_status") or "unknown"): int(row.get("count") or 0)
+            for row in status_rows
+        }
+
+        return {
+            "success": True,
+            "service": "homefax_home_care_shopping",
+            "tables": {
+                "home_care_shopping_items": {
+                    "ok": True,
+                    "count": total_count,
+                },
+            },
+            "status_counts": status_counts,
+            "purpose": {
+                "separates_shopping_items_from_maintenance_tasks": True,
+                "supports_shorter_timeframe_items": True,
+                "examples": [
+                    "bleach",
+                    "garbage bags",
+                    "batteries",
+                    "furnace filter",
+                    "caulk",
+                    "leak sensor",
+                ],
+            },
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/home-care-shopping-items")
+def create_home_care_shopping_item(payload: _HFHomeCareShoppingItemPayload):
+    _hf_shop_ensure_schema()
+
+    safe_record_id = _hf_shop_one_line(payload.record_id)
+    item_name = _hf_shop_one_line(payload.item_name)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    if not item_name:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_item_name",
+                "message": "item_name is required.",
+            },
+        )
+
+    status = _hf_shop_normalize_status(payload.item_status)
+    urgency = _hf_shop_normalize_urgency(payload.urgency)
+    needed_by_sql = _hf_shop_dt_sql(payload.needed_by)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO home_care_shopping_items (
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    user_id,
+
+                    maintenance_task_id,
+                    source_issue_id,
+                    location_alert_event_id,
+
+                    item_name,
+                    quantity,
+                    store_category,
+
+                    needed_by,
+                    reminder_window_days,
+                    urgency,
+
+                    item_status,
+                    notes,
+                    source_type
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s
+                )
+                """,
+                (
+                    _hf_shop_one_line(payload.tenant_id or "lateef-home-inspection"),
+                    _hf_shop_one_line(payload.property_id),
+                    safe_record_id,
+                    _hf_shop_one_line(payload.user_id),
+
+                    payload.maintenance_task_id,
+                    payload.source_issue_id,
+                    payload.location_alert_event_id,
+
+                    item_name,
+                    _hf_shop_one_line(payload.quantity),
+                    _hf_shop_one_line(payload.store_category or "hardware_store"),
+
+                    needed_by_sql,
+                    max(0, int(payload.reminder_window_days or 14)),
+                    urgency,
+
+                    status,
+                    _hf_shop_text(payload.notes),
+                    _hf_shop_one_line(payload.source_type or "manual"),
+                ),
+            )
+
+            item_id = cursor.lastrowid
+
+            cursor.execute(
+                "SELECT * FROM home_care_shopping_items WHERE id = %s LIMIT 1",
+                (item_id,),
+            )
+            item = cursor.fetchone()
+
+        conn.commit()
+
+        item_api = _hf_shop_row_to_api(item)
+        item_api["needed_by_status"] = _hf_shop_status_for_needed_by(
+            item_api.get("needed_by"),
+            item_api.get("reminder_window_days"),
+        )
+
+        return {
+            "success": True,
+            "message": "Home-care shopping item created.",
+            "shopping_item": item_api,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "home_care_shopping_item_create_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/home-care-shopping-items/{record_id}")
+def get_home_care_shopping_items(
+    record_id: str,
+    status: str = "",
+    store_category: str = "",
+    include_archived: str = "no",
+):
+    _hf_shop_ensure_schema()
+
+    safe_record_id = _hf_shop_one_line(record_id)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    filters = ["hsi.record_id = %s"]
+    params = [safe_record_id]
+
+    safe_status = _hf_shop_one_line(status).lower()
+    safe_store_category = _hf_shop_one_line(store_category)
+
+    if safe_status:
+        filters.append("hsi.item_status = %s")
+        params.append(safe_status)
+
+    if safe_store_category:
+        filters.append("hsi.store_category = %s")
+        params.append(safe_store_category)
+
+    if _hf_shop_one_line(include_archived).lower() not in {"yes", "true", "1"}:
+        filters.append("hsi.item_status != 'archived'")
+
+    where_sql = " AND ".join(filters)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    hsi.*,
+                    mt.title AS maintenance_task_title,
+                    mt.system AS maintenance_task_system,
+                    mt.component AS maintenance_task_component,
+                    mt.next_due_at AS maintenance_task_next_due_at
+                FROM home_care_shopping_items hsi
+                LEFT JOIN maintenance_tasks mt
+                    ON mt.id = hsi.maintenance_task_id
+                WHERE {where_sql}
+                ORDER BY
+                    CASE
+                        WHEN hsi.item_status = 'needed' THEN 0
+                        WHEN hsi.item_status = 'purchased' THEN 1
+                        WHEN hsi.item_status = 'not_needed' THEN 2
+                        WHEN hsi.item_status = 'archived' THEN 3
+                        ELSE 4
+                    END,
+                    CASE
+                        WHEN hsi.needed_by IS NULL THEN 1
+                        ELSE 0
+                    END,
+                    hsi.needed_by ASC,
+                    hsi.id DESC
+                """,
+                tuple(params),
+            )
+            rows = cursor.fetchall() or []
+
+        items = []
+
+        for row in rows:
+            item = _hf_shop_row_to_api(row)
+            item["needed_by_status"] = _hf_shop_status_for_needed_by(
+                item.get("needed_by"),
+                item.get("reminder_window_days"),
+            )
+            items.append(item)
+
+        summary = {
+            "total": len(items),
+            "needed": len([item for item in items if item.get("item_status") == "needed"]),
+            "purchased": len([item for item in items if item.get("item_status") == "purchased"]),
+            "archived": len([item for item in items if item.get("item_status") == "archived"]),
+            "urgent": len([item for item in items if item.get("urgency") == "urgent"]),
+            "soon": len([item for item in items if item.get("urgency") == "soon"]),
+            "overdue": len([item for item in items if item.get("needed_by_status") == "overdue"]),
+            "due_today": len([item for item in items if item.get("needed_by_status") == "due_today"]),
+            "needed_soon": len([item for item in items if item.get("needed_by_status") == "needed_soon"]),
+        }
+
+        return {
+            "success": True,
+            "record_id": safe_record_id,
+            "shopping_item_count": len(items),
+            "summary": summary,
+            "shopping_items": items,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/home-care-shopping-item/{item_id}")
+def update_home_care_shopping_item(item_id: int, payload: _HFHomeCareShoppingItemUpdatePayload):
+    _hf_shop_ensure_schema()
+
+    safe_item_id = int(item_id or 0)
+
+    if safe_item_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_item_id",
+                "message": "item_id must be a positive integer.",
+            },
+        )
+
+    fields = []
+    params = []
+
+    if payload.item_name is not None:
+        item_name = _hf_shop_one_line(payload.item_name)
+        if not item_name:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "error": "missing_item_name",
+                    "message": "item_name cannot be blank.",
+                },
+            )
+        fields.append("item_name = %s")
+        params.append(item_name)
+
+    if payload.quantity is not None:
+        fields.append("quantity = %s")
+        params.append(_hf_shop_one_line(payload.quantity))
+
+    if payload.store_category is not None:
+        fields.append("store_category = %s")
+        params.append(_hf_shop_one_line(payload.store_category or "hardware_store"))
+
+    if payload.needed_by is not None:
+        fields.append("needed_by = %s")
+        params.append(_hf_shop_dt_sql(payload.needed_by))
+
+    if payload.reminder_window_days is not None:
+        fields.append("reminder_window_days = %s")
+        params.append(max(0, int(payload.reminder_window_days or 0)))
+
+    if payload.urgency is not None:
+        fields.append("urgency = %s")
+        params.append(_hf_shop_normalize_urgency(payload.urgency))
+
+    if payload.item_status is not None:
+        fields.append("item_status = %s")
+        params.append(_hf_shop_normalize_status(payload.item_status))
+
+    if payload.notes is not None:
+        fields.append("notes = %s")
+        params.append(_hf_shop_text(payload.notes))
+
+    if not fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "no_update_fields",
+                "message": "At least one field is required.",
+            },
+        )
+
+    fields.append("updated_at = NOW()")
+    params.append(safe_item_id)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM home_care_shopping_items WHERE id = %s LIMIT 1",
+                (safe_item_id,),
+            )
+            existing = cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "shopping_item_not_found",
+                        "message": f"Shopping item {safe_item_id} was not found.",
+                    },
+                )
+
+            cursor.execute(
+                f"""
+                UPDATE home_care_shopping_items
+                SET {", ".join(fields)}
+                WHERE id = %s
+                """,
+                tuple(params),
+            )
+
+            cursor.execute(
+                "SELECT * FROM home_care_shopping_items WHERE id = %s LIMIT 1",
+                (safe_item_id,),
+            )
+            item = cursor.fetchone()
+
+        conn.commit()
+
+        item_api = _hf_shop_row_to_api(item)
+        item_api["needed_by_status"] = _hf_shop_status_for_needed_by(
+            item_api.get("needed_by"),
+            item_api.get("reminder_window_days"),
+        )
+
+        return {
+            "success": True,
+            "message": "Home-care shopping item updated.",
+            "shopping_item": item_api,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "home_care_shopping_item_update_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/home-care-shopping-item/{item_id}/mark-purchased")
+def mark_home_care_shopping_item_purchased(
+    item_id: int,
+    payload: _HFHomeCareShoppingItemPurchasePayload,
+):
+    _hf_shop_ensure_schema()
+
+    safe_item_id = int(item_id or 0)
+
+    if safe_item_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_item_id",
+                "message": "item_id must be a positive integer.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM home_care_shopping_items WHERE id = %s LIMIT 1",
+                (safe_item_id,),
+            )
+            existing = cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "shopping_item_not_found",
+                        "message": f"Shopping item {safe_item_id} was not found.",
+                    },
+                )
+
+            cursor.execute(
+                """
+                UPDATE home_care_shopping_items
+                SET
+                    item_status = 'purchased',
+                    purchased_at = NOW(),
+                    purchased_by = %s,
+                    purchase_note = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    _hf_shop_one_line(payload.purchased_by),
+                    _hf_shop_text(payload.purchase_note),
+                    safe_item_id,
+                ),
+            )
+
+            cursor.execute(
+                "SELECT * FROM home_care_shopping_items WHERE id = %s LIMIT 1",
+                (safe_item_id,),
+            )
+            item = cursor.fetchone()
+
+        conn.commit()
+
+        item_api = _hf_shop_row_to_api(item)
+        item_api["needed_by_status"] = _hf_shop_status_for_needed_by(
+            item_api.get("needed_by"),
+            item_api.get("reminder_window_days"),
+        )
+
+        return {
+            "success": True,
+            "message": "Home-care shopping item marked purchased.",
+            "shopping_item": item_api,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "home_care_shopping_item_purchase_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/home-care-shopping-item/{item_id}/archive")
+def archive_home_care_shopping_item(
+    item_id: int,
+    payload: _HFHomeCareShoppingItemArchivePayload,
+):
+    _hf_shop_ensure_schema()
+
+    safe_item_id = int(item_id or 0)
+
+    if safe_item_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_item_id",
+                "message": "item_id must be a positive integer.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM home_care_shopping_items WHERE id = %s LIMIT 1",
+                (safe_item_id,),
+            )
+            existing = cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "shopping_item_not_found",
+                        "message": f"Shopping item {safe_item_id} was not found.",
+                    },
+                )
+
+            cursor.execute(
+                """
+                UPDATE home_care_shopping_items
+                SET
+                    item_status = 'archived',
+                    archived_at = NOW(),
+                    archived_by = %s,
+                    archive_reason = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    _hf_shop_one_line(payload.archived_by),
+                    _hf_shop_text(payload.archive_reason),
+                    safe_item_id,
+                ),
+            )
+
+            cursor.execute(
+                "SELECT * FROM home_care_shopping_items WHERE id = %s LIMIT 1",
+                (safe_item_id,),
+            )
+            item = cursor.fetchone()
+
+        conn.commit()
+
+        item_api = _hf_shop_row_to_api(item)
+        item_api["needed_by_status"] = _hf_shop_status_for_needed_by(
+            item_api.get("needed_by"),
+            item_api.get("reminder_window_days"),
+        )
+
+        return {
+            "success": True,
+            "message": "Home-care shopping item archived.",
+            "shopping_item": item_api,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "home_care_shopping_item_archive_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

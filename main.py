@@ -26525,3 +26525,773 @@ def split_maintenance_task_shopping_list(
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Store Reminder Notification Engine Pass 1
+# Turns location/store reminder events into notification-ready
+# queue records. This pass does not send real email/SMS yet.
+# ============================================================
+
+import json as _hf_notify_json
+from datetime import datetime as _hf_notify_datetime
+from typing import Optional as _hf_notify_Optional
+
+
+class _HFStoreReminderQueuePayload(BaseModel):
+    tenant_id: str = "lateef-home-inspection"
+    property_id: str = ""
+    user_id: str = "homeowner-smoke-test"
+
+    channel: str = "in_app"
+    recipient: str = ""
+    include_acknowledged: str = "no"
+    dry_run: str = "no"
+
+
+class _HFStoreReminderNotificationStatusPayload(BaseModel):
+    note: str = ""
+    provider_message_id: str = ""
+    error_message: str = ""
+
+
+def _hf_notify_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_notify_yes(value):
+    return _hf_notify_one_line(value).lower() in {"yes", "true", "1", "enabled", "active"}
+
+
+def _hf_notify_json_list(value):
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return value
+
+    raw = str(value or "").strip()
+
+    if not raw:
+        return []
+
+    try:
+        parsed = _hf_notify_json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+
+    return []
+
+
+def _hf_notify_dt_to_iso(value):
+    if value is None:
+        return None
+
+    try:
+        return value.isoformat()
+    except Exception:
+        return str(value)
+
+
+def _hf_notify_table_exists(cursor, table_name):
+    cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+    return cursor.fetchone() is not None
+
+
+def _hf_notify_ensure_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS store_reminder_notifications (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    tenant_id VARCHAR(128) NOT NULL DEFAULT 'lateef-home-inspection',
+                    property_id VARCHAR(255) NOT NULL DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL,
+                    user_id VARCHAR(255) NOT NULL DEFAULT '',
+
+                    location_alert_event_id BIGINT NOT NULL DEFAULT 0,
+
+                    notification_type VARCHAR(128) NOT NULL DEFAULT 'store_reminder',
+                    channel VARCHAR(64) NOT NULL DEFAULT 'in_app',
+                    recipient VARCHAR(255) NOT NULL DEFAULT '',
+
+                    title TEXT,
+                    body LONGTEXT,
+                    action_url TEXT,
+
+                    notification_status VARCHAR(64) NOT NULL DEFAULT 'queued',
+                    provider_message_id VARCHAR(255) NOT NULL DEFAULT '',
+                    error_message TEXT,
+                    note TEXT,
+
+                    scheduled_for DATETIME NULL,
+                    queued_at DATETIME NULL,
+                    sent_at DATETIME NULL,
+                    failed_at DATETIME NULL,
+
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+                    INDEX idx_store_notify_record_id (record_id),
+                    INDEX idx_store_notify_event_id (location_alert_event_id),
+                    INDEX idx_store_notify_status (notification_status),
+                    INDEX idx_store_notify_channel (channel)
+                )
+                """
+            )
+
+        conn.commit()
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_notify_row_to_api(row):
+    item = dict(row or {})
+
+    for field in [
+        "scheduled_for",
+        "queued_at",
+        "sent_at",
+        "failed_at",
+        "created_at",
+        "updated_at",
+    ]:
+        if field in item:
+            item[field] = _hf_notify_dt_to_iso(item.get(field))
+
+    return item
+
+
+def _hf_notify_alert_row_to_api(row):
+    item = dict(row or {})
+
+    for field in [
+        "triggered_at",
+        "acknowledged_at",
+        "created_at",
+        "updated_at",
+    ]:
+        if field in item:
+            item[field] = _hf_notify_dt_to_iso(item.get(field))
+
+    return item
+
+
+def _hf_notify_is_shopping_only_alert(alert):
+    maintenance_task_id = str(alert.get("maintenance_task_id") if alert.get("maintenance_task_id") is not None else "").strip()
+    message = str(alert.get("alert_message") or "").lower()
+
+    if maintenance_task_id == "0":
+        return True
+
+    if "home-care items needed soon" in message:
+        return True
+
+    return False
+
+
+def _hf_notify_title_for_alert(alert):
+    store_name = _hf_notify_one_line(alert.get("store_name") or "Nearby store")
+    is_shopping_only = _hf_notify_is_shopping_only_alert(alert)
+
+    if is_shopping_only:
+        return f"HomeFax shopping reminder near {store_name}"
+
+    task_title = _hf_notify_one_line(
+        alert.get("maintenance_task_title") or
+        alert.get("task_title") or
+        alert.get("title") or
+        "home-care task"
+    )
+
+    return f"HomeFax maintenance reminder near {store_name}: {task_title}"
+
+
+def _hf_notify_body_for_alert(alert):
+    store_name = _hf_notify_one_line(alert.get("store_name") or "a nearby store")
+    alert_message = str(alert.get("alert_message") or "").strip()
+    shopping_items = _hf_notify_json_list(alert.get("shopping_list_json"))
+
+    lines = []
+
+    if alert_message:
+        lines.append(alert_message)
+    else:
+        lines.append(f"You are near {store_name}.")
+
+    if shopping_items:
+        lines.append("")
+        lines.append("Shopping list:")
+
+        for item in shopping_items:
+            clean_item = _hf_notify_one_line(item)
+            if clean_item:
+                lines.append(f"- {clean_item}")
+
+    if _hf_notify_is_shopping_only_alert(alert):
+        lines.append("")
+        lines.append("Open HomeFax to mark these items purchased, snooze, or dismiss this reminder.")
+    else:
+        lines.append("")
+        lines.append("Open HomeFax to mark items bought, snooze, or mark the task complete.")
+
+    return "\n".join(lines).strip()
+
+
+def _hf_notify_action_url_for_record(record_id):
+    safe_record_id = _hf_notify_one_line(record_id)
+    return f"https://homefax-dashboard.onrender.com/?record_id={safe_record_id}&v=store-notification"
+
+
+def _hf_notify_can_queue_alert(alert, include_acknowledged=False):
+    status = _hf_notify_one_line(alert.get("alert_status")).lower()
+    homeowner_action = _hf_notify_one_line(alert.get("homeowner_action")).lower()
+
+    if status in {"dismissed", "archived", "not_relevant", "snoozed"}:
+        return False
+
+    if homeowner_action in {"not_relevant", "snoozed", "completed_task", "bought_items"}:
+        return False
+
+    if status == "created":
+        return True
+
+    if include_acknowledged and status == "acknowledged":
+        return True
+
+    return False
+
+
+@app.get("/store-reminder-notifications/health")
+def store_reminder_notifications_health():
+    _hf_notify_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM store_reminder_notifications")
+            row = cursor.fetchone() or {}
+
+        return {
+            "success": True,
+            "service": "homefax_store_reminder_notification_engine",
+            "tables": {
+                "store_reminder_notifications": {
+                    "ok": True,
+                    "count": row.get("count", 0),
+                }
+            },
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "service": "homefax_store_reminder_notification_engine",
+            "error": str(exc),
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/store-reminder-notifications/queue-ready/{record_id}")
+def queue_ready_store_reminder_notifications(
+    record_id: str,
+    payload: _HFStoreReminderQueuePayload,
+):
+    """
+    Finds ready location/store reminder events and creates notification queue rows.
+
+    Pass 1 only queues notifications. Real email/SMS/push delivery comes later.
+    """
+    _hf_notify_ensure_schema()
+
+    safe_record_id = _hf_notify_one_line(record_id)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    conn = None
+
+    try:
+        if "_hf_loc_ensure_schema" in globals():
+            _hf_loc_ensure_schema()
+
+        conn = _hf_mon_get_connection()
+
+        queued = []
+        skipped = []
+        candidates = []
+
+        include_acknowledged = _hf_notify_yes(payload.include_acknowledged)
+        dry_run = _hf_notify_yes(payload.dry_run)
+        channel = _hf_notify_one_line(payload.channel or "in_app") or "in_app"
+        recipient = _hf_notify_one_line(payload.recipient)
+
+        with conn.cursor() as cursor:
+            if not _hf_notify_table_exists(cursor, "location_alert_events"):
+                raise RuntimeError("location_alert_events table does not exist.")
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM location_alert_events
+                WHERE record_id = %s
+                ORDER BY id DESC
+                """,
+                (safe_record_id,),
+            )
+
+            alert_rows = cursor.fetchall() or []
+
+            for alert_row in alert_rows:
+                alert = _hf_notify_alert_row_to_api(alert_row)
+                candidates.append(alert)
+
+                alert_id = int(alert.get("id") or 0)
+
+                if not alert_id:
+                    skipped.append({
+                        "reason": "missing_alert_id",
+                        "alert": alert,
+                    })
+                    continue
+
+                if not _hf_notify_can_queue_alert(alert, include_acknowledged=include_acknowledged):
+                    skipped.append({
+                        "reason": "alert_not_ready_or_already_handled",
+                        "alert_id": alert_id,
+                        "alert_status": alert.get("alert_status"),
+                        "homeowner_action": alert.get("homeowner_action"),
+                        "store_name": alert.get("store_name"),
+                    })
+                    continue
+
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM store_reminder_notifications
+                    WHERE record_id = %s
+                      AND location_alert_event_id = %s
+                      AND channel = %s
+                      AND notification_status IN ('queued', 'sent')
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        safe_record_id,
+                        alert_id,
+                        channel,
+                    ),
+                )
+
+                existing = cursor.fetchone()
+
+                if existing:
+                    skipped.append({
+                        "reason": "notification_already_exists",
+                        "alert_id": alert_id,
+                        "notification": _hf_notify_row_to_api(existing),
+                    })
+                    continue
+
+                title = _hf_notify_title_for_alert(alert)
+                body = _hf_notify_body_for_alert(alert)
+                action_url = _hf_notify_action_url_for_record(safe_record_id)
+
+                notification_preview = {
+                    "tenant_id": _hf_notify_one_line(payload.tenant_id or "lateef-home-inspection"),
+                    "property_id": _hf_notify_one_line(payload.property_id),
+                    "record_id": safe_record_id,
+                    "user_id": _hf_notify_one_line(payload.user_id),
+                    "location_alert_event_id": alert_id,
+                    "notification_type": "store_reminder",
+                    "channel": channel,
+                    "recipient": recipient,
+                    "title": title,
+                    "body": body,
+                    "action_url": action_url,
+                    "notification_status": "queued",
+                    "queued_at": _hf_notify_datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "alert": alert,
+                }
+
+                if dry_run:
+                    queued.append(notification_preview)
+                    continue
+
+                cursor.execute(
+                    """
+                    INSERT INTO store_reminder_notifications (
+                        tenant_id,
+                        property_id,
+                        record_id,
+                        user_id,
+                        location_alert_event_id,
+                        notification_type,
+                        channel,
+                        recipient,
+                        title,
+                        body,
+                        action_url,
+                        notification_status,
+                        queued_at,
+                        note
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        'queued',
+                        NOW(),
+                        %s
+                    )
+                    """,
+                    (
+                        notification_preview["tenant_id"],
+                        notification_preview["property_id"],
+                        notification_preview["record_id"],
+                        notification_preview["user_id"],
+                        notification_preview["location_alert_event_id"],
+                        notification_preview["notification_type"],
+                        notification_preview["channel"],
+                        notification_preview["recipient"],
+                        notification_preview["title"],
+                        notification_preview["body"],
+                        notification_preview["action_url"],
+                        "Queued by Store Reminder Notification Engine Pass 1.",
+                    ),
+                )
+
+                notification_id = cursor.lastrowid
+
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM store_reminder_notifications
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (notification_id,),
+                )
+
+                created = cursor.fetchone()
+
+                queued.append(_hf_notify_row_to_api(created))
+
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+
+        return {
+            "success": True,
+            "dry_run": dry_run,
+            "message": "Store reminder notification queue run completed.",
+            "record_id": safe_record_id,
+            "candidate_count": len(candidates),
+            "queued_count": len(queued),
+            "skipped_count": len(skipped),
+            "queued_notifications": queued,
+            "skipped": skipped,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "store_reminder_notification_queue_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/store-reminder-notifications/{record_id}")
+def get_store_reminder_notifications(record_id: str):
+    _hf_notify_ensure_schema()
+
+    safe_record_id = _hf_notify_one_line(record_id)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE record_id = %s
+                ORDER BY id DESC
+                """,
+                (safe_record_id,),
+            )
+
+            rows = cursor.fetchall() or []
+
+        notifications = [_hf_notify_row_to_api(row) for row in rows]
+
+        summary = {
+            "total": len(notifications),
+            "queued": 0,
+            "sent": 0,
+            "failed": 0,
+            "in_app": 0,
+            "email": 0,
+            "sms": 0,
+            "push": 0,
+        }
+
+        for notification in notifications:
+            status = _hf_notify_one_line(notification.get("notification_status")).lower()
+            channel = _hf_notify_one_line(notification.get("channel")).lower()
+
+            if status in summary:
+                summary[status] += 1
+
+            if channel in summary:
+                summary[channel] += 1
+
+        return {
+            "success": True,
+            "record_id": safe_record_id,
+            "notification_count": len(notifications),
+            "summary": summary,
+            "notifications": notifications,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "store_reminder_notifications_fetch_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/store-reminder-notification/{notification_id}/mark-sent")
+def mark_store_reminder_notification_sent(
+    notification_id: int,
+    payload: _HFStoreReminderNotificationStatusPayload,
+):
+    _hf_notify_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE store_reminder_notifications
+                SET notification_status = 'sent',
+                    provider_message_id = %s,
+                    note = %s,
+                    error_message = '',
+                    sent_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    _hf_notify_one_line(payload.provider_message_id),
+                    _hf_notify_one_line(payload.note),
+                    int(notification_id),
+                ),
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (int(notification_id),),
+            )
+
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "success": False,
+                    "error": "notification_not_found",
+                    "message": f"Notification {notification_id} was not found.",
+                },
+            )
+
+        return {
+            "success": True,
+            "message": "Store reminder notification marked sent.",
+            "notification": _hf_notify_row_to_api(row),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "notification_mark_sent_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/store-reminder-notification/{notification_id}/mark-failed")
+def mark_store_reminder_notification_failed(
+    notification_id: int,
+    payload: _HFStoreReminderNotificationStatusPayload,
+):
+    _hf_notify_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE store_reminder_notifications
+                SET notification_status = 'failed',
+                    error_message = %s,
+                    note = %s,
+                    failed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    _hf_notify_one_line(payload.error_message),
+                    _hf_notify_one_line(payload.note),
+                    int(notification_id),
+                ),
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (int(notification_id),),
+            )
+
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "success": False,
+                    "error": "notification_not_found",
+                    "message": f"Notification {notification_id} was not found.",
+                },
+            )
+
+        return {
+            "success": True,
+            "message": "Store reminder notification marked failed.",
+            "notification": _hf_notify_row_to_api(row),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "notification_mark_failed_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

@@ -27295,3 +27295,645 @@ def mark_store_reminder_notification_failed(
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Email/SMS Provider Send Pass 1
+# Dispatches queued store reminder notifications through
+# provider adapters. in_app is internal. email/sms require env.
+# ============================================================
+
+import os as _hf_send_os
+import json as _hf_send_json
+import base64 as _hf_send_base64
+import urllib.request as _hf_send_urllib_request
+import urllib.parse as _hf_send_urllib_parse
+import urllib.error as _hf_send_urllib_error
+from datetime import datetime as _hf_send_datetime
+
+
+class _HFStoreReminderSendPayload(BaseModel):
+    dry_run: str = "no"
+    force_resend: str = "no"
+    note: str = ""
+
+
+class _HFStoreReminderDispatchPayload(BaseModel):
+    channel: str = ""
+    dry_run: str = "no"
+    force_resend: str = "no"
+    limit: int = 25
+    note: str = ""
+
+
+def _hf_send_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_send_yes(value):
+    return _hf_send_one_line(value).lower() in {"yes", "true", "1", "enabled", "active"}
+
+
+def _hf_send_now_sql():
+    return _hf_send_datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hf_send_env_status():
+    sendgrid_key = _hf_send_os.getenv("SENDGRID_API_KEY", "")
+    email_from = _hf_send_os.getenv("HOMEFAX_EMAIL_FROM", "")
+
+    twilio_sid = _hf_send_os.getenv("TWILIO_ACCOUNT_SID", "")
+    twilio_token = _hf_send_os.getenv("TWILIO_AUTH_TOKEN", "")
+    twilio_from = _hf_send_os.getenv("TWILIO_FROM_NUMBER", "")
+
+    return {
+        "in_app": {
+            "available": True,
+            "reason": "internal_channel",
+        },
+        "email": {
+            "available": bool(sendgrid_key and email_from),
+            "provider": "sendgrid",
+            "has_api_key": bool(sendgrid_key),
+            "has_from_address": bool(email_from),
+        },
+        "sms": {
+            "available": bool(twilio_sid and twilio_token and twilio_from),
+            "provider": "twilio",
+            "has_account_sid": bool(twilio_sid),
+            "has_auth_token": bool(twilio_token),
+            "has_from_number": bool(twilio_from),
+        },
+        "push": {
+            "available": False,
+            "reason": "push_provider_not_configured_in_pass_1",
+        },
+    }
+
+
+def _hf_send_http_json(url, method, headers, payload, timeout=20):
+    data = _hf_send_json.dumps(payload).encode("utf-8")
+
+    request = _hf_send_urllib_request.Request(
+        url=url,
+        data=data,
+        method=method,
+        headers=headers,
+    )
+
+    try:
+        with _hf_send_urllib_request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            parsed = {}
+
+            if raw.strip():
+                try:
+                    parsed = _hf_send_json.loads(raw)
+                except Exception:
+                    parsed = {"raw": raw}
+
+            return {
+                "ok": 200 <= int(response.status) < 300,
+                "status_code": int(response.status),
+                "response": parsed,
+                "raw": raw,
+            }
+
+    except _hf_send_urllib_error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+
+        try:
+            parsed = _hf_send_json.loads(raw)
+        except Exception:
+            parsed = {"raw": raw}
+
+        return {
+            "ok": False,
+            "status_code": int(exc.code),
+            "response": parsed,
+            "raw": raw,
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status_code": 0,
+            "response": {},
+            "raw": "",
+            "error": str(exc),
+        }
+
+
+def _hf_send_sendgrid(notification):
+    api_key = _hf_send_os.getenv("SENDGRID_API_KEY", "")
+    email_from = _hf_send_os.getenv("HOMEFAX_EMAIL_FROM", "")
+    recipient = _hf_send_one_line(notification.get("recipient"))
+
+    if not api_key or not email_from:
+        return {
+            "ok": False,
+            "provider": "sendgrid",
+            "error": "sendgrid_not_configured",
+            "message": "SENDGRID_API_KEY and HOMEFAX_EMAIL_FROM are required for email sends.",
+        }
+
+    if not recipient or "@" not in recipient:
+        return {
+            "ok": False,
+            "provider": "sendgrid",
+            "error": "invalid_email_recipient",
+            "message": "A valid email recipient is required.",
+        }
+
+    title = _hf_send_one_line(notification.get("title") or "HomeFax notification")
+    body = str(notification.get("body") or "").strip()
+
+    payload = {
+        "personalizations": [
+            {
+                "to": [
+                    {
+                        "email": recipient,
+                    }
+                ],
+                "subject": title,
+            }
+        ],
+        "from": {
+            "email": email_from,
+        },
+        "content": [
+            {
+                "type": "text/plain",
+                "value": body or title,
+            }
+        ],
+    }
+
+    result = _hf_send_http_json(
+        url="https://api.sendgrid.com/v3/mail/send",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        payload=payload,
+    )
+
+    result["provider"] = "sendgrid"
+    return result
+
+
+def _hf_send_twilio_sms(notification):
+    account_sid = _hf_send_os.getenv("TWILIO_ACCOUNT_SID", "")
+    auth_token = _hf_send_os.getenv("TWILIO_AUTH_TOKEN", "")
+    from_number = _hf_send_os.getenv("TWILIO_FROM_NUMBER", "")
+    recipient = _hf_send_one_line(notification.get("recipient"))
+
+    if not account_sid or not auth_token or not from_number:
+        return {
+            "ok": False,
+            "provider": "twilio",
+            "error": "twilio_not_configured",
+            "message": "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER are required for SMS sends.",
+        }
+
+    if not recipient:
+        return {
+            "ok": False,
+            "provider": "twilio",
+            "error": "invalid_sms_recipient",
+            "message": "A valid SMS recipient is required.",
+        }
+
+    title = _hf_send_one_line(notification.get("title") or "HomeFax")
+    body = str(notification.get("body") or "").strip()
+
+    sms_body = f"{title}\n\n{body}".strip()
+
+    if len(sms_body) > 1400:
+        sms_body = sms_body[:1397] + "..."
+
+    form_body = _hf_send_urllib_parse.urlencode({
+        "From": from_number,
+        "To": recipient,
+        "Body": sms_body,
+    }).encode("utf-8")
+
+    auth_raw = f"{account_sid}:{auth_token}".encode("utf-8")
+    auth_header = _hf_send_base64.b64encode(auth_raw).decode("utf-8")
+
+    request = _hf_send_urllib_request.Request(
+        url=f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
+        data=form_body,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {auth_header}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+
+    try:
+        with _hf_send_urllib_request.urlopen(request, timeout=20) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+
+            try:
+                parsed = _hf_send_json.loads(raw)
+            except Exception:
+                parsed = {"raw": raw}
+
+            return {
+                "ok": 200 <= int(response.status) < 300,
+                "provider": "twilio",
+                "status_code": int(response.status),
+                "response": parsed,
+                "provider_message_id": parsed.get("sid") or "",
+                "raw": raw,
+            }
+
+    except _hf_send_urllib_error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+
+        try:
+            parsed = _hf_send_json.loads(raw)
+        except Exception:
+            parsed = {"raw": raw}
+
+        return {
+            "ok": False,
+            "provider": "twilio",
+            "status_code": int(exc.code),
+            "response": parsed,
+            "raw": raw,
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "provider": "twilio",
+            "status_code": 0,
+            "response": {},
+            "raw": "",
+            "error": str(exc),
+        }
+
+
+def _hf_send_dispatch_notification(notification):
+    channel = _hf_send_one_line(notification.get("channel")).lower() or "in_app"
+
+    if channel == "in_app":
+        return {
+            "ok": True,
+            "provider": "homefax_in_app",
+            "provider_message_id": f"in-app-{notification.get('id')}-{int(_hf_send_datetime.utcnow().timestamp())}",
+            "message": "In-app notification marked sent by HomeFax internal provider.",
+        }
+
+    if channel == "email":
+        return _hf_send_sendgrid(notification)
+
+    if channel == "sms":
+        return _hf_send_twilio_sms(notification)
+
+    return {
+        "ok": False,
+        "provider": channel or "unknown",
+        "error": "provider_not_supported",
+        "message": f"Channel '{channel}' is not supported in Email/SMS Provider Send Pass 1.",
+    }
+
+
+def _hf_send_update_notification_status(cursor, notification_id, result, note=""):
+    ok = bool(result.get("ok"))
+    provider_message_id = _hf_send_one_line(
+        result.get("provider_message_id") or
+        result.get("response", {}).get("id") if isinstance(result.get("response"), dict) else ""
+    )
+
+    if not provider_message_id:
+        provider_message_id = _hf_send_one_line(
+            result.get("response", {}).get("message_id") if isinstance(result.get("response"), dict) else ""
+        )
+
+    if ok:
+        cursor.execute(
+            """
+            UPDATE store_reminder_notifications
+            SET notification_status = 'sent',
+                provider_message_id = %s,
+                error_message = '',
+                note = %s,
+                sent_at = NOW(),
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                provider_message_id,
+                note or "Sent by Email/SMS Provider Send Pass 1.",
+                int(notification_id),
+            ),
+        )
+    else:
+        error_message = (
+            result.get("message") or
+            result.get("error") or
+            result.get("raw") or
+            "Provider send failed."
+        )
+
+        cursor.execute(
+            """
+            UPDATE store_reminder_notifications
+            SET notification_status = 'failed',
+                error_message = %s,
+                note = %s,
+                failed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                str(error_message)[:2000],
+                note or "Failed during Email/SMS Provider Send Pass 1.",
+                int(notification_id),
+            ),
+        )
+
+
+@app.get("/store-reminder-notifications/provider-health")
+def store_reminder_notification_provider_health():
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    return {
+        "success": True,
+        "service": "homefax_email_sms_provider_send",
+        "providers": _hf_send_env_status(),
+    }
+
+
+@app.post("/store-reminder-notification/{notification_id}/send")
+def send_store_reminder_notification(
+    notification_id: int,
+    payload: _HFStoreReminderSendPayload,
+):
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    safe_notification_id = int(notification_id or 0)
+
+    if safe_notification_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_notification_id",
+                "message": "notification_id must be a positive integer.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_notification_id,),
+            )
+
+            notification = cursor.fetchone()
+
+            if not notification:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "notification_not_found",
+                        "message": f"Notification {safe_notification_id} was not found.",
+                    },
+                )
+
+            notification_api = _hf_notify_row_to_api(notification) if "_hf_notify_row_to_api" in globals() else dict(notification)
+
+            status = _hf_send_one_line(notification_api.get("notification_status")).lower()
+
+            if status == "sent" and not _hf_send_yes(payload.force_resend):
+                return {
+                    "success": True,
+                    "sent": False,
+                    "reason": "already_sent",
+                    "notification": notification_api,
+                }
+
+            if _hf_send_yes(payload.dry_run):
+                result = {
+                    "ok": True,
+                    "dry_run": True,
+                    "provider": _hf_send_one_line(notification_api.get("channel") or "in_app"),
+                    "message": "Dry-run only. Notification was not sent or updated.",
+                }
+
+                return {
+                    "success": True,
+                    "sent": False,
+                    "dry_run": True,
+                    "notification": notification_api,
+                    "provider_result": result,
+                }
+
+            result = _hf_send_dispatch_notification(notification_api)
+
+            _hf_send_update_notification_status(
+                cursor,
+                safe_notification_id,
+                result,
+                note=_hf_send_one_line(payload.note),
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_notification_id,),
+            )
+
+            updated = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": bool(result.get("ok")),
+            "sent": bool(result.get("ok")),
+            "notification": _hf_notify_row_to_api(updated) if "_hf_notify_row_to_api" in globals() else dict(updated or {}),
+            "provider_result": result,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "store_reminder_notification_send_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/store-reminder-notifications/dispatch-ready/{record_id}")
+def dispatch_ready_store_reminder_notifications(
+    record_id: str,
+    payload: _HFStoreReminderDispatchPayload,
+):
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    safe_record_id = _hf_send_one_line(record_id)
+    safe_channel = _hf_send_one_line(payload.channel).lower()
+    safe_limit = max(1, min(int(payload.limit or 25), 100))
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        dispatched = []
+        skipped = []
+
+        with conn.cursor() as cursor:
+            params = [safe_record_id]
+
+            channel_clause = ""
+
+            if safe_channel:
+                channel_clause = "AND channel = %s"
+                params.append(safe_channel)
+
+            params.append(safe_limit)
+
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE record_id = %s
+                  AND notification_status = 'queued'
+                  {channel_clause}
+                ORDER BY id ASC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+
+            rows = cursor.fetchall() or []
+
+            for row in rows:
+                notification = _hf_notify_row_to_api(row) if "_hf_notify_row_to_api" in globals() else dict(row)
+                notification_id = int(notification.get("id") or 0)
+
+                if not notification_id:
+                    skipped.append({
+                        "reason": "missing_notification_id",
+                        "notification": notification,
+                    })
+                    continue
+
+                if _hf_send_yes(payload.dry_run):
+                    dispatched.append({
+                        "dry_run": True,
+                        "notification": notification,
+                        "provider_preview": {
+                            "channel": notification.get("channel"),
+                            "title": notification.get("title"),
+                            "recipient": notification.get("recipient"),
+                        },
+                    })
+                    continue
+
+                result = _hf_send_dispatch_notification(notification)
+
+                _hf_send_update_notification_status(
+                    cursor,
+                    notification_id,
+                    result,
+                    note=_hf_send_one_line(payload.note),
+                )
+
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM store_reminder_notifications
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (notification_id,),
+                )
+
+                updated = cursor.fetchone()
+
+                dispatched.append({
+                    "notification": _hf_notify_row_to_api(updated) if "_hf_notify_row_to_api" in globals() else dict(updated or {}),
+                    "provider_result": result,
+                })
+
+        if _hf_send_yes(payload.dry_run):
+            conn.rollback()
+        else:
+            conn.commit()
+
+        return {
+            "success": True,
+            "dry_run": _hf_send_yes(payload.dry_run),
+            "record_id": safe_record_id,
+            "channel": safe_channel or "all",
+            "dispatch_count": len(dispatched),
+            "skipped_count": len(skipped),
+            "dispatched": dispatched,
+            "skipped": skipped,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "store_reminder_dispatch_ready_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

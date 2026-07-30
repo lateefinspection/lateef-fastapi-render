@@ -27937,3 +27937,39 @@ def dispatch_ready_store_reminder_notifications(
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Email/SMS Provider Health Route Fix
+# Non-conflicting provider health endpoint because
+# /store-reminder-notifications/{record_id} catches provider-health.
+# ============================================================
+
+@app.get("/store-reminder-notification-provider-health")
+def store_reminder_notification_provider_health_v2():
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    return {
+        "success": True,
+        "service": "homefax_email_sms_provider_send",
+        "providers": _hf_send_env_status(),
+    }
+
+
+# ============================================================
+# HomeFax Email/SMS Provider Health Route Fix
+# Non-conflicting provider health endpoint because
+# /store-reminder-notifications/{record_id} catches provider-health.
+# ============================================================
+
+@app.get("/store-reminder-notification-provider-health")
+def store_reminder_notification_provider_health_v2():
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    return {
+        "success": True,
+        "service": "homefax_email_sms_provider_send",
+        "providers": _hf_send_env_status(),
+    }
+

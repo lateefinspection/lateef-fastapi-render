@@ -29147,3 +29147,706 @@ def _hf_pref_ensure_schema():
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Notification Preference Enforcement Pass 1
+# Enforces channel toggles, category toggles, recipients, and
+# quiet hours before dispatching notifications.
+# ============================================================
+
+from datetime import datetime as _hf_enforce_datetime
+from datetime import time as _hf_enforce_time
+from zoneinfo import ZoneInfo as _hf_enforce_ZoneInfo
+
+
+class _HFStoreReminderPreferenceSendPayload(BaseModel):
+    user_id: str = "homeowner-smoke-test"
+    dry_run: str = "no"
+    force_resend: str = "no"
+    force_send: str = "no"
+    note: str = ""
+
+
+class _HFStoreReminderPreferenceDispatchPayload(BaseModel):
+    user_id: str = "homeowner-smoke-test"
+    channel: str = ""
+    dry_run: str = "no"
+    force_resend: str = "no"
+    force_send: str = "no"
+    limit: int = 25
+    note: str = ""
+
+
+def _hf_enforce_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_enforce_yes(value):
+    return _hf_enforce_one_line(value).lower() in {
+        "yes",
+        "true",
+        "1",
+        "enabled",
+        "active",
+        "on",
+    }
+
+
+def _hf_enforce_parse_hhmm(value, fallback):
+    raw = _hf_enforce_one_line(value or fallback)
+
+    try:
+        parts = raw.split(":")
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+
+        if hour < 0 or hour > 23:
+            raise ValueError("Invalid hour")
+
+        if minute < 0 or minute > 59:
+            raise ValueError("Invalid minute")
+
+        return _hf_enforce_time(hour=hour, minute=minute)
+    except Exception:
+        fallback_parts = str(fallback).split(":")
+        return _hf_enforce_time(
+            hour=int(fallback_parts[0]),
+            minute=int(fallback_parts[1]) if len(fallback_parts) > 1 else 0,
+        )
+
+
+def _hf_enforce_now_for_timezone(timezone_name):
+    safe_timezone = _hf_enforce_one_line(timezone_name or "America/Chicago")
+
+    try:
+        return _hf_enforce_datetime.now(_hf_enforce_ZoneInfo(safe_timezone))
+    except Exception:
+        return _hf_enforce_datetime.now(_hf_enforce_ZoneInfo("America/Chicago"))
+
+
+def _hf_enforce_is_quiet_now(preferences):
+    quiet_enabled = _hf_enforce_yes(preferences.get("quiet_hours_enabled"))
+
+    if not quiet_enabled:
+        return {
+            "quiet_now": False,
+            "quiet_hours_enabled": False,
+            "reason": "quiet_hours_disabled",
+        }
+
+    timezone_name = preferences.get("timezone") or "America/Chicago"
+    now_local = _hf_enforce_now_for_timezone(timezone_name)
+    current_time = now_local.time().replace(second=0, microsecond=0)
+
+    quiet_start = _hf_enforce_parse_hhmm(
+        preferences.get("quiet_hours_start"),
+        "21:00",
+    )
+    quiet_end = _hf_enforce_parse_hhmm(
+        preferences.get("quiet_hours_end"),
+        "08:00",
+    )
+
+    if quiet_start <= quiet_end:
+        quiet_now = quiet_start <= current_time <= quiet_end
+    else:
+        quiet_now = current_time >= quiet_start or current_time <= quiet_end
+
+    return {
+        "quiet_now": bool(quiet_now),
+        "quiet_hours_enabled": True,
+        "quiet_hours_start": preferences.get("quiet_hours_start") or "21:00",
+        "quiet_hours_end": preferences.get("quiet_hours_end") or "08:00",
+        "timezone": timezone_name,
+        "local_time": now_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
+    }
+
+
+def _hf_enforce_get_preferences(record_id, user_id):
+    if "_hf_pref_ensure_schema" in globals():
+        _hf_pref_ensure_schema()
+
+    safe_record_id = _hf_enforce_one_line(record_id)
+    safe_user_id = _hf_enforce_one_line(user_id or "homeowner-smoke-test")
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM notification_preferences
+                WHERE record_id = %s
+                  AND user_id = %s
+                LIMIT 1
+                """,
+                (
+                    safe_record_id,
+                    safe_user_id,
+                ),
+            )
+
+            row = cursor.fetchone()
+
+        if row:
+            return _hf_pref_row_to_api(row) if "_hf_pref_row_to_api" in globals() else dict(row)
+
+        if "_hf_pref_default" in globals():
+            return _hf_pref_default(safe_record_id, safe_user_id)
+
+        return {
+            "record_id": safe_record_id,
+            "user_id": safe_user_id,
+            "in_app_enabled": "yes",
+            "email_enabled": "no",
+            "sms_enabled": "no",
+            "push_enabled": "no",
+            "store_reminders_enabled": "yes",
+            "maintenance_reminders_enabled": "yes",
+            "weather_alerts_enabled": "yes",
+            "device_alerts_enabled": "yes",
+            "quiet_hours_enabled": "no",
+            "quiet_hours_start": "21:00",
+            "quiet_hours_end": "08:00",
+            "timezone": "America/Chicago",
+            "email_recipient": "",
+            "sms_recipient": "",
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_enforce_channel_field(channel):
+    safe_channel = _hf_enforce_one_line(channel).lower() or "in_app"
+
+    if safe_channel == "in_app":
+        return "in_app_enabled"
+
+    if safe_channel == "email":
+        return "email_enabled"
+
+    if safe_channel == "sms":
+        return "sms_enabled"
+
+    if safe_channel == "push":
+        return "push_enabled"
+
+    return ""
+
+
+def _hf_enforce_expected_recipient(channel, notification, preferences):
+    safe_channel = _hf_enforce_one_line(channel).lower() or "in_app"
+
+    if safe_channel == "email":
+        return _hf_enforce_one_line(
+            preferences.get("email_recipient") or notification.get("recipient")
+        )
+
+    if safe_channel == "sms":
+        return _hf_enforce_one_line(
+            preferences.get("sms_recipient") or notification.get("recipient")
+        )
+
+    if safe_channel == "in_app":
+        return _hf_enforce_one_line(notification.get("recipient") or "dashboard")
+
+    return _hf_enforce_one_line(notification.get("recipient"))
+
+
+def _hf_enforce_validate_notification(notification, preferences, force_send=False):
+    channel = _hf_enforce_one_line(notification.get("channel")).lower() or "in_app"
+    notification_type = _hf_enforce_one_line(
+        notification.get("notification_type") or "store_reminder"
+    ).lower()
+
+    checks = []
+
+    if notification_type == "store_reminder":
+        store_allowed = _hf_enforce_yes(preferences.get("store_reminders_enabled", "yes"))
+        checks.append({
+            "check": "store_reminders_enabled",
+            "allowed": store_allowed,
+            "value": preferences.get("store_reminders_enabled"),
+        })
+
+        if not store_allowed and not force_send:
+            return {
+                "allowed": False,
+                "reason": "store_reminders_disabled",
+                "channel": channel,
+                "notification_type": notification_type,
+                "checks": checks,
+                "preferences": preferences,
+            }
+
+    channel_field = _hf_enforce_channel_field(channel)
+
+    if not channel_field:
+        return {
+            "allowed": False,
+            "reason": "unsupported_channel",
+            "channel": channel,
+            "notification_type": notification_type,
+            "checks": checks,
+            "preferences": preferences,
+        }
+
+    channel_allowed = _hf_enforce_yes(preferences.get(channel_field, "no"))
+
+    checks.append({
+        "check": channel_field,
+        "allowed": channel_allowed,
+        "value": preferences.get(channel_field),
+    })
+
+    if not channel_allowed and not force_send:
+        return {
+            "allowed": False,
+            "reason": f"{channel}_disabled_by_preferences",
+            "channel": channel,
+            "notification_type": notification_type,
+            "checks": checks,
+            "preferences": preferences,
+        }
+
+    expected_recipient = _hf_enforce_expected_recipient(channel, notification, preferences)
+
+    if channel == "email":
+        if not expected_recipient or "@" not in expected_recipient:
+            return {
+                "allowed": False,
+                "reason": "missing_or_invalid_email_recipient",
+                "channel": channel,
+                "notification_type": notification_type,
+                "checks": checks,
+                "preferences": preferences,
+            }
+
+    if channel == "sms":
+        if not expected_recipient:
+            return {
+                "allowed": False,
+                "reason": "missing_sms_recipient",
+                "channel": channel,
+                "notification_type": notification_type,
+                "checks": checks,
+                "preferences": preferences,
+            }
+
+    quiet_state = _hf_enforce_is_quiet_now(preferences)
+    checks.append({
+        "check": "quiet_hours",
+        "quiet_now": quiet_state.get("quiet_now"),
+        "quiet_hours_enabled": quiet_state.get("quiet_hours_enabled"),
+        "local_time": quiet_state.get("local_time"),
+    })
+
+    if quiet_state.get("quiet_now") and not force_send:
+        return {
+            "allowed": False,
+            "reason": "blocked_by_quiet_hours",
+            "channel": channel,
+            "notification_type": notification_type,
+            "checks": checks,
+            "preferences": preferences,
+            "quiet_state": quiet_state,
+        }
+
+    enriched_notification = dict(notification)
+    enriched_notification["recipient"] = expected_recipient
+
+    return {
+        "allowed": True,
+        "reason": "allowed_by_preferences",
+        "channel": channel,
+        "notification_type": notification_type,
+        "recipient": expected_recipient,
+        "notification": enriched_notification,
+        "checks": checks,
+        "preferences": preferences,
+        "quiet_state": quiet_state,
+    }
+
+
+def _hf_enforce_update_blocked_notification(cursor, notification_id, reason, note=""):
+    cursor.execute(
+        """
+        UPDATE store_reminder_notifications
+        SET notification_status = 'failed',
+            error_message = %s,
+            note = %s,
+            failed_at = NOW(),
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (
+            f"Blocked by notification preferences: {reason}",
+            note or f"Blocked by notification preferences: {reason}",
+            int(notification_id),
+        ),
+    )
+
+
+@app.post("/store-reminder-notification/{notification_id}/send-with-preferences")
+def send_store_reminder_notification_with_preferences(
+    notification_id: int,
+    payload: _HFStoreReminderPreferenceSendPayload,
+):
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    safe_notification_id = int(notification_id or 0)
+    safe_user_id = _hf_enforce_one_line(payload.user_id or "homeowner-smoke-test")
+
+    if safe_notification_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "invalid_notification_id",
+                "message": "notification_id must be a positive integer.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_notification_id,),
+            )
+
+            row = cursor.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "notification_not_found",
+                        "message": f"Notification {safe_notification_id} was not found.",
+                    },
+                )
+
+            notification = _hf_notify_row_to_api(row) if "_hf_notify_row_to_api" in globals() else dict(row)
+            status = _hf_enforce_one_line(notification.get("notification_status")).lower()
+
+            if status == "sent" and not _hf_enforce_yes(payload.force_resend):
+                return {
+                    "success": True,
+                    "sent": False,
+                    "reason": "already_sent",
+                    "notification": notification,
+                }
+
+            preferences = _hf_enforce_get_preferences(
+                notification.get("record_id"),
+                safe_user_id,
+            )
+
+            validation = _hf_enforce_validate_notification(
+                notification,
+                preferences,
+                force_send=_hf_enforce_yes(payload.force_send),
+            )
+
+            if not validation.get("allowed"):
+                if _hf_enforce_yes(payload.dry_run):
+                    return {
+                        "success": True,
+                        "sent": False,
+                        "dry_run": True,
+                        "blocked": True,
+                        "reason": validation.get("reason"),
+                        "notification": notification,
+                        "validation": validation,
+                    }
+
+                _hf_enforce_update_blocked_notification(
+                    cursor,
+                    safe_notification_id,
+                    validation.get("reason"),
+                    note=_hf_enforce_one_line(payload.note),
+                )
+
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM store_reminder_notifications
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (safe_notification_id,),
+                )
+
+                updated = cursor.fetchone()
+                conn.commit()
+
+                return {
+                    "success": True,
+                    "sent": False,
+                    "blocked": True,
+                    "reason": validation.get("reason"),
+                    "notification": _hf_notify_row_to_api(updated) if "_hf_notify_row_to_api" in globals() else dict(updated or {}),
+                    "validation": validation,
+                }
+
+            dispatch_notification = validation.get("notification") or notification
+
+            if _hf_enforce_yes(payload.dry_run):
+                return {
+                    "success": True,
+                    "sent": False,
+                    "dry_run": True,
+                    "blocked": False,
+                    "reason": "dry_run_allowed_by_preferences",
+                    "notification": dispatch_notification,
+                    "validation": validation,
+                }
+
+            result = _hf_send_dispatch_notification(dispatch_notification)
+
+            _hf_send_update_notification_status(
+                cursor,
+                safe_notification_id,
+                result,
+                note=_hf_enforce_one_line(payload.note),
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_notification_id,),
+            )
+
+            updated = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": bool(result.get("ok")),
+            "sent": bool(result.get("ok")),
+            "blocked": False,
+            "notification": _hf_notify_row_to_api(updated) if "_hf_notify_row_to_api" in globals() else dict(updated or {}),
+            "validation": validation,
+            "provider_result": result,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "send_with_preferences_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/store-reminder-notifications/dispatch-ready-with-preferences/{record_id}")
+def dispatch_ready_store_reminder_notifications_with_preferences(
+    record_id: str,
+    payload: _HFStoreReminderPreferenceDispatchPayload,
+):
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    safe_record_id = _hf_enforce_one_line(record_id)
+    safe_user_id = _hf_enforce_one_line(payload.user_id or "homeowner-smoke-test")
+    safe_channel = _hf_enforce_one_line(payload.channel).lower()
+    safe_limit = max(1, min(int(payload.limit or 25), 100))
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        dispatched = []
+        blocked = []
+        skipped = []
+
+        preferences = _hf_enforce_get_preferences(safe_record_id, safe_user_id)
+
+        with conn.cursor() as cursor:
+            params = [safe_record_id]
+
+            channel_clause = ""
+
+            if safe_channel:
+                channel_clause = "AND channel = %s"
+                params.append(safe_channel)
+
+            params.append(safe_limit)
+
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE record_id = %s
+                  AND notification_status = 'queued'
+                  {channel_clause}
+                ORDER BY id ASC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+
+            rows = cursor.fetchall() or []
+
+            for row in rows:
+                notification = _hf_notify_row_to_api(row) if "_hf_notify_row_to_api" in globals() else dict(row)
+                notification_id = int(notification.get("id") or 0)
+
+                if not notification_id:
+                    skipped.append({
+                        "reason": "missing_notification_id",
+                        "notification": notification,
+                    })
+                    continue
+
+                validation = _hf_enforce_validate_notification(
+                    notification,
+                    preferences,
+                    force_send=_hf_enforce_yes(payload.force_send),
+                )
+
+                if not validation.get("allowed"):
+                    blocked_item = {
+                        "notification": notification,
+                        "reason": validation.get("reason"),
+                        "validation": validation,
+                    }
+
+                    blocked.append(blocked_item)
+
+                    if not _hf_enforce_yes(payload.dry_run):
+                        _hf_enforce_update_blocked_notification(
+                            cursor,
+                            notification_id,
+                            validation.get("reason"),
+                            note=_hf_enforce_one_line(payload.note),
+                        )
+
+                    continue
+
+                dispatch_notification = validation.get("notification") or notification
+
+                if _hf_enforce_yes(payload.dry_run):
+                    dispatched.append({
+                        "dry_run": True,
+                        "notification": dispatch_notification,
+                        "validation": validation,
+                        "provider_preview": {
+                            "channel": dispatch_notification.get("channel"),
+                            "title": dispatch_notification.get("title"),
+                            "recipient": dispatch_notification.get("recipient"),
+                        },
+                    })
+                    continue
+
+                result = _hf_send_dispatch_notification(dispatch_notification)
+
+                _hf_send_update_notification_status(
+                    cursor,
+                    notification_id,
+                    result,
+                    note=_hf_enforce_one_line(payload.note),
+                )
+
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM store_reminder_notifications
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (notification_id,),
+                )
+
+                updated = cursor.fetchone()
+
+                dispatched.append({
+                    "notification": _hf_notify_row_to_api(updated) if "_hf_notify_row_to_api" in globals() else dict(updated or {}),
+                    "validation": validation,
+                    "provider_result": result,
+                })
+
+        if _hf_enforce_yes(payload.dry_run):
+            conn.rollback()
+        else:
+            conn.commit()
+
+        return {
+            "success": True,
+            "dry_run": _hf_enforce_yes(payload.dry_run),
+            "record_id": safe_record_id,
+            "user_id": safe_user_id,
+            "channel": safe_channel or "all",
+            "dispatch_count": len(dispatched),
+            "blocked_count": len(blocked),
+            "skipped_count": len(skipped),
+            "preferences": preferences,
+            "dispatched": dispatched,
+            "blocked": blocked,
+            "skipped": skipped,
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "dispatch_ready_with_preferences_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

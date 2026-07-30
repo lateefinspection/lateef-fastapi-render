@@ -29377,7 +29377,7 @@ def _hf_enforce_validate_notification(notification, preferences, force_send=Fals
             "value": preferences.get("store_reminders_enabled"),
         })
 
-        if not store_allowed and not force_send:
+        if not store_allowed:
             return {
                 "allowed": False,
                 "reason": "store_reminders_disabled",
@@ -29407,7 +29407,7 @@ def _hf_enforce_validate_notification(notification, preferences, force_send=Fals
         "value": preferences.get(channel_field),
     })
 
-    if not channel_allowed and not force_send:
+    if not channel_allowed:
         return {
             "allowed": False,
             "reason": f"{channel}_disabled_by_preferences",

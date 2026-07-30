@@ -27973,3 +27973,527 @@ def store_reminder_notification_provider_health_v2():
         "providers": _hf_send_env_status(),
     }
 
+
+# ============================================================
+# HomeFax Notification Preferences Pass 1
+# Stores homeowner/admin notification channel preferences,
+# quiet hours, and alert category toggles.
+# ============================================================
+
+from typing import Optional as _hf_pref_Optional
+from datetime import datetime as _hf_pref_datetime
+
+
+class _HFNotificationPreferencesPayload(BaseModel):
+    tenant_id: str = "lateef-home-inspection"
+    property_id: str = ""
+    user_id: str = "homeowner-smoke-test"
+
+    in_app_enabled: str = "yes"
+    email_enabled: str = "no"
+    sms_enabled: str = "no"
+    push_enabled: str = "no"
+
+    store_reminders_enabled: str = "yes"
+    maintenance_reminders_enabled: str = "yes"
+    weather_alerts_enabled: str = "yes"
+    device_alerts_enabled: str = "yes"
+
+    quiet_hours_enabled: str = "no"
+    quiet_hours_start: str = "21:00"
+    quiet_hours_end: str = "08:00"
+    timezone: str = "America/Chicago"
+
+    email_recipient: str = ""
+    sms_recipient: str = ""
+
+    updated_by: str = "homeowner-smoke-test"
+    notes: str = ""
+
+
+def _hf_pref_one_line(value):
+    return str(value or "").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _hf_pref_yes(value):
+    return _hf_pref_one_line(value).lower() in {"yes", "true", "1", "enabled", "active", "on"}
+
+
+def _hf_pref_yes_no(value, default="no"):
+    raw = _hf_pref_one_line(value).lower()
+
+    if raw in {"yes", "true", "1", "enabled", "active", "on"}:
+        return "yes"
+
+    if raw in {"no", "false", "0", "disabled", "inactive", "off"}:
+        return "no"
+
+    return default
+
+
+def _hf_pref_now_sql():
+    return _hf_pref_datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hf_pref_dt_to_iso(value):
+    if value is None:
+        return None
+
+    try:
+        return value.isoformat()
+    except Exception:
+        return str(value)
+
+
+def _hf_pref_ensure_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_preferences (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+                    tenant_id VARCHAR(128) NOT NULL DEFAULT 'lateef-home-inspection',
+                    property_id VARCHAR(255) NOT NULL DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL,
+                    user_id VARCHAR(255) NOT NULL DEFAULT '',
+
+                    in_app_enabled VARCHAR(16) NOT NULL DEFAULT 'yes',
+                    email_enabled VARCHAR(16) NOT NULL DEFAULT 'no',
+                    sms_enabled VARCHAR(16) NOT NULL DEFAULT 'no',
+                    push_enabled VARCHAR(16) NOT NULL DEFAULT 'no',
+
+                    store_reminders_enabled VARCHAR(16) NOT NULL DEFAULT 'yes',
+                    maintenance_reminders_enabled VARCHAR(16) NOT NULL DEFAULT 'yes',
+                    weather_alerts_enabled VARCHAR(16) NOT NULL DEFAULT 'yes',
+                    device_alerts_enabled VARCHAR(16) NOT NULL DEFAULT 'yes',
+
+                    quiet_hours_enabled VARCHAR(16) NOT NULL DEFAULT 'no',
+                    quiet_hours_start VARCHAR(16) NOT NULL DEFAULT '21:00',
+                    quiet_hours_end VARCHAR(16) NOT NULL DEFAULT '08:00',
+                    timezone VARCHAR(128) NOT NULL DEFAULT 'America/Chicago',
+
+                    email_recipient VARCHAR(255) NOT NULL DEFAULT '',
+                    sms_recipient VARCHAR(64) NOT NULL DEFAULT '',
+
+                    updated_by VARCHAR(255) NOT NULL DEFAULT '',
+                    notes TEXT,
+
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+                    UNIQUE KEY uniq_notification_pref_record_user (record_id, user_id),
+                    INDEX idx_notification_pref_record_id (record_id),
+                    INDEX idx_notification_pref_user_id (user_id)
+                )
+                """
+            )
+
+        conn.commit()
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_pref_row_to_api(row):
+    item = dict(row or {})
+
+    for field in ["created_at", "updated_at"]:
+        if field in item:
+            item[field] = _hf_pref_dt_to_iso(item.get(field))
+
+    item["channel_summary"] = {
+        "in_app": item.get("in_app_enabled") == "yes",
+        "email": item.get("email_enabled") == "yes",
+        "sms": item.get("sms_enabled") == "yes",
+        "push": item.get("push_enabled") == "yes",
+    }
+
+    item["alert_summary"] = {
+        "store_reminders": item.get("store_reminders_enabled") == "yes",
+        "maintenance_reminders": item.get("maintenance_reminders_enabled") == "yes",
+        "weather_alerts": item.get("weather_alerts_enabled") == "yes",
+        "device_alerts": item.get("device_alerts_enabled") == "yes",
+    }
+
+    item["quiet_hours_summary"] = {
+        "enabled": item.get("quiet_hours_enabled") == "yes",
+        "start": item.get("quiet_hours_start") or "21:00",
+        "end": item.get("quiet_hours_end") or "08:00",
+        "timezone": item.get("timezone") or "America/Chicago",
+    }
+
+    return item
+
+
+def _hf_pref_default(record_id, user_id="homeowner-smoke-test"):
+    return {
+        "id": None,
+        "tenant_id": "lateef-home-inspection",
+        "property_id": "",
+        "record_id": _hf_pref_one_line(record_id),
+        "user_id": _hf_pref_one_line(user_id or "homeowner-smoke-test"),
+
+        "in_app_enabled": "yes",
+        "email_enabled": "no",
+        "sms_enabled": "no",
+        "push_enabled": "no",
+
+        "store_reminders_enabled": "yes",
+        "maintenance_reminders_enabled": "yes",
+        "weather_alerts_enabled": "yes",
+        "device_alerts_enabled": "yes",
+
+        "quiet_hours_enabled": "no",
+        "quiet_hours_start": "21:00",
+        "quiet_hours_end": "08:00",
+        "timezone": "America/Chicago",
+
+        "email_recipient": "",
+        "sms_recipient": "",
+
+        "updated_by": "",
+        "notes": "",
+        "created_at": None,
+        "updated_at": None,
+
+        "channel_summary": {
+            "in_app": True,
+            "email": False,
+            "sms": False,
+            "push": False,
+        },
+        "alert_summary": {
+            "store_reminders": True,
+            "maintenance_reminders": True,
+            "weather_alerts": True,
+            "device_alerts": True,
+        },
+        "quiet_hours_summary": {
+            "enabled": False,
+            "start": "21:00",
+            "end": "08:00",
+            "timezone": "America/Chicago",
+        },
+    }
+
+
+@app.get("/notification-preferences-health")
+def notification_preferences_health():
+    _hf_pref_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM notification_preferences")
+            row = cursor.fetchone() or {}
+
+        return {
+            "success": True,
+            "service": "homefax_notification_preferences",
+            "tables": {
+                "notification_preferences": {
+                    "ok": True,
+                    "count": row.get("count", 0),
+                }
+            },
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "service": "homefax_notification_preferences",
+            "error": str(exc),
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/notification-preferences/{record_id}")
+def get_notification_preferences(
+    record_id: str,
+    user_id: str = "homeowner-smoke-test",
+):
+    _hf_pref_ensure_schema()
+
+    safe_record_id = _hf_pref_one_line(record_id)
+    safe_user_id = _hf_pref_one_line(user_id or "homeowner-smoke-test")
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM notification_preferences
+                WHERE record_id = %s
+                  AND user_id = %s
+                LIMIT 1
+                """,
+                (
+                    safe_record_id,
+                    safe_user_id,
+                ),
+            )
+
+            row = cursor.fetchone()
+
+        if not row:
+            return {
+                "success": True,
+                "exists": False,
+                "record_id": safe_record_id,
+                "user_id": safe_user_id,
+                "preferences": _hf_pref_default(safe_record_id, safe_user_id),
+            }
+
+        return {
+            "success": True,
+            "exists": True,
+            "record_id": safe_record_id,
+            "user_id": safe_user_id,
+            "preferences": _hf_pref_row_to_api(row),
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "notification_preferences_fetch_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.put("/notification-preferences/{record_id}")
+def upsert_notification_preferences(
+    record_id: str,
+    payload: _HFNotificationPreferencesPayload,
+):
+    _hf_pref_ensure_schema()
+
+    safe_record_id = _hf_pref_one_line(record_id)
+    safe_user_id = _hf_pref_one_line(payload.user_id or "homeowner-smoke-test")
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+            },
+        )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        pref_data = {
+            "tenant_id": _hf_pref_one_line(payload.tenant_id or "lateef-home-inspection"),
+            "property_id": _hf_pref_one_line(payload.property_id),
+            "record_id": safe_record_id,
+            "user_id": safe_user_id,
+
+            "in_app_enabled": _hf_pref_yes_no(payload.in_app_enabled, "yes"),
+            "email_enabled": _hf_pref_yes_no(payload.email_enabled, "no"),
+            "sms_enabled": _hf_pref_yes_no(payload.sms_enabled, "no"),
+            "push_enabled": _hf_pref_yes_no(payload.push_enabled, "no"),
+
+            "store_reminders_enabled": _hf_pref_yes_no(payload.store_reminders_enabled, "yes"),
+            "maintenance_reminders_enabled": _hf_pref_yes_no(payload.maintenance_reminders_enabled, "yes"),
+            "weather_alerts_enabled": _hf_pref_yes_no(payload.weather_alerts_enabled, "yes"),
+            "device_alerts_enabled": _hf_pref_yes_no(payload.device_alerts_enabled, "yes"),
+
+            "quiet_hours_enabled": _hf_pref_yes_no(payload.quiet_hours_enabled, "no"),
+            "quiet_hours_start": _hf_pref_one_line(payload.quiet_hours_start or "21:00"),
+            "quiet_hours_end": _hf_pref_one_line(payload.quiet_hours_end or "08:00"),
+            "timezone": _hf_pref_one_line(payload.timezone or "America/Chicago"),
+
+            "email_recipient": _hf_pref_one_line(payload.email_recipient),
+            "sms_recipient": _hf_pref_one_line(payload.sms_recipient),
+
+            "updated_by": _hf_pref_one_line(payload.updated_by),
+            "notes": _hf_pref_one_line(payload.notes),
+        }
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO notification_preferences (
+                    tenant_id,
+                    property_id,
+                    record_id,
+                    user_id,
+
+                    in_app_enabled,
+                    email_enabled,
+                    sms_enabled,
+                    push_enabled,
+
+                    store_reminders_enabled,
+                    maintenance_reminders_enabled,
+                    weather_alerts_enabled,
+                    device_alerts_enabled,
+
+                    quiet_hours_enabled,
+                    quiet_hours_start,
+                    quiet_hours_end,
+                    timezone,
+
+                    email_recipient,
+                    sms_recipient,
+
+                    updated_by,
+                    notes
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s
+                )
+                ON DUPLICATE KEY UPDATE
+                    tenant_id = VALUES(tenant_id),
+                    property_id = VALUES(property_id),
+
+                    in_app_enabled = VALUES(in_app_enabled),
+                    email_enabled = VALUES(email_enabled),
+                    sms_enabled = VALUES(sms_enabled),
+                    push_enabled = VALUES(push_enabled),
+
+                    store_reminders_enabled = VALUES(store_reminders_enabled),
+                    maintenance_reminders_enabled = VALUES(maintenance_reminders_enabled),
+                    weather_alerts_enabled = VALUES(weather_alerts_enabled),
+                    device_alerts_enabled = VALUES(device_alerts_enabled),
+
+                    quiet_hours_enabled = VALUES(quiet_hours_enabled),
+                    quiet_hours_start = VALUES(quiet_hours_start),
+                    quiet_hours_end = VALUES(quiet_hours_end),
+                    timezone = VALUES(timezone),
+
+                    email_recipient = VALUES(email_recipient),
+                    sms_recipient = VALUES(sms_recipient),
+
+                    updated_by = VALUES(updated_by),
+                    notes = VALUES(notes),
+                    updated_at = NOW()
+                """,
+                (
+                    pref_data["tenant_id"],
+                    pref_data["property_id"],
+                    pref_data["record_id"],
+                    pref_data["user_id"],
+
+                    pref_data["in_app_enabled"],
+                    pref_data["email_enabled"],
+                    pref_data["sms_enabled"],
+                    pref_data["push_enabled"],
+
+                    pref_data["store_reminders_enabled"],
+                    pref_data["maintenance_reminders_enabled"],
+                    pref_data["weather_alerts_enabled"],
+                    pref_data["device_alerts_enabled"],
+
+                    pref_data["quiet_hours_enabled"],
+                    pref_data["quiet_hours_start"],
+                    pref_data["quiet_hours_end"],
+                    pref_data["timezone"],
+
+                    pref_data["email_recipient"],
+                    pref_data["sms_recipient"],
+
+                    pref_data["updated_by"],
+                    pref_data["notes"],
+                ),
+            )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM notification_preferences
+                WHERE record_id = %s
+                  AND user_id = %s
+                LIMIT 1
+                """,
+                (
+                    safe_record_id,
+                    safe_user_id,
+                ),
+            )
+
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Notification preferences saved.",
+            "record_id": safe_record_id,
+            "user_id": safe_user_id,
+            "preferences": _hf_pref_row_to_api(row),
+        }
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "notification_preferences_save_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

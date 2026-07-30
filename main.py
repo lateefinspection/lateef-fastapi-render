@@ -28497,3 +28497,219 @@ def upsert_notification_preferences(
         except Exception:
             pass
 
+
+# ============================================================
+# HomeFax Notification Preferences Schema Migration Fix
+# Existing notification_preferences table may already exist with
+# an older/incomplete shape. This migration adds missing columns.
+# ============================================================
+
+def _hf_pref_column_exists(cursor, table_name, column_name):
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND COLUMN_NAME = %s
+        """,
+        (table_name, column_name),
+    )
+    row = cursor.fetchone() or {}
+    return int(row.get("count") or 0) > 0
+
+
+def _hf_pref_index_exists(cursor, table_name, index_name):
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND INDEX_NAME = %s
+        """,
+        (table_name, index_name),
+    )
+    row = cursor.fetchone() or {}
+    return int(row.get("count") or 0) > 0
+
+
+def _hf_pref_add_column_if_missing(cursor, table_name, column_name, ddl):
+    if not _hf_pref_column_exists(cursor, table_name, column_name):
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
+
+
+def _hf_pref_ensure_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_preferences (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            table_name = "notification_preferences"
+
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "tenant_id",
+                "tenant_id VARCHAR(128) NOT NULL DEFAULT 'lateef-home-inspection'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "property_id",
+                "property_id VARCHAR(255) NOT NULL DEFAULT ''"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "record_id",
+                "record_id VARCHAR(255) NOT NULL DEFAULT ''"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "user_id",
+                "user_id VARCHAR(255) NOT NULL DEFAULT ''"
+            )
+
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "in_app_enabled",
+                "in_app_enabled VARCHAR(16) NOT NULL DEFAULT 'yes'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "email_enabled",
+                "email_enabled VARCHAR(16) NOT NULL DEFAULT 'no'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "sms_enabled",
+                "sms_enabled VARCHAR(16) NOT NULL DEFAULT 'no'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "push_enabled",
+                "push_enabled VARCHAR(16) NOT NULL DEFAULT 'no'"
+            )
+
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "store_reminders_enabled",
+                "store_reminders_enabled VARCHAR(16) NOT NULL DEFAULT 'yes'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "maintenance_reminders_enabled",
+                "maintenance_reminders_enabled VARCHAR(16) NOT NULL DEFAULT 'yes'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "weather_alerts_enabled",
+                "weather_alerts_enabled VARCHAR(16) NOT NULL DEFAULT 'yes'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "device_alerts_enabled",
+                "device_alerts_enabled VARCHAR(16) NOT NULL DEFAULT 'yes'"
+            )
+
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "quiet_hours_enabled",
+                "quiet_hours_enabled VARCHAR(16) NOT NULL DEFAULT 'no'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "quiet_hours_start",
+                "quiet_hours_start VARCHAR(16) NOT NULL DEFAULT '21:00'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "quiet_hours_end",
+                "quiet_hours_end VARCHAR(16) NOT NULL DEFAULT '08:00'"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "timezone",
+                "timezone VARCHAR(128) NOT NULL DEFAULT 'America/Chicago'"
+            )
+
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "email_recipient",
+                "email_recipient VARCHAR(255) NOT NULL DEFAULT ''"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "sms_recipient",
+                "sms_recipient VARCHAR(64) NOT NULL DEFAULT ''"
+            )
+
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "updated_by",
+                "updated_by VARCHAR(255) NOT NULL DEFAULT ''"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "notes",
+                "notes TEXT NULL"
+            )
+            _hf_pref_add_column_if_missing(
+                cursor,
+                table_name,
+                "updated_at",
+                "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+            )
+
+            if not _hf_pref_index_exists(cursor, table_name, "idx_notification_pref_record_id"):
+                cursor.execute(
+                    "CREATE INDEX idx_notification_pref_record_id ON notification_preferences (record_id)"
+                )
+
+            if not _hf_pref_index_exists(cursor, table_name, "idx_notification_pref_user_id"):
+                cursor.execute(
+                    "CREATE INDEX idx_notification_pref_user_id ON notification_preferences (user_id)"
+                )
+
+            if not _hf_pref_index_exists(cursor, table_name, "uniq_notification_pref_record_user"):
+                cursor.execute(
+                    "CREATE UNIQUE INDEX uniq_notification_pref_record_user ON notification_preferences (record_id, user_id)"
+                )
+
+        conn.commit()
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

@@ -9198,6 +9198,41 @@ def _hf_repair_ensure_schema():
                 """
             )
 
+            _hf_notify_add_column_if_missing(
+                cursor,
+                "store_reminder_notifications",
+                "homeowner_read_status",
+                "homeowner_read_status VARCHAR(64) NOT NULL DEFAULT 'unread'",
+            )
+
+            _hf_notify_add_column_if_missing(
+                cursor,
+                "store_reminder_notifications",
+                "homeowner_read_at",
+                "homeowner_read_at DATETIME NULL",
+            )
+
+            _hf_notify_add_column_if_missing(
+                cursor,
+                "store_reminder_notifications",
+                "homeowner_archived",
+                "homeowner_archived VARCHAR(16) NOT NULL DEFAULT 'no'",
+            )
+
+            _hf_notify_add_column_if_missing(
+                cursor,
+                "store_reminder_notifications",
+                "homeowner_archived_at",
+                "homeowner_archived_at DATETIME NULL",
+            )
+
+            _hf_notify_add_column_if_missing(
+                cursor,
+                "store_reminder_notifications",
+                "homeowner_action_note",
+                "homeowner_action_note TEXT",
+            )
+
         conn.commit()
 
     except Exception:
@@ -26554,6 +26589,12 @@ class _HFStoreReminderNotificationStatusPayload(BaseModel):
     error_message: str = ""
 
 
+class _HFHomeownerNotificationActionPayload(BaseModel):
+    user_id: str = "homeowner-smoke-test"
+    action_note: str = ""
+    archived: str = "yes"
+
+
 def _hf_notify_one_line(value):
     return str(value or "").replace("\n", " ").replace("\r", " ").strip()
 
@@ -26597,6 +26638,26 @@ def _hf_notify_dt_to_iso(value):
 def _hf_notify_table_exists(cursor, table_name):
     cursor.execute("SHOW TABLES LIKE %s", (table_name,))
     return cursor.fetchone() is not None
+
+
+def _hf_notify_column_exists(cursor, table_name, column_name):
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+          AND column_name = %s
+        """,
+        (table_name, column_name),
+    )
+    row = cursor.fetchone() or {}
+    return int(row.get("count") or 0) > 0
+
+
+def _hf_notify_add_column_if_missing(cursor, table_name, column_name, ddl):
+    if not _hf_notify_column_exists(cursor, table_name, column_name):
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
 
 
 def _hf_notify_ensure_schema():
@@ -29881,6 +29942,296 @@ def dispatch_ready_store_reminder_notifications_with_preferences(
             detail={
                 "success": False,
                 "error": "dispatch_ready_with_preferences_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# Homeowner Notification Read / Archive Actions Pass 1
+# Homeowner inbox actions. These do not change provider delivery
+# status. They only change homeowner visibility/read state.
+# ============================================================
+
+@app.patch("/store-reminder-notification/{notification_id}/mark-read")
+def mark_store_reminder_notification_read(
+    notification_id: int,
+    payload: _HFHomeownerNotificationActionPayload,
+):
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    safe_notification_id = int(notification_id or 0)
+    safe_user_id = _hf_notify_one_line(payload.user_id or "homeowner-smoke-test")
+
+    if safe_notification_id <= 0:
+        raise HTTPException(status_code=400, detail="notification_id must be positive")
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE store_reminder_notifications
+                SET homeowner_read_status = 'read',
+                    homeowner_read_at = COALESCE(homeowner_read_at, NOW()),
+                    homeowner_action_note = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND user_id = %s
+                """,
+                (
+                    _hf_notify_one_line(payload.action_note),
+                    safe_notification_id,
+                    safe_user_id,
+                ),
+            )
+
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "notification_not_found_for_user",
+                        "notification_id": safe_notification_id,
+                        "user_id": safe_user_id,
+                    },
+                )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_notification_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "action": "mark_read",
+            "notification": _hf_notify_row_to_api(row) if "_hf_notify_row_to_api" in globals() else dict(row or {}),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "mark_notification_read_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/store-reminder-notification/{notification_id}/archive")
+def archive_store_reminder_notification(
+    notification_id: int,
+    payload: _HFHomeownerNotificationActionPayload,
+):
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    safe_notification_id = int(notification_id or 0)
+    safe_user_id = _hf_notify_one_line(payload.user_id or "homeowner-smoke-test")
+
+    if safe_notification_id <= 0:
+        raise HTTPException(status_code=400, detail="notification_id must be positive")
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE store_reminder_notifications
+                SET homeowner_archived = 'yes',
+                    homeowner_archived_at = NOW(),
+                    homeowner_read_status = 'read',
+                    homeowner_read_at = COALESCE(homeowner_read_at, NOW()),
+                    homeowner_action_note = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND user_id = %s
+                """,
+                (
+                    _hf_notify_one_line(payload.action_note),
+                    safe_notification_id,
+                    safe_user_id,
+                ),
+            )
+
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "notification_not_found_for_user",
+                        "notification_id": safe_notification_id,
+                        "user_id": safe_user_id,
+                    },
+                )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_notification_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "action": "archive",
+            "notification": _hf_notify_row_to_api(row) if "_hf_notify_row_to_api" in globals() else dict(row or {}),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "archive_notification_failed",
+                "message": str(exc),
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/store-reminder-notification/{notification_id}/unarchive")
+def unarchive_store_reminder_notification(
+    notification_id: int,
+    payload: _HFHomeownerNotificationActionPayload,
+):
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    safe_notification_id = int(notification_id or 0)
+    safe_user_id = _hf_notify_one_line(payload.user_id or "homeowner-smoke-test")
+
+    if safe_notification_id <= 0:
+        raise HTTPException(status_code=400, detail="notification_id must be positive")
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE store_reminder_notifications
+                SET homeowner_archived = 'no',
+                    homeowner_archived_at = NULL,
+                    homeowner_action_note = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND user_id = %s
+                """,
+                (
+                    _hf_notify_one_line(payload.action_note),
+                    safe_notification_id,
+                    safe_user_id,
+                ),
+            )
+
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "success": False,
+                        "error": "notification_not_found_for_user",
+                        "notification_id": safe_notification_id,
+                        "user_id": safe_user_id,
+                    },
+                )
+
+            cursor.execute(
+                """
+                SELECT *
+                FROM store_reminder_notifications
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (safe_notification_id,),
+            )
+            row = cursor.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "action": "unarchive",
+            "notification": _hf_notify_row_to_api(row) if "_hf_notify_row_to_api" in globals() else dict(row or {}),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "unarchive_notification_failed",
                 "message": str(exc),
             },
         )

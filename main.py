@@ -27739,6 +27739,9 @@ def send_store_reminder_notification(
     if "_hf_notify_ensure_schema" in globals():
         _hf_notify_ensure_schema()
 
+    if "_hf_notify_ensure_homeowner_action_columns" in globals():
+        _hf_notify_ensure_homeowner_action_columns()
+
     safe_notification_id = int(notification_id or 0)
 
     if safe_notification_id <= 0:
@@ -29565,6 +29568,9 @@ def send_store_reminder_notification_with_preferences(
     if "_hf_notify_ensure_schema" in globals():
         _hf_notify_ensure_schema()
 
+    if "_hf_notify_ensure_homeowner_action_columns" in globals():
+        _hf_notify_ensure_homeowner_action_columns()
+
     safe_notification_id = int(notification_id or 0)
     safe_user_id = _hf_enforce_one_line(payload.user_id or "homeowner-smoke-test")
 
@@ -29954,6 +29960,161 @@ def dispatch_ready_store_reminder_notifications_with_preferences(
             pass
 
 
+def _hf_notify_ensure_homeowner_action_columns():
+    """
+    Homeowner Notification Read/Archive schema patch.
+
+    The notification provider delivery state stays in notification_status.
+    These columns track homeowner inbox state only.
+    """
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            if "def _hf_notify_add_column_if_missing" in globals():
+                _hf_notify_add_column_if_missing(
+                    cursor,
+                    "store_reminder_notifications",
+                    "homeowner_read_status",
+                    "homeowner_read_status VARCHAR(64) NOT NULL DEFAULT 'unread'",
+                )
+
+                _hf_notify_add_column_if_missing(
+                    cursor,
+                    "store_reminder_notifications",
+                    "homeowner_read_at",
+                    "homeowner_read_at DATETIME NULL",
+                )
+
+                _hf_notify_add_column_if_missing(
+                    cursor,
+                    "store_reminder_notifications",
+                    "homeowner_archived",
+                    "homeowner_archived VARCHAR(16) NOT NULL DEFAULT 'no'",
+                )
+
+                _hf_notify_add_column_if_missing(
+                    cursor,
+                    "store_reminder_notifications",
+                    "homeowner_archived_at",
+                    "homeowner_archived_at DATETIME NULL",
+                )
+
+                _hf_notify_add_column_if_missing(
+                    cursor,
+                    "store_reminder_notifications",
+                    "homeowner_action_note",
+                    "homeowner_action_note TEXT",
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'store_reminder_notifications'
+                      AND column_name = 'homeowner_read_status'
+                    """
+                )
+                row = cursor.fetchone() or {}
+                if int(row.get("count") or 0) == 0:
+                    cursor.execute(
+                        """
+                        ALTER TABLE store_reminder_notifications
+                        ADD COLUMN homeowner_read_status VARCHAR(64) NOT NULL DEFAULT 'unread'
+                        """
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'store_reminder_notifications'
+                      AND column_name = 'homeowner_read_at'
+                    """
+                )
+                row = cursor.fetchone() or {}
+                if int(row.get("count") or 0) == 0:
+                    cursor.execute(
+                        """
+                        ALTER TABLE store_reminder_notifications
+                        ADD COLUMN homeowner_read_at DATETIME NULL
+                        """
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'store_reminder_notifications'
+                      AND column_name = 'homeowner_archived'
+                    """
+                )
+                row = cursor.fetchone() or {}
+                if int(row.get("count") or 0) == 0:
+                    cursor.execute(
+                        """
+                        ALTER TABLE store_reminder_notifications
+                        ADD COLUMN homeowner_archived VARCHAR(16) NOT NULL DEFAULT 'no'
+                        """
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'store_reminder_notifications'
+                      AND column_name = 'homeowner_archived_at'
+                    """
+                )
+                row = cursor.fetchone() or {}
+                if int(row.get("count") or 0) == 0:
+                    cursor.execute(
+                        """
+                        ALTER TABLE store_reminder_notifications
+                        ADD COLUMN homeowner_archived_at DATETIME NULL
+                        """
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'store_reminder_notifications'
+                      AND column_name = 'homeowner_action_note'
+                    """
+                )
+                row = cursor.fetchone() or {}
+                if int(row.get("count") or 0) == 0:
+                    cursor.execute(
+                        """
+                        ALTER TABLE store_reminder_notifications
+                        ADD COLUMN homeowner_action_note TEXT
+                        """
+                    )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "schema": "homeowner_notification_action_columns",
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+
 # ============================================================
 # Homeowner Notification Read / Archive Actions Pass 1
 # Homeowner inbox actions. These do not change provider delivery
@@ -29967,6 +30128,9 @@ def mark_store_reminder_notification_read(
 ):
     if "_hf_notify_ensure_schema" in globals():
         _hf_notify_ensure_schema()
+
+    if "_hf_notify_ensure_homeowner_action_columns" in globals():
+        _hf_notify_ensure_homeowner_action_columns()
 
     safe_notification_id = int(notification_id or 0)
     safe_user_id = _hf_notify_one_line(payload.user_id or "homeowner-smoke-test")
@@ -30243,3 +30407,62 @@ def unarchive_store_reminder_notification(
         except Exception:
             pass
 
+
+
+@app.get("/homeowner-notification-actions/health")
+def homeowner_notification_actions_health():
+    if "_hf_notify_ensure_schema" in globals():
+        _hf_notify_ensure_schema()
+
+    if "_hf_notify_ensure_homeowner_action_columns" in globals():
+        _hf_notify_ensure_homeowner_action_columns()
+
+    conn = None
+
+    required_columns = [
+        "homeowner_read_status",
+        "homeowner_read_at",
+        "homeowner_archived",
+        "homeowner_archived_at",
+        "homeowner_action_note",
+    ]
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'store_reminder_notifications'
+                  AND column_name IN (
+                    'homeowner_read_status',
+                    'homeowner_read_at',
+                    'homeowner_archived',
+                    'homeowner_archived_at',
+                    'homeowner_action_note'
+                  )
+                """
+            )
+
+            rows = cursor.fetchall() or []
+
+        found = sorted([row.get("column_name") for row in rows if row.get("column_name")])
+        missing = sorted([column for column in required_columns if column not in found])
+
+        return {
+            "success": len(missing) == 0,
+            "service": "homeowner_notification_actions",
+            "table": "store_reminder_notifications",
+            "columns_found": found,
+            "columns_missing": missing,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass

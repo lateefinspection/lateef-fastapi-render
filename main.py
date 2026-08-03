@@ -27744,6 +27744,7 @@ def send_store_reminder_notification(
                     "dry_run": True,
                     "notification": notification_api,
                     "provider_result": result,
+                    "recipient_sync_result": recipient_sync_result,
                 }
 
             result = _hf_send_dispatch_notification(notification_api)
@@ -29609,6 +29610,46 @@ def send_store_reminder_notification_with_preferences(
 
             dispatch_notification = validation.get("notification") or notification
 
+            # Notification Recipient Sync Patch
+            # Preference enforcement may resolve the final recipient from
+            # notification_preferences.email_recipient or sms_recipient.
+            # Persist that resolved recipient so the notification row, dashboard,
+            # admin debug panel, and provider destination all match.
+            resolved_recipient = _hf_enforce_one_line(
+                validation.get("recipient")
+                or dispatch_notification.get("recipient")
+                or notification.get("recipient")
+            )
+
+            recipient_sync_result = {
+                "updated": False,
+                "reason": "no_resolved_recipient",
+                "recipient": resolved_recipient,
+            }
+
+            if resolved_recipient:
+                cursor.execute(
+                    """
+                    UPDATE store_reminder_notifications
+                    SET recipient = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (resolved_recipient, safe_notification_id),
+                )
+
+                notification["recipient"] = resolved_recipient
+                dispatch_notification["recipient"] = resolved_recipient
+                validation["recipient"] = resolved_recipient
+                validation["notification"] = dispatch_notification
+
+                recipient_sync_result = {
+                    "updated": True,
+                    "notification_id": safe_notification_id,
+                    "recipient": resolved_recipient,
+                    "rows_affected": cursor.rowcount,
+                }
+
             if _hf_enforce_yes(payload.dry_run):
                 return {
                     "success": True,
@@ -29618,6 +29659,7 @@ def send_store_reminder_notification_with_preferences(
                     "reason": "dry_run_allowed_by_preferences",
                     "notification": dispatch_notification,
                     "validation": validation,
+                    "recipient_sync_result": recipient_sync_result,
                 }
 
             result = _hf_send_dispatch_notification(dispatch_notification)

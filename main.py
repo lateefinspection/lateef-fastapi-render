@@ -29257,6 +29257,107 @@ def _hf_enforce_yes(value):
     }
 
 
+def _hf_enforce_is_valid_email(value):
+    email = _hf_enforce_one_line(value or "")
+
+    if not email:
+        return False
+
+    if "@" not in email:
+        return False
+
+    local_part, _, domain_part = email.partition("@")
+
+    if not local_part or not domain_part:
+        return False
+
+    if "." not in domain_part:
+        return False
+
+    return True
+
+
+def _hf_enforce_is_valid_e164(value):
+    raw = _hf_enforce_one_line(value or "")
+
+    if not raw:
+        return False
+
+    if not raw.startswith("+"):
+        return False
+
+    digits = raw[1:]
+
+    if not digits.isdigit():
+        return False
+
+    return 8 <= len(digits) <= 15
+
+
+def _hf_enforce_normalize_yes_no(value, default="no"):
+    if value is None:
+        return "yes" if _hf_enforce_yes(default) else "no"
+
+    return "yes" if _hf_enforce_yes(value) else "no"
+
+
+def _hf_enforce_validate_preferences(preferences):
+    prefs = dict(preferences or {})
+    warnings = []
+    errors = []
+
+    email_enabled = _hf_enforce_yes(prefs.get("email_enabled"))
+    sms_enabled = _hf_enforce_yes(prefs.get("sms_enabled"))
+    quiet_hours_enabled = _hf_enforce_yes(prefs.get("quiet_hours_enabled"))
+
+    email_recipient = _hf_enforce_one_line(prefs.get("email_recipient") or "")
+    sms_recipient = _hf_enforce_one_line(prefs.get("sms_recipient") or "")
+    quiet_hours_start = _hf_enforce_one_line(prefs.get("quiet_hours_start") or "")
+    quiet_hours_end = _hf_enforce_one_line(prefs.get("quiet_hours_end") or "")
+    timezone = _hf_enforce_one_line(prefs.get("timezone") or "")
+
+    if email_enabled and not email_recipient:
+        warnings.append({
+            "code": "email_enabled_missing_recipient",
+            "message": "Email is enabled, but no email recipient is saved.",
+        })
+        errors.append("email_enabled_missing_recipient")
+
+    if email_enabled and email_recipient and not _hf_enforce_is_valid_email(email_recipient):
+        warnings.append({
+            "code": "email_recipient_invalid",
+            "message": "Email is enabled, but the email recipient is not valid.",
+        })
+        errors.append("email_recipient_invalid")
+
+    if sms_enabled and not sms_recipient:
+        warnings.append({
+            "code": "sms_enabled_missing_recipient",
+            "message": "SMS is enabled, but no SMS recipient is saved.",
+        })
+        errors.append("sms_enabled_missing_recipient")
+
+    if sms_enabled and sms_recipient and not _hf_enforce_is_valid_e164(sms_recipient):
+        warnings.append({
+            "code": "sms_recipient_invalid_e164",
+            "message": "SMS is enabled, but the SMS recipient is not valid E.164 format.",
+        })
+        errors.append("sms_recipient_invalid_e164")
+
+    if quiet_hours_enabled and (not quiet_hours_start or not quiet_hours_end or not timezone):
+        warnings.append({
+            "code": "quiet_hours_incomplete",
+            "message": "Quiet hours are enabled, but start, end, or timezone is missing.",
+        })
+        errors.append("quiet_hours_incomplete")
+
+    return {
+        "valid": len(errors) == 0,
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+
 def _hf_enforce_parse_hhmm(value, fallback):
     raw = _hf_enforce_one_line(value or fallback)
 
@@ -29506,6 +29607,14 @@ def _hf_enforce_validate_notification(notification, preferences, force_send=Fals
                 "preferences": preferences,
             }
 
+    preference_validation = _hf_enforce_validate_preferences(preferences)
+    checks.append({
+        "check": "preference_validation",
+        "valid": preference_validation.get("valid"),
+        "warnings": preference_validation.get("warnings"),
+        "errors": preference_validation.get("errors"),
+    })
+
     quiet_state = _hf_enforce_is_quiet_now(preferences)
     checks.append({
         "check": "quiet_hours",
@@ -29537,6 +29646,7 @@ def _hf_enforce_validate_notification(notification, preferences, force_send=Fals
         "notification": enriched_notification,
         "checks": checks,
         "preferences": preferences,
+        "preference_validation": preference_validation,
         "quiet_state": quiet_state,
     }
 
@@ -30449,8 +30559,25 @@ def homeowner_notification_actions_health():
 
             rows = cursor.fetchall() or []
 
-        found = sorted([row.get("column_name") for row in rows if row.get("column_name")])
-        missing = sorted([column for column in required_columns if column not in found])
+        found_raw = []
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            column_name = (
+                row.get("column_name")
+                or row.get("COLUMN_NAME")
+                or row.get("Column_name")
+                or row.get("Column_Name")
+            )
+
+            if column_name:
+                found_raw.append(str(column_name).strip())
+
+        found = sorted([column for column in found_raw if column])
+        found_normalized = {column.lower() for column in found}
+        missing = sorted([column for column in required_columns if column.lower() not in found_normalized])
 
         return {
             "success": len(missing) == 0,

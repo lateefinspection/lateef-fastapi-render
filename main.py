@@ -28196,6 +28196,15 @@ def _hf_pref_row_to_api(row):
         "timezone": item.get("timezone") or "America/Chicago",
     }
 
+    if "_hf_enforce_validate_preferences" in globals():
+        item["preference_validation"] = _hf_enforce_validate_preferences(item)
+    else:
+        item["preference_validation"] = {
+            "valid": True,
+            "warnings": [],
+            "errors": [],
+        }
+
     return item
 
 
@@ -28247,6 +28256,11 @@ def _hf_pref_default(record_id, user_id="homeowner-smoke-test"):
             "start": "21:00",
             "end": "08:00",
             "timezone": "America/Chicago",
+        },
+        "preference_validation": {
+            "valid": True,
+            "warnings": [],
+            "errors": [],
         },
     }
 

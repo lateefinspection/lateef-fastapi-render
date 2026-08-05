@@ -31328,3 +31328,582 @@ def homefax_auth_upsert_notification_preferences(
 
     return result
 
+
+
+# ============================================================
+# HomeFax Phase 29E - Super Admin / Internal Access Audit Pass 1
+# ============================================================
+#
+# Purpose:
+#   Allow controlled cross-tenant access for HomeFax platform operators,
+#   while requiring reason codes and audit logging.
+#
+# Internal roles:
+#   - super_admin
+#   - internal
+#
+# New endpoints:
+#   GET /auth/internal/system-health
+#   GET /auth/internal/record-access/{record_id}
+#   GET /auth/internal/audit-log
+# ============================================================
+
+
+def _hf_internal_one_line(value, fallback=""):
+    return _hf_auth_one_line(value if value is not None else fallback)
+
+
+def _hf_internal_json_dumps(value):
+    try:
+        if "_hf_send_json" in globals():
+            return _hf_send_json.dumps(value, default=str)
+    except Exception:
+        pass
+
+    try:
+        import json
+        return json.dumps(value, default=str)
+    except Exception:
+        return str(value)
+
+
+def _hf_internal_is_role(user):
+    role = _hf_auth_normalize_role(user.get("role"))
+    return role in {"super_admin", "internal"}
+
+
+def _hf_internal_access_decision(user, action, reason):
+    safe_reason = _hf_internal_one_line(reason)
+    safe_action = _hf_internal_one_line(action)
+    safe_role = _hf_auth_normalize_role(user.get("role"))
+
+    if not _hf_internal_is_role(user):
+        return {
+            "allowed": False,
+            "reason": "internal_role_required",
+            "action": safe_action,
+            "role": safe_role,
+        }
+
+    if not safe_reason:
+        return {
+            "allowed": False,
+            "reason": "internal_access_reason_required",
+            "action": safe_action,
+            "role": safe_role,
+        }
+
+    return {
+        "allowed": True,
+        "reason": "internal_cross_tenant_access_allowed",
+        "action": safe_action,
+        "role": safe_role,
+        "reason_code": safe_reason,
+    }
+
+
+def _hf_internal_ensure_audit_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS homefax_internal_audit_log (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+                    actor_user_id VARCHAR(255) NOT NULL DEFAULT '',
+                    actor_role VARCHAR(64) NOT NULL DEFAULT '',
+                    actor_tenant_id VARCHAR(128) NOT NULL DEFAULT '',
+
+                    target_tenant_id VARCHAR(128) NOT NULL DEFAULT '',
+                    target_user_id VARCHAR(255) NOT NULL DEFAULT '',
+                    target_record_id VARCHAR(255) NOT NULL DEFAULT '',
+
+                    action VARCHAR(128) NOT NULL DEFAULT '',
+                    reason_code VARCHAR(255) NOT NULL DEFAULT '',
+                    access_result VARCHAR(64) NOT NULL DEFAULT '',
+                    request_path VARCHAR(500) NOT NULL DEFAULT '',
+
+                    metadata_json LONGTEXT NULL,
+
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+                    INDEX idx_hf_internal_actor_user_id (actor_user_id),
+                    INDEX idx_hf_internal_actor_role (actor_role),
+                    INDEX idx_hf_internal_target_tenant_id (target_tenant_id),
+                    INDEX idx_hf_internal_target_record_id (target_record_id),
+                    INDEX idx_hf_internal_action (action),
+                    INDEX idx_hf_internal_created_at (created_at)
+                )
+                """
+            )
+
+        conn.commit()
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_internal_log_action(
+    user,
+    action,
+    reason,
+    access_result,
+    request_path="",
+    target_tenant_id="",
+    target_user_id="",
+    target_record_id="",
+    metadata=None,
+):
+    _hf_internal_ensure_audit_schema()
+
+    conn = None
+
+    safe_action = _hf_internal_one_line(action)
+    safe_reason = _hf_internal_one_line(reason)
+    safe_access_result = _hf_internal_one_line(access_result)
+    safe_request_path = _hf_internal_one_line(request_path)
+
+    safe_actor_user_id = _hf_internal_one_line(user.get("user_id"))
+    safe_actor_role = _hf_auth_normalize_role(user.get("role"))
+    safe_actor_tenant_id = _hf_internal_one_line(user.get("tenant_id"))
+
+    safe_target_tenant_id = _hf_internal_one_line(target_tenant_id)
+    safe_target_user_id = _hf_internal_one_line(target_user_id)
+    safe_target_record_id = _hf_internal_one_line(target_record_id)
+
+    metadata_json = _hf_internal_json_dumps(metadata or {})
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO homefax_internal_audit_log (
+                    actor_user_id,
+                    actor_role,
+                    actor_tenant_id,
+                    target_tenant_id,
+                    target_user_id,
+                    target_record_id,
+                    action,
+                    reason_code,
+                    access_result,
+                    request_path,
+                    metadata_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    safe_actor_user_id,
+                    safe_actor_role,
+                    safe_actor_tenant_id,
+                    safe_target_tenant_id,
+                    safe_target_user_id,
+                    safe_target_record_id,
+                    safe_action,
+                    safe_reason,
+                    safe_access_result,
+                    safe_request_path,
+                    metadata_json,
+                ),
+            )
+
+        conn.commit()
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_internal_count_table(cursor, table_name):
+    safe_table = _hf_internal_one_line(table_name)
+
+    try:
+        cursor.execute(f"SELECT COUNT(*) AS count FROM {safe_table}")
+        row = cursor.fetchone() or {}
+        return {
+            "ok": True,
+            "count": int(row.get("count") or 0),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "count": 0,
+            "error": str(exc),
+        }
+
+
+def _hf_internal_record_snapshot(record_id):
+    safe_record_id = _hf_internal_one_line(record_id)
+    conn = None
+
+    snapshot = {
+        "record_id": safe_record_id,
+        "notification_preferences_count": 0,
+        "store_reminder_notifications_count": 0,
+        "verified_issues_count": 0,
+        "tenant_ids": [],
+        "user_ids": [],
+    }
+
+    if not safe_record_id:
+        return snapshot
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            try:
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS count,
+                        GROUP_CONCAT(DISTINCT tenant_id) AS tenant_ids,
+                        GROUP_CONCAT(DISTINCT user_id) AS user_ids
+                    FROM notification_preferences
+                    WHERE record_id = %s
+                    """,
+                    (safe_record_id,),
+                )
+                row = cursor.fetchone() or {}
+                snapshot["notification_preferences_count"] = int(row.get("count") or 0)
+                if row.get("tenant_ids"):
+                    snapshot["tenant_ids"].extend(str(row.get("tenant_ids")).split(","))
+                if row.get("user_ids"):
+                    snapshot["user_ids"].extend(str(row.get("user_ids")).split(","))
+            except Exception as exc:
+                snapshot["notification_preferences_error"] = str(exc)
+
+            try:
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS count,
+                        GROUP_CONCAT(DISTINCT tenant_id) AS tenant_ids,
+                        GROUP_CONCAT(DISTINCT user_id) AS user_ids
+                    FROM store_reminder_notifications
+                    WHERE record_id = %s
+                    """,
+                    (safe_record_id,),
+                )
+                row = cursor.fetchone() or {}
+                snapshot["store_reminder_notifications_count"] = int(row.get("count") or 0)
+                if row.get("tenant_ids"):
+                    snapshot["tenant_ids"].extend(str(row.get("tenant_ids")).split(","))
+                if row.get("user_ids"):
+                    snapshot["user_ids"].extend(str(row.get("user_ids")).split(","))
+            except Exception as exc:
+                snapshot["store_reminder_notifications_error"] = str(exc)
+
+            try:
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS count,
+                        GROUP_CONCAT(DISTINCT tenant_id) AS tenant_ids,
+                        GROUP_CONCAT(DISTINCT homeowner_user_id) AS user_ids
+                    FROM verified_issues
+                    WHERE record_id = %s
+                    """,
+                    (safe_record_id,),
+                )
+                row = cursor.fetchone() or {}
+                snapshot["verified_issues_count"] = int(row.get("count") or 0)
+                if row.get("tenant_ids"):
+                    snapshot["tenant_ids"].extend(str(row.get("tenant_ids")).split(","))
+                if row.get("user_ids"):
+                    snapshot["user_ids"].extend(str(row.get("user_ids")).split(","))
+            except Exception as exc:
+                snapshot["verified_issues_error"] = str(exc)
+
+        snapshot["tenant_ids"] = sorted({item for item in snapshot["tenant_ids"] if item})
+        snapshot["user_ids"] = sorted({item for item in snapshot["user_ids"] if item})
+
+        return snapshot
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/auth/internal/system-health")
+def homefax_internal_system_health(request: Request, reason: str = ""):
+    _hf_auth_seed_smoke_access()
+    _hf_internal_ensure_audit_schema()
+
+    user = _hf_auth_get_current_user(request)
+    decision = _hf_internal_access_decision(
+        user,
+        action="internal_system_health",
+        reason=reason,
+    )
+
+    request_path = ""
+    try:
+        request_path = str(request.url.path)
+    except Exception:
+        request_path = "/auth/internal/system-health"
+
+    if not decision.get("allowed"):
+        _hf_internal_log_action(
+            user=user,
+            action="internal_system_health",
+            reason=reason,
+            access_result="denied",
+            request_path=request_path,
+            metadata={"decision": decision},
+        )
+
+        return {
+            "success": False,
+            "allowed": False,
+            "auth_mode": user.get("auth_mode"),
+            "user": user,
+            "decision": decision,
+        }
+
+    conn = None
+    health = {}
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            health["homefax_users"] = _hf_internal_count_table(cursor, "homefax_users")
+            health["homefax_user_record_access"] = _hf_internal_count_table(cursor, "homefax_user_record_access")
+            health["homefax_internal_audit_log"] = _hf_internal_count_table(cursor, "homefax_internal_audit_log")
+            health["notification_preferences"] = _hf_internal_count_table(cursor, "notification_preferences")
+            health["store_reminder_notifications"] = _hf_internal_count_table(cursor, "store_reminder_notifications")
+            health["verified_issues"] = _hf_internal_count_table(cursor, "verified_issues")
+
+        _hf_internal_log_action(
+            user=user,
+            action="internal_system_health",
+            reason=reason,
+            access_result="allowed",
+            request_path=request_path,
+            metadata={"decision": decision, "health_keys": sorted(health.keys())},
+        )
+
+        return {
+            "success": True,
+            "allowed": True,
+            "service": "homefax_internal_system_health",
+            "auth_mode": user.get("auth_mode"),
+            "user": user,
+            "decision": decision,
+            "health": health,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/auth/internal/record-access/{record_id}")
+def homefax_internal_record_access(record_id: str, request: Request, reason: str = ""):
+    _hf_auth_seed_smoke_access()
+    _hf_internal_ensure_audit_schema()
+
+    safe_record_id = _hf_internal_one_line(record_id)
+    user = _hf_auth_get_current_user(request)
+    decision = _hf_internal_access_decision(
+        user,
+        action="internal_record_access",
+        reason=reason,
+    )
+
+    request_path = ""
+    try:
+        request_path = str(request.url.path)
+    except Exception:
+        request_path = f"/auth/internal/record-access/{safe_record_id}"
+
+    snapshot = _hf_internal_record_snapshot(safe_record_id)
+
+    target_tenant_id = ""
+    if snapshot.get("tenant_ids"):
+        target_tenant_id = snapshot.get("tenant_ids")[0]
+
+    target_user_id = ""
+    if snapshot.get("user_ids"):
+        target_user_id = snapshot.get("user_ids")[0]
+
+    if not decision.get("allowed"):
+        _hf_internal_log_action(
+            user=user,
+            action="internal_record_access",
+            reason=reason,
+            access_result="denied",
+            request_path=request_path,
+            target_tenant_id=target_tenant_id,
+            target_user_id=target_user_id,
+            target_record_id=safe_record_id,
+            metadata={"decision": decision, "snapshot": snapshot},
+        )
+
+        return {
+            "success": False,
+            "allowed": False,
+            "record_id": safe_record_id,
+            "auth_mode": user.get("auth_mode"),
+            "user": user,
+            "decision": decision,
+            "snapshot": snapshot,
+        }
+
+    _hf_internal_log_action(
+        user=user,
+        action="internal_record_access",
+        reason=reason,
+        access_result="allowed",
+        request_path=request_path,
+        target_tenant_id=target_tenant_id,
+        target_user_id=target_user_id,
+        target_record_id=safe_record_id,
+        metadata={"decision": decision, "snapshot": snapshot},
+    )
+
+    return {
+        "success": True,
+        "allowed": True,
+        "record_id": safe_record_id,
+        "auth_mode": user.get("auth_mode"),
+        "user": user,
+        "decision": decision,
+        "snapshot": snapshot,
+    }
+
+
+@app.get("/auth/internal/audit-log")
+def homefax_internal_audit_log(
+    request: Request,
+    reason: str = "",
+    limit: int = 25,
+    target_record_id: str = "",
+):
+    _hf_auth_seed_smoke_access()
+    _hf_internal_ensure_audit_schema()
+
+    user = _hf_auth_get_current_user(request)
+    decision = _hf_internal_access_decision(
+        user,
+        action="internal_audit_log_read",
+        reason=reason,
+    )
+
+    request_path = ""
+    try:
+        request_path = str(request.url.path)
+    except Exception:
+        request_path = "/auth/internal/audit-log"
+
+    safe_limit = max(1, min(int(limit or 25), 100))
+    safe_target_record_id = _hf_internal_one_line(target_record_id)
+
+    if not decision.get("allowed"):
+        _hf_internal_log_action(
+            user=user,
+            action="internal_audit_log_read",
+            reason=reason,
+            access_result="denied",
+            request_path=request_path,
+            target_record_id=safe_target_record_id,
+            metadata={"decision": decision},
+        )
+
+        return {
+            "success": False,
+            "allowed": False,
+            "auth_mode": user.get("auth_mode"),
+            "user": user,
+            "decision": decision,
+            "audit_events": [],
+        }
+
+    _hf_internal_log_action(
+        user=user,
+        action="internal_audit_log_read",
+        reason=reason,
+        access_result="allowed",
+        request_path=request_path,
+        target_record_id=safe_target_record_id,
+        metadata={"decision": decision, "limit": safe_limit},
+    )
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            if safe_target_record_id:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM homefax_internal_audit_log
+                    WHERE target_record_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (
+                        safe_target_record_id,
+                        safe_limit,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM homefax_internal_audit_log
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (safe_limit,),
+                )
+
+            rows = cursor.fetchall() or []
+
+        audit_events = []
+
+        for row in rows:
+            item = dict(row)
+            if "created_at" in item:
+                item["created_at"] = _hf_pref_dt_to_iso(item.get("created_at"))
+            audit_events.append(item)
+
+        return {
+            "success": True,
+            "allowed": True,
+            "auth_mode": user.get("auth_mode"),
+            "user": user,
+            "decision": decision,
+            "count": len(audit_events),
+            "audit_events": audit_events,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

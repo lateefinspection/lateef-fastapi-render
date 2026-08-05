@@ -5819,7 +5819,7 @@ def get_dynamic_adapter_profile_match_event(event_id: int):
 #   Parser/n8n output is not tenant-safe unless tenant metadata is stored.
 
 from typing import Optional
-from fastapi import Header
+from fastapi import Header, Request
 from pydantic import BaseModel
 
 

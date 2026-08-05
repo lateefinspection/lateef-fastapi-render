@@ -31051,3 +31051,143 @@ def homefax_auth_record_access(record_id: str, request: Request):
         "access": access,
     }
 
+
+
+# ============================================================
+# HomeFax Phase 29D - Auth-Gated Notification Preferences Read
+# ============================================================
+#
+# Purpose:
+#   Add a protected read wrapper for notification preferences.
+#
+# Existing public/smoke endpoint remains untouched:
+#   GET /notification-preferences/{record_id}?user_id=...
+#
+# New authenticated wrapper:
+#   GET /auth/notification-preferences/{record_id}
+# ============================================================
+
+
+def _hf_auth_notification_pref_reader_user_id(user, explicit_user_id=""):
+    """
+    For Pass 1:
+      - Homeowner reads their own preference record.
+      - Admin can pass ?user_id=... for tenant debugging.
+      - Admin defaults to homeowner-smoke-test for current smoke record.
+    """
+    safe_explicit_user_id = _hf_auth_one_line(explicit_user_id)
+    safe_role = _hf_auth_normalize_role(user.get("role"))
+    safe_user_id = _hf_auth_one_line(user.get("user_id") or "homeowner-smoke-test")
+
+    if _hf_auth_is_admin_role(safe_role):
+        return safe_explicit_user_id or "homeowner-smoke-test"
+
+    return safe_user_id or "homeowner-smoke-test"
+
+
+@app.get("/auth/notification-preferences/{record_id}")
+def homefax_auth_notification_preferences(
+    record_id: str,
+    request: Request,
+    user_id: str = "",
+):
+    _hf_auth_seed_smoke_access()
+    _hf_pref_ensure_schema()
+
+    safe_record_id = _hf_pref_one_line(record_id)
+    user = _hf_auth_get_current_user(request)
+    access = _hf_auth_user_can_access_record(user, safe_record_id)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "allowed": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+                "user": user,
+            },
+        )
+
+    if not access.get("allowed"):
+        return {
+            "success": False,
+            "allowed": False,
+            "reason": access.get("reason") or "record_access_denied",
+            "record_id": safe_record_id,
+            "auth_mode": user.get("auth_mode"),
+            "user": user,
+            "access": access,
+        }
+
+    reader_user_id = _hf_auth_notification_pref_reader_user_id(user, user_id)
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM notification_preferences
+                WHERE record_id = %s
+                  AND user_id = %s
+                LIMIT 1
+                """,
+                (
+                    safe_record_id,
+                    reader_user_id,
+                ),
+            )
+
+            row = cursor.fetchone()
+
+        if not row:
+            return {
+                "success": True,
+                "allowed": True,
+                "exists": False,
+                "auth_mode": user.get("auth_mode"),
+                "record_id": safe_record_id,
+                "user_id": reader_user_id,
+                "user": user,
+                "access": access,
+                "preferences": _hf_pref_default(safe_record_id, reader_user_id),
+            }
+
+        return {
+            "success": True,
+            "allowed": True,
+            "exists": True,
+            "auth_mode": user.get("auth_mode"),
+            "record_id": safe_record_id,
+            "user_id": reader_user_id,
+            "user": user,
+            "access": access,
+            "preferences": _hf_pref_row_to_api(row),
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "allowed": False,
+                "error": "auth_notification_preferences_fetch_failed",
+                "message": str(exc),
+                "record_id": safe_record_id,
+                "user": user,
+                "access": access,
+            },
+        )
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+

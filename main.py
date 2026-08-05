@@ -29725,14 +29725,6 @@ def send_store_reminder_notification_with_preferences(
             notification = _hf_notify_row_to_api(row) if "_hf_notify_row_to_api" in globals() else dict(row)
             status = _hf_enforce_one_line(notification.get("notification_status")).lower()
 
-            if status == "sent" and not _hf_enforce_yes(payload.force_resend):
-                return {
-                    "success": True,
-                    "sent": False,
-                    "reason": "already_sent",
-                    "notification": notification,
-                }
-
             preferences = _hf_enforce_get_preferences(
                 notification.get("record_id"),
                 safe_user_id,
@@ -29743,6 +29735,25 @@ def send_store_reminder_notification_with_preferences(
                 preferences,
                 force_send=_hf_enforce_yes(payload.force_send),
             )
+
+            if status == "sent" and not _hf_enforce_yes(payload.force_resend):
+                if not validation.get("allowed"):
+                    return {
+                        "success": False,
+                        "sent": False,
+                        "blocked": True,
+                        "reason": validation.get("reason"),
+                        "validation": validation,
+                        "notification": notification,
+                    }
+
+                return {
+                    "success": True,
+                    "sent": False,
+                    "reason": "already_sent",
+                    "validation": validation,
+                    "notification": notification,
+                }
 
             if not validation.get("allowed"):
                 if _hf_enforce_yes(payload.dry_run):

@@ -29615,6 +29615,24 @@ def _hf_enforce_validate_notification(notification, preferences, force_send=Fals
         "errors": preference_validation.get("errors"),
     })
 
+    if not preference_validation.get("valid"):
+        first_error = ""
+        errors = preference_validation.get("errors") or []
+
+        if errors:
+            first_error = str(errors[0] or "").strip()
+
+        return {
+            "allowed": False,
+            "reason": first_error or "notification_preferences_invalid",
+            "channel": channel,
+            "notification_type": notification_type,
+            "recipient": expected_recipient,
+            "checks": checks,
+            "preferences": preferences,
+            "preference_validation": preference_validation,
+        }
+
     quiet_state = _hf_enforce_is_quiet_now(preferences)
     checks.append({
         "check": "quiet_hours",

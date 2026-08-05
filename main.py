@@ -31191,3 +31191,140 @@ def homefax_auth_notification_preferences(
         except Exception:
             pass
 
+
+
+# ============================================================
+# HomeFax Phase 29D - Auth-Gated Notification Preferences Write
+# ============================================================
+#
+# Purpose:
+#   Add a protected write wrapper for notification preferences.
+#
+# Existing public/smoke endpoint remains untouched:
+#   PUT /notification-preferences/{record_id}
+#
+# New authenticated wrapper:
+#   PUT /auth/notification-preferences/{record_id}
+# ============================================================
+
+
+def _hf_auth_notification_pref_writer_user_id(user, payload_user_id="", explicit_user_id=""):
+    """
+    For Pass 1:
+      - Homeowner can only write their own preference record.
+      - Admin can write a target user's preference record when ?user_id=...
+        or payload.user_id is supplied.
+      - Admin defaults to homeowner-smoke-test for current smoke testing.
+    """
+    safe_role = _hf_auth_normalize_role(user.get("role"))
+    safe_user_id = _hf_auth_one_line(user.get("user_id") or "homeowner-smoke-test")
+    safe_payload_user_id = _hf_auth_one_line(payload_user_id)
+    safe_explicit_user_id = _hf_auth_one_line(explicit_user_id)
+
+    if _hf_auth_is_admin_role(safe_role):
+        return safe_explicit_user_id or safe_payload_user_id or "homeowner-smoke-test"
+
+    return safe_user_id or "homeowner-smoke-test"
+
+
+def _hf_auth_clone_notification_pref_payload(payload, user, target_user_id):
+    """
+    Copies the request payload while forcing authenticated tenant/user ownership.
+
+    This prevents a homeowner from spoofing:
+      - user_id
+      - tenant_id
+      - updated_by
+    """
+    if hasattr(payload, "model_dump"):
+        data = payload.model_dump()
+    elif hasattr(payload, "dict"):
+        data = payload.dict()
+    else:
+        data = dict(payload)
+
+    safe_role = _hf_auth_normalize_role(user.get("role"))
+    safe_tenant_id = _hf_auth_one_line(user.get("tenant_id") or "lateef-home-inspection")
+    safe_actor_user_id = _hf_auth_one_line(user.get("user_id") or "homeowner-smoke-test")
+    safe_target_user_id = _hf_auth_one_line(target_user_id or safe_actor_user_id)
+
+    data["tenant_id"] = safe_tenant_id
+    data["user_id"] = safe_target_user_id
+    data["updated_by"] = safe_actor_user_id
+
+    if _hf_auth_is_admin_role(safe_role):
+        existing_notes = _hf_pref_one_line(data.get("notes"))
+        marker = f"Auth-gated admin write by {safe_actor_user_id}."
+        data["notes"] = f"{existing_notes} {marker}".strip()
+    else:
+        existing_notes = _hf_pref_one_line(data.get("notes"))
+        marker = f"Auth-gated homeowner write by {safe_actor_user_id}."
+        data["notes"] = f"{existing_notes} {marker}".strip()
+
+    return _HFNotificationPreferencesPayload(**data)
+
+
+@app.put("/auth/notification-preferences/{record_id}")
+def homefax_auth_upsert_notification_preferences(
+    record_id: str,
+    payload: _HFNotificationPreferencesPayload,
+    request: Request,
+    user_id: str = "",
+):
+    _hf_auth_seed_smoke_access()
+    _hf_pref_ensure_schema()
+
+    safe_record_id = _hf_pref_one_line(record_id)
+    user = _hf_auth_get_current_user(request)
+
+    if not safe_record_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "allowed": False,
+                "error": "missing_record_id",
+                "message": "record_id is required.",
+                "user": user,
+            },
+        )
+
+    access = _hf_auth_user_can_access_record(user, safe_record_id)
+
+    if not access.get("allowed"):
+        return {
+            "success": False,
+            "allowed": False,
+            "updated": False,
+            "reason": access.get("reason") or "record_access_denied",
+            "record_id": safe_record_id,
+            "auth_mode": user.get("auth_mode"),
+            "user": user,
+            "access": access,
+        }
+
+    target_user_id = _hf_auth_notification_pref_writer_user_id(
+        user,
+        payload_user_id=getattr(payload, "user_id", ""),
+        explicit_user_id=user_id,
+    )
+
+    safe_payload = _hf_auth_clone_notification_pref_payload(
+        payload,
+        user,
+        target_user_id,
+    )
+
+    result = upsert_notification_preferences(safe_record_id, safe_payload)
+
+    if isinstance(result, dict):
+        result["allowed"] = True
+        result["updated"] = True
+        result["auth_mode"] = user.get("auth_mode")
+        result["user"] = user
+        result["access"] = access
+        result["target_user_id"] = target_user_id
+        result["auth_gated"] = True
+
+    return result
+

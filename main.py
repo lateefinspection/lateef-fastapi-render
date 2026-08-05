@@ -30636,3 +30636,418 @@ def homeowner_notification_actions_health():
                 conn.close()
         except Exception:
             pass
+
+
+# ============================================================
+# HomeFax Phase 29A - Auth Identity + Tenant Access Skeleton
+# ============================================================
+#
+# Purpose:
+#   Introduce a platform-wide identity contract for authenticated
+#   homeowner/admin access without breaking existing Phase 28 flows.
+#
+# Current mode:
+#   Dev-header / smoke fallback compatible.
+#
+# Future mode:
+#   Authorization: Bearer <jwt> provider integration.
+# ============================================================
+
+
+class _HFAuthCurrentUser(BaseModel):
+    user_id: str = "homeowner-smoke-test"
+    tenant_id: str = "lateef-home-inspection"
+    role: str = "homeowner"
+    email: str = ""
+    auth_mode: str = "dev_header_or_smoke_fallback"
+
+
+def _hf_auth_one_line(value, fallback=""):
+    raw = str(value if value is not None else fallback).strip()
+    return " ".join(raw.split())
+
+
+def _hf_auth_normalize_role(value):
+    role = _hf_auth_one_line(value or "homeowner").lower()
+
+    allowed = {
+        "homeowner",
+        "admin",
+        "tenant_admin",
+        "super_admin",
+        "internal",
+    }
+
+    if role in allowed:
+        return role
+
+    if role in {"owner", "customer"}:
+        return "homeowner"
+
+    if role in {"staff", "operator"}:
+        return "admin"
+
+    return "homeowner"
+
+
+def _hf_auth_is_admin_role(role):
+    safe_role = _hf_auth_normalize_role(role)
+    return safe_role in {"admin", "tenant_admin", "super_admin", "internal"}
+
+
+def _hf_auth_get_header_value(request, name, fallback=""):
+    try:
+        return _hf_auth_one_line(request.headers.get(name) or fallback)
+    except Exception:
+        return _hf_auth_one_line(fallback)
+
+
+def _hf_auth_get_current_user(request):
+    """
+    Resolves current user from dev headers first, then smoke fallback.
+
+    This is intentionally provider-flexible. Later, this function becomes
+    the single place where JWT/Auth0/Clerk/Supabase/Cognito verification
+    is connected.
+    """
+    user_id = (
+        _hf_auth_get_header_value(request, "x-homefax-dev-user")
+        or _hf_auth_get_header_value(request, "x-homeowner-user-id")
+        or "homeowner-smoke-test"
+    )
+
+    tenant_id = (
+        _hf_auth_get_header_value(request, "x-homefax-dev-tenant")
+        or _hf_auth_get_header_value(request, "x-tenant-id")
+        or "lateef-home-inspection"
+    )
+
+    role = _hf_auth_normalize_role(
+        _hf_auth_get_header_value(request, "x-homefax-dev-role") or "homeowner"
+    )
+
+    email = (
+        _hf_auth_get_header_value(request, "x-homefax-dev-email")
+        or _hf_auth_get_header_value(request, "x-homeowner-email")
+        or ""
+    ).lower()
+
+    return {
+        "user_id": user_id,
+        "tenant_id": tenant_id,
+        "role": role,
+        "email": email,
+        "auth_mode": "dev_header_or_smoke_fallback",
+    }
+
+
+def _hf_auth_ensure_schema():
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS homefax_users (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    tenant_id VARCHAR(128) NOT NULL DEFAULT '',
+                    auth_user_id VARCHAR(255) NOT NULL DEFAULT '',
+                    email VARCHAR(255) NOT NULL DEFAULT '',
+                    display_name VARCHAR(255) NOT NULL DEFAULT '',
+                    role VARCHAR(64) NOT NULL DEFAULT 'homeowner',
+                    user_status VARCHAR(64) NOT NULL DEFAULT 'active',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_homefax_auth_user (auth_user_id),
+                    INDEX idx_homefax_users_tenant_id (tenant_id),
+                    INDEX idx_homefax_users_email (email),
+                    INDEX idx_homefax_users_role (role)
+                )
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS homefax_user_record_access (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    tenant_id VARCHAR(128) NOT NULL DEFAULT '',
+                    auth_user_id VARCHAR(255) NOT NULL DEFAULT '',
+                    record_id VARCHAR(255) NOT NULL DEFAULT '',
+                    property_id VARCHAR(255) NOT NULL DEFAULT '',
+                    access_role VARCHAR(64) NOT NULL DEFAULT 'homeowner',
+                    access_status VARCHAR(64) NOT NULL DEFAULT 'active',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_homefax_user_record (auth_user_id, record_id),
+                    INDEX idx_homefax_access_tenant_id (tenant_id),
+                    INDEX idx_homefax_access_record_id (record_id),
+                    INDEX idx_homefax_access_property_id (property_id)
+                )
+                """
+            )
+
+        conn.commit()
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_auth_seed_smoke_access():
+    _hf_auth_ensure_schema()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO homefax_users (
+                    tenant_id,
+                    auth_user_id,
+                    email,
+                    display_name,
+                    role,
+                    user_status
+                )
+                VALUES (
+                    'lateef-home-inspection',
+                    'homeowner-smoke-test',
+                    '',
+                    'HomeFax Smoke Test Homeowner',
+                    'homeowner',
+                    'active'
+                )
+                ON DUPLICATE KEY UPDATE
+                    tenant_id = VALUES(tenant_id),
+                    display_name = VALUES(display_name),
+                    role = VALUES(role),
+                    user_status = VALUES(user_status),
+                    updated_at = NOW()
+                """
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO homefax_users (
+                    tenant_id,
+                    auth_user_id,
+                    email,
+                    display_name,
+                    role,
+                    user_status
+                )
+                VALUES (
+                    'lateef-home-inspection',
+                    'admin-smoke-test',
+                    '',
+                    'HomeFax Smoke Test Admin',
+                    'admin',
+                    'active'
+                )
+                ON DUPLICATE KEY UPDATE
+                    tenant_id = VALUES(tenant_id),
+                    display_name = VALUES(display_name),
+                    role = VALUES(role),
+                    user_status = VALUES(user_status),
+                    updated_at = NOW()
+                """
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO homefax_user_record_access (
+                    tenant_id,
+                    auth_user_id,
+                    record_id,
+                    property_id,
+                    access_role,
+                    access_status
+                )
+                VALUES (
+                    'lateef-home-inspection',
+                    'homeowner-smoke-test',
+                    'n8n-weather-autoprovision-hook-006',
+                    '',
+                    'homeowner',
+                    'active'
+                )
+                ON DUPLICATE KEY UPDATE
+                    tenant_id = VALUES(tenant_id),
+                    property_id = VALUES(property_id),
+                    access_role = VALUES(access_role),
+                    access_status = VALUES(access_status),
+                    updated_at = NOW()
+                """
+            )
+
+        conn.commit()
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _hf_auth_user_can_access_record(user, record_id):
+    safe_record_id = _hf_auth_one_line(record_id)
+    safe_user_id = _hf_auth_one_line(user.get("user_id"))
+    safe_tenant_id = _hf_auth_one_line(user.get("tenant_id"))
+    safe_role = _hf_auth_normalize_role(user.get("role"))
+
+    if not safe_record_id:
+        return {
+            "allowed": False,
+            "reason": "missing_record_id",
+            "record_id": safe_record_id,
+            "user": user,
+        }
+
+    if _hf_auth_is_admin_role(safe_role):
+        return {
+            "allowed": True,
+            "reason": "admin_role_allowed_for_tenant",
+            "record_id": safe_record_id,
+            "tenant_id": safe_tenant_id,
+            "role": safe_role,
+            "user_id": safe_user_id,
+        }
+
+    _hf_auth_seed_smoke_access()
+
+    conn = None
+
+    try:
+        conn = _hf_mon_get_connection()
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM homefax_user_record_access
+                WHERE auth_user_id = %s
+                  AND tenant_id = %s
+                  AND record_id = %s
+                  AND access_status = 'active'
+                LIMIT 1
+                """,
+                (
+                    safe_user_id,
+                    safe_tenant_id,
+                    safe_record_id,
+                ),
+            )
+
+            row = cursor.fetchone()
+
+        if row:
+            return {
+                "allowed": True,
+                "reason": "record_access_granted",
+                "record_id": safe_record_id,
+                "tenant_id": safe_tenant_id,
+                "role": safe_role,
+                "user_id": safe_user_id,
+                "access": dict(row),
+            }
+
+        return {
+            "allowed": False,
+            "reason": "record_access_not_found",
+            "record_id": safe_record_id,
+            "tenant_id": safe_tenant_id,
+            "role": safe_role,
+            "user_id": safe_user_id,
+        }
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/auth-health")
+def homefax_auth_health():
+    try:
+        _hf_auth_seed_smoke_access()
+
+        conn = None
+
+        try:
+            conn = _hf_mon_get_connection()
+
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) AS count FROM homefax_users")
+                users_row = cursor.fetchone() or {}
+
+                cursor.execute("SELECT COUNT(*) AS count FROM homefax_user_record_access")
+                access_row = cursor.fetchone() or {}
+
+            return {
+                "success": True,
+                "service": "homefax_auth_identity_tenant_access",
+                "auth_mode": "dev_header_or_smoke_fallback",
+                "tables": {
+                    "homefax_users": {
+                        "ok": True,
+                        "count": int(users_row.get("count") or 0),
+                    },
+                    "homefax_user_record_access": {
+                        "ok": True,
+                        "count": int(access_row.get("count") or 0),
+                    },
+                },
+            }
+
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "service": "homefax_auth_identity_tenant_access",
+            "error": str(exc),
+        }
+
+
+@app.get("/auth/me")
+def homefax_auth_me(request: Request):
+    _hf_auth_seed_smoke_access()
+    user = _hf_auth_get_current_user(request)
+
+    return {
+        "success": True,
+        "auth_mode": user.get("auth_mode"),
+        "user": user,
+    }
+
+
+@app.get("/auth/record-access/{record_id}")
+def homefax_auth_record_access(record_id: str, request: Request):
+    _hf_auth_seed_smoke_access()
+    user = _hf_auth_get_current_user(request)
+    access = _hf_auth_user_can_access_record(user, record_id)
+
+    return {
+        "success": True,
+        "auth_mode": user.get("auth_mode"),
+        "user": user,
+        "record_id": _hf_auth_one_line(record_id),
+        "access": access,
+    }
+
